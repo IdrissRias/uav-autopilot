@@ -1,0 +1,36 @@
+airframe_id: "c172"
+name: "Cessna 172"
+type: "fixed_wing"
+
+speeds_kts:
+  v_stall: 48
+  v_rotate: 55
+  v_takeoff: 65
+  v_climb: 75
+  v_cruise: 105
+  v_approach: 70
+  v_land: 60
+  v_never_exceed: 163
+
+rates_fpm:
+  climb: 500
+  descent: 400
+
+throttle:
+  takeoff: 1.0
+  climb: 0.85
+  cruise: 0.55
+  approach: 0.45
+  idle: 0.0
+
+limits:
+  max_roll_cmd: 0.35
+  max_pitch_cmd: 0.25
+  max_yaw_cmd: 1.0
+
+thresholds:
+  takeoff_to_climb_speed_kts: 55
+  rotate_altitude_gain_ft: 200
+  climb_to_cruise_altitude_tolerance_ft: 10
+  approach_transition_alt_ft: 1500
+  land_transition_alt_ft: 200

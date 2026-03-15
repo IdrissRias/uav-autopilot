@@ -1,0 +1,68 @@
+ports:
+  xplane_ip: "127.0.0.1"
+  xplane_port: 49000
+  local_port: 0
+
+airframe:
+  id: "c172"
+
+nav:
+  apt_dat_path: "/Users/idrisss/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
+  min_distance_nm: 10.0
+  max_distance_nm: 80.0
+
+loop:
+  rate_hz: 15
+
+controller:
+  heading_kp: 0.02
+  heading_ki: 0.0
+  heading_kd: 0.005
+  altitude_kp: 0.02
+  altitude_ki: 0.0
+  altitude_kd: 0.005
+  airspeed_kp: 0.02
+  airspeed_ki: 0.0
+  airspeed_kd: 0.005
+  cruise_throttle: 0.55
+
+safety:
+  max_roll: 0.35
+  max_pitch: 0.25
+  max_yaw: 0.35
+  throttle_min: 0.0
+  throttle_max: 1.0
+  telemetry_timeout_s: 2.0
+
+mode:
+  start_mode: "CRUISE"
+  auto_start: true
+  has_destination: true
+  landing_requested: false
+  demo_sequence: false
+  lock_heading: true
+
+targets:
+  target_alt_ft: 800.0
+  target_hdg_deg: 90.0
+  target_airspeed_kts: 85.0
+  climb_airspeed_kts: 70.0
+
+takeoff:
+  throttle: 1.0
+  max_roll_cmd: 0.0
+  max_pitch_cmd: 0.10
+  yaw_kp: 0.02
+  yaw_ki: 0.0
+  yaw_limit: 0.35
+  yaw_full_deg: 5.0
+
+climb:
+  max_roll_cmd: 0.15
+  max_pitch_cmd: 0.25
+  roll_freeze_alt_ft: 600.0
+  throttle_min: 0.85
+  throttle_cap: 1.0
+  overspeed_kts: 15.0
+  recover_fpm: 900
+  pitch_protect_gain: 0.03
