@@ -15,6 +15,7 @@ class Telemetry:
     timestamp: float
     lat_deg: float = math.nan
     lon_deg: float = math.nan
+    agl_m: float = math.nan
 
     def is_valid(self) -> bool:
         # Valid attitude/airspeed/alt/heading telemetry (position optional).

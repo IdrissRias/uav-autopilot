@@ -23,6 +23,7 @@ class XPlaneUDP(SimAdapter):
         4: "sim/flightmodel/position/psi",
         5: "sim/flightmodel/position/latitude",
         6: "sim/flightmodel/position/longitude",
+        7: "sim/flightmodel/position/y_agl",  # metres above ground
     }
 
     def __init__(
@@ -51,6 +52,7 @@ class XPlaneUDP(SimAdapter):
 
         self._last_values: Dict[int, float] = {}
         self._last_ts: float = 0.0
+        self._gear_state: bool | None = None  # track last commanded gear position
 
         for idx, dataref in self.DATAREFS.items():
             self._send_rref(self.freq_hz, idx, dataref)
@@ -96,6 +98,7 @@ class XPlaneUDP(SimAdapter):
         heading = self._last_values.get(4, math.nan)
         lat = self._last_values.get(5, math.nan)
         lon = self._last_values.get(6, math.nan)
+        agl_m = self._last_values.get(7, math.nan)
         return Telemetry(
             airspeed_kts=airspeed,
             altitude_ft=alt,
@@ -105,6 +108,7 @@ class XPlaneUDP(SimAdapter):
             timestamp=self._last_ts,
             lat_deg=lat,
             lon_deg=lon,
+            agl_m=agl_m,
         )
 
     def write_actuators(self, act: Actuators) -> None:
@@ -130,16 +134,22 @@ class XPlaneUDP(SimAdapter):
         self._send_dref(value, "sim/cockpit2/controls/rudder_ratio")
 
     def set_brakes(self, value: float) -> None:
-        # parking_brake_ratio controls the brake handle position.
-        # sim/cockpit/switches/parking_brake is the actual switch X-Plane reads.
-        self._send_dref(value, "sim/cockpit2/controls/parking_brake_ratio")
-        self._send_dref(value, "sim/cockpit/switches/parking_brake")
+        # sim/flightmodel/controls/parkbrake is the writable parking brake (0.0=off, 1.0=on).
+        # left/right_brake_ratio handle the wheel brakes directly.
+        self._send_dref(value, "sim/flightmodel/controls/parkbrake")
         self._send_dref(value, "sim/cockpit2/controls/left_brake_ratio")
         self._send_dref(value, "sim/cockpit2/controls/right_brake_ratio")
 
     def set_gear(self, gear_down: bool) -> None:
-        # 1 = gear down/locked, 0 = gear up/retracted.
-        self._send_dref(1.0 if gear_down else 0.0, "sim/cockpit/switches/gear_handle_status")
+        # sim/cockpit/switches/gear_handle_status is read-only — use commands instead.
+        # Only send when state changes to avoid spamming X-Plane every loop tick.
+        if gear_down == self._gear_state:
+            return
+        self._gear_state = gear_down
+        if gear_down:
+            self._send_cmnd("sim/flight_controls/landing_gear_down")
+        else:
+            self._send_cmnd("sim/flight_controls/landing_gear_up")
 
     def reset_flight(self) -> bool:
         # Try a few common reset commands. We already observed these can work in XP12.
@@ -150,4 +160,6 @@ class XPlaneUDP(SimAdapter):
         ):
             self._send_cmnd(cmd)
             time.sleep(0.05)
+        # Clear gear state so set_gear fires fresh commands after the reset.
+        self._gear_state = None
         return True

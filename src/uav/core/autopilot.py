@@ -133,10 +133,11 @@ class Autopilot:
                 print(
                     f"Mode={self.mode_manager.name} "
                     f"Alt={telemetry.altitude_ft:.1f}ft "
+                    f"AGL={telemetry.agl_m:.1f}m "
                     f"Hdg={telemetry.heading_deg:.1f}deg "
                     f"Spd={telemetry.airspeed_kts:.1f}kts "
                     f"age={age:.2f}s "
-                    f"cmd[T={act.throttle:.2f} P={act.pitch:+.2f} R={act.roll:+.2f} Y={act.yaw:+.2f} B={act.brake_ratio:.2f}]"
+                    f"cmd[T={act.throttle:.2f} P={act.pitch:+.2f} R={act.roll:+.2f} Y={act.yaw:+.2f} B={act.brake_ratio:.2f} G={'dn' if act.gear_down else 'UP'}]"
                 )
 
             self._last_step = loop_start
