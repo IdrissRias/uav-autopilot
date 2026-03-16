@@ -31,14 +31,17 @@ class SimpleFixedWingController(Controller):
         airspeed_pid: PID,
         cruise_throttle: float,
         pitch_rate_limit_per_s: float = 0.6,
+        roll_rate_limit_per_s: float = 0.3,
     ) -> None:
         self.heading_pid = heading_pid
         self.altitude_pid = altitude_pid
         self.airspeed_pid = airspeed_pid
         self.cruise_throttle = cruise_throttle
         self.pitch_rate_limit_per_s = pitch_rate_limit_per_s
+        self.roll_rate_limit_per_s = roll_rate_limit_per_s
         self._yaw_integral = 0.0
         self._prev_pitch_cmd = 0.0
+        self._prev_roll_cmd = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -66,6 +69,16 @@ class SimpleFixedWingController(Controller):
             roll_cmd = _clamp(roll_cmd, targets.roll_limit)
         if targets.pitch_limit is not None:
             pitch_cmd = _clamp(pitch_cmd, targets.pitch_limit)
+
+        # Roll rate limit: smooth out corrections instead of one big snap.
+        if dt > 0:
+            max_roll_delta = self.roll_rate_limit_per_s * dt
+            roll_delta = roll_cmd - self._prev_roll_cmd
+            if roll_delta > max_roll_delta:
+                roll_cmd = self._prev_roll_cmd + max_roll_delta
+            elif roll_delta < -max_roll_delta:
+                roll_cmd = self._prev_roll_cmd - max_roll_delta
+        self._prev_roll_cmd = roll_cmd
 
         # Pitch rate limit to avoid oscillation/hunting.
         if dt > 0:

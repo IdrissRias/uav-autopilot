@@ -36,9 +36,85 @@ class Autopilot:
         self._last_step = time.time()
         self._reset_last_ts = 0.0
         self._reset_cooldown_s = 5.0
+        self._monitor: dict = {}  # timers for phase-limit watchdog
 
     def stop(self) -> None:
         self._running = False
+
+    def _check_phase_limits(self, mode: str, telemetry) -> str | None:
+        """Return a failure reason string if the flight is in an unacceptable state, else None."""
+        now = time.time()
+        ctx = self.mode_manager.ctx
+        ms = self._monitor
+
+        if mode == "CLIMB":
+            target_alt = ctx.get("targets", {}).get("target_alt_ft", telemetry.altitude_ft)
+            # If we're massively above cruise target, X-Plane started mid-air at wrong altitude.
+            if telemetry.altitude_ft > target_alt + 1000.0:
+                if "climb_high_since" not in ms:
+                    ms["climb_high_since"] = now
+                elif now - ms["climb_high_since"] >= 5.0:
+                    ms.pop("climb_high_since", None)
+                    return f"CLIMB alt {telemetry.altitude_ft:.0f}ft >1000ft above cruise target {target_alt:.0f}ft"
+            else:
+                ms.pop("climb_high_since", None)
+
+        elif mode == "CRUISE":
+            target_alt = ctx.get("targets", {}).get("target_alt_ft", telemetry.altitude_ft)
+            alt_error = telemetry.altitude_ft - target_alt
+
+            # Hard upper limit: if the plane is way above target, it's out of control.
+            if alt_error > 400.0:
+                return f"CRUISE alt {telemetry.altitude_ft:.0f}ft is >400ft above target {target_alt:.0f}ft"
+
+            # Sustained low altitude (altitude loss from turns not recovering).
+            if alt_error < -500.0:
+                if "low_since" not in ms:
+                    ms["low_since"] = now
+                elif now - ms["low_since"] >= 15.0:
+                    ms.pop("low_since", None)
+                    return f"CRUISE alt {telemetry.altitude_ft:.0f}ft >500ft below target for >15s"
+            else:
+                ms.pop("low_since", None)
+
+            # Circling: stuck with large heading error for too long.
+            dest = ctx.get("destination")
+            if dest and telemetry.has_position():
+                try:
+                    from uav.nav.geo import bearing_deg as _bd
+                    true_bearing = _bd(
+                        telemetry.lat_deg, telemetry.lon_deg,
+                        float(dest["lat"]), float(dest["lon"]),
+                    )
+                    raw_err = true_bearing - telemetry.heading_deg
+                    while raw_err > 180.0:
+                        raw_err -= 360.0
+                    while raw_err < -180.0:
+                        raw_err += 360.0
+                    hdg_err = abs(raw_err)
+                    if hdg_err > 90.0:
+                        if "circle_since" not in ms:
+                            ms["circle_since"] = now
+                        elif now - ms["circle_since"] >= 30.0:
+                            ms.pop("circle_since", None)
+                            return f"CRUISE heading error {hdg_err:.0f}° for >30s (circling)"
+                    else:
+                        ms.pop("circle_since", None)
+                except Exception:
+                    pass
+
+        elif mode == "APPROACH":
+            if telemetry.airspeed_kts > 110.0 and telemetry.agl_m < 200.0:
+                return f"APPROACH {telemetry.airspeed_kts:.0f}kts > 110kts at AGL {telemetry.agl_m:.0f}m"
+
+        # Clear stale timers when not in a monitored phase.
+        if mode not in ("CRUISE",):
+            ms.pop("low_since", None)
+            ms.pop("circle_since", None)
+        if mode not in ("CLIMB",):
+            ms.pop("climb_high_since", None)
+
+        return None
 
     def _safe_write(self, act: Actuators) -> None:
         self.adapter.write_actuators(act)
@@ -53,10 +129,20 @@ class Autopilot:
             # Lazy destination selection once position is available.
             if getattr(self.mode_manager, "ctx", None) is not None:
                 ctx = self.mode_manager.ctx
-                if ctx.get("destination") is None and hasattr(telemetry, "has_position") and telemetry.has_position():
+                on_ground = telemetry.agl_m < 5.0
+                if ctx.get("destination") is None and on_ground and telemetry.is_valid() and hasattr(telemetry, "has_position") and telemetry.has_position():
                     nav = ctx.get("nav", {})
                     apt = nav.get("apt_dat_path")
-                    if apt:
+                    fixed = nav.get("fixed_destination")
+                    if fixed:
+                        ctx["destination"] = {
+                            "icao": fixed.get("icao", "???"),
+                            "name": fixed.get("name", "fixed"),
+                            "lat": float(fixed["lat"]),
+                            "lon": float(fixed["lon"]),
+                        }
+                        print(f"NAV: fixed destination {ctx['destination']['icao']} ({ctx['destination']['name']})")
+                    elif apt:
                         try:
                             dest = __import__("uav.nav.select_destination", fromlist=["pick_nearest_airport"]).pick_nearest_airport(
                                 apt,
@@ -70,12 +156,35 @@ class Autopilot:
                                 print(f"NAV: destination selected {dest.icao} ({dest.name})")
                         except Exception:
                             pass
+                    # Adaptive cruise altitude: scale with distance so the full cycle always fits.
+                    if ctx.get("destination"):
+                        from uav.nav.geo import haversine_m
+                        dist_nm = haversine_m(
+                            telemetry.lat_deg, telemetry.lon_deg,
+                            ctx["destination"]["lat"], ctx["destination"]["lon"],
+                        ) / 1852.0
+                        cruise_alt_agl = max(1500.0, min(25000.0, dist_nm * 150.0))
+                        ctx["targets"]["target_alt_ft"] = telemetry.altitude_ft + cruise_alt_agl
+                        ctx["takeoff_alt_ft"] = telemetry.altitude_ft  # used by APPROACH for final altitude
+                        # Store home position so reset can teleport back to runway.
+                        alt_m = telemetry.altitude_ft / 3.28084
+                        if hasattr(self.adapter, "set_home"):
+                            self.adapter.set_home(telemetry.lat_deg, telemetry.lon_deg, alt_m, telemetry.heading_deg)
+                        print(f"NAV: dist={dist_nm:.1f}nm → cruise alt {cruise_alt_agl:.0f}ft AGL ({ctx['targets']['target_alt_ft']:.0f}ft MSL)")
             stale = (not telemetry.is_valid()) or is_telemetry_stale(telemetry, self.telemetry_timeout_s)
 
             now = time.time()
             # Grace window after a reset: ignore stale blips while X-Plane is settling.
             grace_until = getattr(self, "_reset_grace_until", 0.0)
             in_grace = now < grace_until
+
+            # Phase-limit watchdog: catch unacceptable altitude/heading conditions.
+            if not stale and not in_grace:
+                failure = self._check_phase_limits(self.mode_manager.name, telemetry)
+                if failure:
+                    print(f"MONITOR: reset → {failure}")
+                    self._monitor.clear()
+                    stale = True  # reuse the existing stale-reset path
 
             if stale or in_grace:
                 # Don't drive modes/controllers on stale data. Neutralize.

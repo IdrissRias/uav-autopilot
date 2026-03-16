@@ -19,6 +19,9 @@ class Telemetry:
 
     def is_valid(self) -> bool:
         # Valid attitude/airspeed/alt/heading telemetry (position optional).
+        # agl_m < -0.5 means the aircraft is crashed/underground — treat as invalid.
+        if not math.isnan(self.agl_m) and self.agl_m < -0.5:
+            return False
         return not (
             math.isnan(self.airspeed_kts)
             or math.isnan(self.altitude_ft)

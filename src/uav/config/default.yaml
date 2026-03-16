@@ -10,20 +10,20 @@ loop:
   rate_hz: 15
 
 controller:
-  heading_kp: 0.02
+  heading_kp: 0.003
   heading_ki: 0.0
-  heading_kd: 0.005
-  altitude_kp: 0.02
+  heading_kd: 0.002
+  altitude_kp: 0.005
   altitude_ki: 0.0
-  altitude_kd: 0.005
+  altitude_kd: 0.002
   airspeed_kp: 0.02
   airspeed_ki: 0.0
   airspeed_kd: 0.005
   cruise_throttle: 0.55
-  pitch_rate_limit_per_s: 0.5
+  pitch_rate_limit_per_s: 1.0
 
 safety:
-  max_roll: 0.35
+  max_roll: 0.20
   max_pitch: 0.25
   max_yaw: 0.35
   throttle_min: 0.0
@@ -56,6 +56,11 @@ nav:
   apt_dat_path: "/Users/idrisss/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
   min_distance_nm: 10.0
   max_distance_nm: 80.0
+  fixed_destination:
+    icao: "65MN"
+    name: "Wheaton Muni"
+    lat: 45.97420
+    lon: -96.16370
 
 climb:
   max_roll_cmd: 0.15

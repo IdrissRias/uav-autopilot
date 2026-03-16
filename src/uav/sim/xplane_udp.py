@@ -53,6 +53,7 @@ class XPlaneUDP(SimAdapter):
         self._last_values: Dict[int, float] = {}
         self._last_ts: float = 0.0
         self._gear_state: bool | None = None  # track last commanded gear position
+        self._home: tuple | None = None  # (lat, lon, alt_m, heading) set on first arm
 
         for idx, dataref in self.DATAREFS.items():
             self._send_rref(self.freq_hz, idx, dataref)
@@ -151,15 +152,35 @@ class XPlaneUDP(SimAdapter):
         else:
             self._send_cmnd("sim/flight_controls/landing_gear_up")
 
+    def set_home(self, lat: float, lon: float, alt_m: float, heading: float) -> None:
+        """Store the takeoff position so reset_flight can teleport back to it.
+        Only set once — never overwrite after the first arm so crashes don't poison home."""
+        if self._home is None:
+            self._home = (lat, lon, alt_m, heading)
+
+    def _send_posi(self, lat: float, lon: float, alt_m: float, pitch: float, roll: float, heading: float) -> None:
+        """Teleport aircraft via XPlaneConnect POSI packet."""
+        # Format: header(5s) + ac_idx(b) + lat(d) + lon(f) + alt_m(f) + pitch(f) + roll(f) + hdg(f) + gear(f)
+        data = struct.pack(b"<5sbdfffffff",
+            b"POSI\0", 0,
+            float(lat), float(lon), float(alt_m),
+            float(pitch), float(roll), float(heading),
+            1.0,  # gear down for takeoff
+        )
+        self.sock.sendto(data, self.xplane_addr)
+
     def reset_flight(self) -> bool:
-        # Try a few common reset commands. We already observed these can work in XP12.
+        # If we have a stored home position, teleport there first for a clean reset.
+        if self._home:
+            lat, lon, alt_m, heading = self._home
+            self._send_posi(lat, lon, alt_m, 0.0, 0.0, heading)
+            time.sleep(0.1)
+        # Also send X-Plane reset commands as a fallback.
         for cmd in (
             "sim/operation/reset_flight",
             "sim/operation/reset_to_runway",
-            "sim/operation/go_to_default",
         ):
             self._send_cmnd(cmd)
             time.sleep(0.05)
-        # Clear gear state so set_gear fires fresh commands after the reset.
         self._gear_state = None
         return True

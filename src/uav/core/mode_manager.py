@@ -43,6 +43,7 @@ class ModeManager:
         # Bring the state machine back to ground and allow auto-start again.
         self._started = False
         self.ctx.pop("mode_state", None)
+        self.ctx.pop("destination", None)  # recalculate from fresh position after reset
         self.transition("GROUND")
 
     def step(self, telemetry: Telemetry, stale: bool) -> Targets:
@@ -89,16 +90,37 @@ class ModeManager:
         if self.current.name == "TAKEOFF" and telemetry.airspeed_kts >= vr_kts:
             self.transition("CLIMB")
 
-        if self.current.name == "CLIMB" and abs(telemetry.altitude_ft - target_alt) < alt_tol:
+        if self.current.name == "CLIMB" and telemetry.altitude_ft >= target_alt - alt_tol:
             self.transition("CRUISE")
 
-        # If we just entered CRUISE this tick, don't immediately jump to APPROACH.
+        # If we just entered CRUISE this tick, record the time and don't immediately jump to APPROACH.
         if prev_mode != "CRUISE" and self.current.name == "CRUISE":
+            import time as _time
+            self.ctx.setdefault("mode_state", {})["cruise_entered_at"] = _time.time()
             return self.current.step(self.ctx, telemetry)
 
-        if self.current.name == "CRUISE" and (landing_requested or demo_sequence):
-            self.transition("APPROACH")
-        elif self.current.name == "APPROACH" and telemetry.altitude_ft <= land_alt_ft:
+        if self.current.name == "CRUISE":
+            should_approach = landing_requested or demo_sequence
+            if not should_approach:
+                import time as _time
+                cruise_entered_at = self.ctx.get("mode_state", {}).get("cruise_entered_at", 0.0)
+                cruise_stable = (_time.time() - cruise_entered_at) >= 5.0
+                dest = self.ctx.get("destination")
+                if cruise_stable and dest and telemetry.has_position():
+                    try:
+                        from uav.nav.geo import haversine_m
+                        dist_nm = haversine_m(
+                            telemetry.lat_deg, telemetry.lon_deg,
+                            float(dest["lat"]), float(dest["lon"]),
+                        ) / 1852.0
+                        agl_ft = telemetry.agl_m * 3.28084
+                        approach_dist_nm = max(3.0, agl_ft / 300.0)
+                        should_approach = dist_nm <= approach_dist_nm
+                    except Exception:
+                        pass
+            if should_approach:
+                self.transition("APPROACH")
+        if self.current.name == "APPROACH" and telemetry.agl_m < 15.0:
             self.transition("LAND")
 
         return self.current.step(self.ctx, telemetry)

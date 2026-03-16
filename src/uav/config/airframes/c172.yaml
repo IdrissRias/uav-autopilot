@@ -20,7 +20,7 @@ throttle:
   takeoff: 1.0
   climb: 0.85
   cruise: 0.55
-  approach: 0.45
+  approach: 0.20
   idle: 0.0
 
 limits:
