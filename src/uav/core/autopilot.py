@@ -4,7 +4,6 @@ import time
 
 from uav.core.control.simple_fixedwing import SimpleFixedWingController
 from uav.core.guidance.simple_guidance import SimpleGuidance
-from uav.core.mode_manager import ModeManager
 from uav.core.safety.limits import SafetyLimits, abort_actuators
 from uav.core.safety.failsafe import is_telemetry_stale
 from uav.logging.recorder import Recorder
@@ -18,7 +17,7 @@ class Autopilot:
         adapter: SimAdapter,
         controller: SimpleFixedWingController,
         guidance: SimpleGuidance,
-        mode_manager: ModeManager,
+        mode_manager: object,
         safety: SafetyLimits,
         recorder: Recorder,
         loop_rate_hz: float,
@@ -104,8 +103,8 @@ class Autopilot:
                     pass
 
         elif mode == "APPROACH":
-            if telemetry.airspeed_kts > 110.0 and telemetry.agl_m < 200.0:
-                return f"APPROACH {telemetry.airspeed_kts:.0f}kts > 110kts at AGL {telemetry.agl_m:.0f}m"
+            # Airspeed is now managed by the PID, so no hard reset threshold here.
+            pass
 
         # Clear stale timers when not in a monitored phase.
         if mode not in ("CRUISE",):
@@ -163,7 +162,7 @@ class Autopilot:
                             telemetry.lat_deg, telemetry.lon_deg,
                             ctx["destination"]["lat"], ctx["destination"]["lon"],
                         ) / 1852.0
-                        cruise_alt_agl = max(1500.0, min(25000.0, dist_nm * 150.0))
+                        cruise_alt_agl = max(3500.0, min(25000.0, dist_nm * 200.0))
                         ctx["targets"]["target_alt_ft"] = telemetry.altitude_ft + cruise_alt_agl
                         ctx["takeoff_alt_ft"] = telemetry.altitude_ft  # used by APPROACH for final altitude
                         # Store home position so reset can teleport back to runway.

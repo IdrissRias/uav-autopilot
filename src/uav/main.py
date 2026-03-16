@@ -11,7 +11,7 @@ from uav.core.autopilot import Autopilot
 from uav.core.control.pid import PID
 from uav.core.control.fixedwing_controller import FixedWingController
 from uav.core.guidance.fixedwing_guidance import FixedWingGuidance
-from uav.core.mode_manager import ModeManager
+from uav.core.reactive_director import ReactiveFlightDirector
 from uav.core.safety.limits import SafetyLimits, abort_actuators
 from uav.logging.recorder import Recorder
 from uav.sim.xplane_udp import XPlaneUDP
@@ -118,13 +118,7 @@ def main() -> None:
         "nav": cfg.get("nav", {}),
         "destination": None,
     }
-    mode_cfg = cfg["mode"]
-    mode_manager = ModeManager(
-        start_mode=mode_cfg["start_mode"],
-        ctx=ctx,
-        auto_start=bool(mode_cfg.get("auto_start", True)),
-        has_destination=bool(mode_cfg.get("has_destination", False)),
-    )
+    mode_manager = ReactiveFlightDirector(ctx=ctx)
 
     guidance = FixedWingGuidance()
     recorder = Recorder()

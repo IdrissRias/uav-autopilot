@@ -157,6 +157,7 @@ class XPlaneUDP(SimAdapter):
         Only set once — never overwrite after the first arm so crashes don't poison home."""
         if self._home is None:
             self._home = (lat, lon, alt_m, heading)
+            print(f"HOME set: lat={lat:.5f} lon={lon:.5f} alt={alt_m:.1f}m hdg={heading:.1f}°")
 
     def _send_posi(self, lat: float, lon: float, alt_m: float, pitch: float, roll: float, heading: float) -> None:
         """Teleport aircraft via XPlaneConnect POSI packet."""
@@ -173,8 +174,12 @@ class XPlaneUDP(SimAdapter):
         # If we have a stored home position, teleport there first for a clean reset.
         if self._home:
             lat, lon, alt_m, heading = self._home
-            self._send_posi(lat, lon, alt_m, 0.0, 0.0, heading)
+            print(f"RESET: teleporting to home lat={lat:.5f} lon={lon:.5f} alt={alt_m+3:.1f}m hdg={heading:.1f}°")
+            # +3m safety margin so terrain mesh rounding never spawns us underground.
+            self._send_posi(lat, lon, alt_m + 3.0, 0.0, 0.0, heading)
             time.sleep(0.1)
+        else:
+            print("RESET: no home stored — relying on X-Plane reset commands only")
         # Also send X-Plane reset commands as a fallback.
         for cmd in (
             "sim/operation/reset_flight",
