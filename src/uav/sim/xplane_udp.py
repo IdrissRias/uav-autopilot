@@ -113,6 +113,7 @@ class XPlaneUDP(SimAdapter):
         self.set_pitch(act.pitch)
         self.set_yaw(act.yaw)
         self.set_brakes(act.brake_ratio)
+        self.set_gear(act.gear_down)
 
     def set_throttle(self, value: float) -> None:
         self._send_dref(value, "sim/cockpit2/engine/actuators/throttle_ratio_all")
@@ -129,9 +130,16 @@ class XPlaneUDP(SimAdapter):
         self._send_dref(value, "sim/cockpit2/controls/rudder_ratio")
 
     def set_brakes(self, value: float) -> None:
+        # parking_brake_ratio controls the brake handle position.
+        # sim/cockpit/switches/parking_brake is the actual switch X-Plane reads.
         self._send_dref(value, "sim/cockpit2/controls/parking_brake_ratio")
+        self._send_dref(value, "sim/cockpit/switches/parking_brake")
         self._send_dref(value, "sim/cockpit2/controls/left_brake_ratio")
         self._send_dref(value, "sim/cockpit2/controls/right_brake_ratio")
+
+    def set_gear(self, gear_down: bool) -> None:
+        # 1 = gear down/locked, 0 = gear up/retracted.
+        self._send_dref(1.0 if gear_down else 0.0, "sim/cockpit/switches/gear_handle_status")
 
     def reset_flight(self) -> bool:
         # Try a few common reset commands. We already observed these can work in XP12.

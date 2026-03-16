@@ -17,6 +17,7 @@ class Mode(Mode):
             airspeed_kts=None,
             throttle=0.0,
             brake_ratio=1.0,
+            gear_down=True,
         )
 
     def exit(self, ctx: dict) -> None:

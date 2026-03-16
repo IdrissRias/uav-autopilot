@@ -59,6 +59,7 @@ class Mode(Mode):
             climb_rate_fpm=takeoff_cfg.get("climb_rate_fpm"),
             throttle=throttle,
             brake_ratio=0.0,
+            gear_down=True,  # keep gear down through rotation; retracted once in CLIMB
             roll_limit=max_roll,
             pitch_limit=max_pitch,
             yaw_hold=True,

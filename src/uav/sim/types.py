@@ -37,6 +37,7 @@ class Actuators:
     pitch: float
     yaw: float
     brake_ratio: float = 0.0
+    gear_down: bool = True
 
 
 @dataclass
@@ -47,6 +48,7 @@ class Targets:
     climb_rate_fpm: float | None = None
     throttle: float | None = None
     brake_ratio: float | None = None
+    gear_down: bool | None = None
     roll_limit: float | None = None
     pitch_limit: float | None = None
     yaw_hold: bool | None = None

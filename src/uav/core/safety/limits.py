@@ -21,8 +21,8 @@ class SafetyLimits:
         pitch = min(max(act.pitch, -self.max_pitch), self.max_pitch)
         yaw = min(max(act.yaw, -self.max_yaw), self.max_yaw)
         brake = min(max(act.brake_ratio, self.brake_min), self.brake_max)
-        return Actuators(throttle=throttle, roll=roll, pitch=pitch, yaw=yaw, brake_ratio=brake)
+        return Actuators(throttle=throttle, roll=roll, pitch=pitch, yaw=yaw, brake_ratio=brake, gear_down=act.gear_down)
 
 
 def abort_actuators() -> Actuators:
-    return Actuators(throttle=0.0, roll=0.0, pitch=0.0, yaw=0.0, brake_ratio=1.0)
+    return Actuators(throttle=0.0, roll=0.0, pitch=0.0, yaw=0.0, brake_ratio=1.0, gear_down=True)

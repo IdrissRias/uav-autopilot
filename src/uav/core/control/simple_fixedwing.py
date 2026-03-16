@@ -101,10 +101,14 @@ class SimpleFixedWingController(Controller):
         if targets.brake_ratio is not None:
             brake_ratio = targets.brake_ratio
 
+        # Gear: None means "don't change" — default to gear down (safe).
+        gear_down = targets.gear_down if targets.gear_down is not None else True
+
         return Actuators(
             throttle=throttle_cmd,
             roll=roll_cmd,
             pitch=pitch_cmd,
             yaw=yaw_cmd,
             brake_ratio=brake_ratio,
+            gear_down=gear_down,
         )

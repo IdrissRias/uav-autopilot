@@ -30,6 +30,7 @@ class Mode(Mode):
             airspeed_kts=v_land,
             throttle=throttle_cfg.get("idle", 0.0),
             brake_ratio=brake,
+            gear_down=True,  # gear must be down for landing
         )
 
     def exit(self, ctx: dict) -> None:

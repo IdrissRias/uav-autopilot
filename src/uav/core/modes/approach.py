@@ -46,6 +46,7 @@ class Mode(Mode):
             climb_rate_fpm=-descent_fpm,
             throttle=throttle_cfg.get("approach", ctx["controller"]["cruise_throttle"] * 0.7),
             brake_ratio=0.0,
+            gear_down=True,  # gear down for approach and landing
         )
 
     def exit(self, ctx: dict) -> None:

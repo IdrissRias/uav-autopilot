@@ -77,6 +77,7 @@ class Mode(Mode):
             climb_rate_fpm=climb_fpm,
             throttle=min(throttle_cap, throttle_cmd),
             brake_ratio=0.0,
+            gear_down=False,  # retract gear once climb mode is active
             roll_limit=max_roll,
             pitch_limit=max_pitch,
             pitch_protect_kts=climb_spd - 10.0,
