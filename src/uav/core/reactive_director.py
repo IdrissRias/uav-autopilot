@@ -114,15 +114,24 @@ class ReactiveFlightDirector:
         # Dynamic approach trigger: start descending earlier the higher we are.
         # Trigger distance is computed once and latched — never shrinks mid-descent,
         # which would cause near_dest to flip False and re-trigger CLIMB.
+        # Guard: only allow approach to trigger after we've actually reached cruise
+        # altitude at least once.  Without this, a short-range flight (dest < 3nm)
+        # fires APPROACH while still climbing → throttle cuts → steep uncontrolled dive.
+        if self._phase == "CRUISE":
+            self._st["has_cruised"] = True
         approach_dist_nm = max(3.0, agl_ft / 300.0)
-        if not self._st.get("approach_initiated", False) and dist_nm <= approach_dist_nm:
+        has_cruised = self._st.get("has_cruised", False)
+        if has_cruised and not self._st.get("approach_initiated", False) and dist_nm <= approach_dist_nm:
             self._st["approach_initiated"] = True
         near_dest = self._st.get("approach_initiated", False)
 
         # ── Phase selection ───────────────────────────────────────────────────
         # Pure function of current flight state — re-evaluated every tick.
         on_ground = agl_ft < 5.0
-        at_cruise = telemetry.altitude_ft >= cruise_target_ft - 50.0
+        # Wide hysteresis: only leave CRUISE if we've dropped 250ft below target.
+        # 50ft was too tight — airspeed PID briefly cuts throttle → plane glides
+        # down 60-80ft → CLIMB fires → full throttle overshoot → oscillation loop.
+        at_cruise = telemetry.altitude_ft >= cruise_target_ft - 250.0
         flaring = agl_ft < 15.0 and near_dest
 
         if flaring:
@@ -211,7 +220,12 @@ class ReactiveFlightDirector:
         else:
             target_alt = telemetry.altitude_ft
 
-        max_roll = 0.0 if telemetry.airspeed_kts < v_rotate else float(takeoff_cfg.get("max_roll_cmd", 0.08))
+        agl_ft = (telemetry.agl_m * 3.28084) if not math.isnan(telemetry.agl_m) else 0.0
+
+        # No roll at all until airborne (AGL > 10ft) — keeps the plane tracking
+        # straight down the runway even after Vr rotation.
+        airborne = agl_ft > 10.0
+        max_roll = float(takeoff_cfg.get("max_roll_cmd", 0.08)) if airborne else 0.0
         max_pitch = float(takeoff_cfg.get("max_pitch_cmd", 0.12))
 
         # Yaw authority tapers from full at 0 kts down to 35% at 50 kts.
@@ -276,11 +290,39 @@ class ReactiveFlightDirector:
         hold_hdg = self._st.get("runway_hdg", self.ctx["targets"]["target_hdg_deg"])
 
         agl_m = telemetry.agl_m if not math.isnan(telemetry.agl_m) else 0.0
+        agl_ft = agl_m * 3.28084
         gear_down = agl_m <= 15.0
 
         throttle_min = float(climb_cfg.get("throttle_min", throttle_cfg.get("climb", 0.85)))
         overspeed_kts = float(climb_cfg.get("overspeed_kts", 10.0))
         throttle_cmd = min(throttle_min, 0.55) if telemetry.airspeed_kts > (v_climb + overspeed_kts) else throttle_min
+
+        # Roll gate: zero bank below 300ft AGL so the plane clears the runway
+        # environment in a straight line before any heading correction is applied.
+        # Ramps from 0 → max_roll linearly between 300ft and 600ft AGL.
+        max_roll_cfg = float(climb_cfg.get("max_roll_cmd", 0.15))
+        if agl_ft < 300.0:
+            roll_lim = 0.0
+        elif agl_ft < 600.0:
+            roll_lim = max_roll_cfg * (agl_ft - 300.0) / 300.0
+        else:
+            roll_lim = max_roll_cfg
+
+        # Heading hold via rudder while roll is restricted (< 600ft AGL).
+        # Without yaw authority the plane drifts off runway heading with no way to
+        # self-correct — roll is zero and yaw is zero, so heading error accumulates.
+        # Once roll is fully available (above 600ft) the aileron heading PID takes over
+        # and we retire the yaw hold.
+        takeoff_cfg = self.ctx.get("takeoff", {})
+        if agl_ft < 600.0:
+            yaw_hold = True
+            yaw_kp = float(takeoff_cfg.get("yaw_kp", 0.07))
+            yaw_ki = float(takeoff_cfg.get("yaw_ki", 0.02))
+            yaw_limit = float(takeoff_cfg.get("yaw_limit", 0.5))
+            yaw_full_deg = float(takeoff_cfg.get("yaw_full_deg", 5.0))
+        else:
+            yaw_hold = False
+            yaw_kp = yaw_ki = yaw_limit = yaw_full_deg = None
 
         return Targets(
             heading_deg=hold_hdg,
@@ -290,10 +332,15 @@ class ReactiveFlightDirector:
             throttle=min(float(climb_cfg.get("throttle_cap", 1.0)), throttle_cmd),
             brake_ratio=0.0,
             gear_down=gear_down,
-            roll_limit=float(climb_cfg.get("max_roll_cmd", 0.15)),
+            roll_limit=roll_lim,
             pitch_limit=float(climb_cfg.get("max_pitch_cmd", 0.15)),
             pitch_protect_kts=v_climb - 10.0,
             pitch_protect_gain=float(climb_cfg.get("pitch_protect_gain", 0.03)),
+            yaw_hold=yaw_hold,
+            yaw_kp=yaw_kp,
+            yaw_ki=yaw_ki,
+            yaw_limit=yaw_limit,
+            yaw_full_deg=yaw_full_deg,
         )
 
     def _cruise(
@@ -357,7 +404,7 @@ class ReactiveFlightDirector:
             throttle=None,       # airspeed PID regulates throttle for speed stability
             brake_ratio=0.0,
             gear_down=False,
-            pitch_limit=0.08,    # prevents PID saturation during altitude hold
+            pitch_limit=0.12,    # 0.08 was too tight — couldn't recover from gentle descents
             roll_limit=0.12,     # gentle bank → small altitude loss during turns
             pitch_protect_kts=v_stall + 20.0,
             pitch_protect_gain=0.03,
@@ -406,8 +453,26 @@ class ReactiveFlightDirector:
         # 3° glidepath: 318ft of descent per NM.  Arrive at 50ft AGL at threshold.
         glidepath_ft = terrain_msl_ft + max(0.0, dist_nm) * 318.0 + 50.0
 
+        # ── Speed bleed via nose-up ───────────────────────────────────────────
+        # If we arrive at approach overspeed (common when speed bleed in cruise
+        # didn't have enough distance), raise the altitude target above the
+        # glidepath to force the altitude PID nose-up.  A nose-up attitude trades
+        # kinetic energy for potential energy → airspeed drops without needing
+        # drag devices.  Cap the raise at +80ft so we don't balloon off the path.
+        spd_error = telemetry.airspeed_kts - v_approach
+        if spd_error > 10.0:
+            nose_up_ft = min(80.0, spd_error * 2.0)   # 2ft per kt over target
+        else:
+            nose_up_ft = 0.0
+
         # Only command descent — never zoom-climb up to a glidepath that's above us.
-        target_alt_ft = min(telemetry.altitude_ft, glidepath_ft)
+        target_alt_ft = min(telemetry.altitude_ft + nose_up_ft, glidepath_ft + nose_up_ft)
+        target_alt_ft = min(target_alt_ft, telemetry.altitude_ft + nose_up_ft)
+
+        # Flap schedule: half flap on approach, full inside 1nm.
+        # Flaps increase lift so the plane can fly slower without stalling —
+        # lowers approach speed from ~110kts toward the 70kts target.
+        flap_ratio = 1.0 if dist_nm < 1.0 else 0.5
 
         return Targets(
             heading_deg=hold_hdg,
@@ -419,6 +484,7 @@ class ReactiveFlightDirector:
             pitch_limit=0.12,
             pitch_protect_kts=v_stall + 10.0,
             pitch_protect_gain=0.03,
+            flap_ratio=flap_ratio,
         )
 
     def _land(
@@ -458,4 +524,5 @@ class ReactiveFlightDirector:
             brake_ratio=1.0 if on_ground else 0.0,
             gear_down=True,
             pitch_limit=0.10,   # caps nose-up so we don't balloon
+            flap_ratio=1.0,     # full flaps through touchdown and rollout
         )

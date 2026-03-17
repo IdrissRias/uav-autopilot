@@ -44,6 +44,7 @@ class Actuators:
     yaw: float
     brake_ratio: float = 0.0
     gear_down: bool = True
+    flap_ratio: float = 0.0   # 0.0 = up, 1.0 = full flaps
 
 
 @dataclass
@@ -64,6 +65,7 @@ class Targets:
     yaw_full_deg: float | None = None
     pitch_protect_kts: float | None = None
     pitch_protect_gain: float | None = None
+    flap_ratio: float | None = None   # 0.0 = up, 1.0 = full; None = don't change
 
 
 class Mode(str, Enum):

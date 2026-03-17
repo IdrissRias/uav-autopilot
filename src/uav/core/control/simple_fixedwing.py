@@ -117,6 +117,9 @@ class SimpleFixedWingController(Controller):
         # Gear: None means "don't change" — default to gear down (safe).
         gear_down = targets.gear_down if targets.gear_down is not None else True
 
+        # Flaps: None means "retract" (safe default for cruise/climb).
+        flap_ratio = targets.flap_ratio if targets.flap_ratio is not None else 0.0
+
         return Actuators(
             throttle=throttle_cmd,
             roll=roll_cmd,
@@ -124,4 +127,5 @@ class SimpleFixedWingController(Controller):
             yaw=yaw_cmd,
             brake_ratio=brake_ratio,
             gear_down=gear_down,
+            flap_ratio=flap_ratio,
         )

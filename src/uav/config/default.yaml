@@ -54,13 +54,13 @@ takeoff:
 
 nav:
   apt_dat_path: "/Users/idrisss/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
-  min_distance_nm: 10.0
+  min_distance_nm: 20.0
   max_distance_nm: 80.0
   fixed_destination:
-    icao: "65MN"
-    name: "Wheaton Muni"
-    lat: 45.97420
-    lon: -96.16370
+    icao: "KFFM"
+    name: "Fergus Falls Municipal"
+    lat: 46.28440
+    lon: -96.15640
 
 climb:
   max_roll_cmd: 0.15

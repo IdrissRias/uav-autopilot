@@ -7,6 +7,7 @@ from uav.core.guidance.simple_guidance import SimpleGuidance
 from uav.core.safety.limits import SafetyLimits, abort_actuators
 from uav.core.safety.failsafe import is_telemetry_stale
 from uav.logging.recorder import Recorder
+from uav.scoring.flight_scorer import FlightScorer
 from uav.sim.adapter_base import SimAdapter
 from uav.sim.types import Actuators, Telemetry
 
@@ -36,6 +37,9 @@ class Autopilot:
         self._reset_last_ts = 0.0
         self._reset_cooldown_s = 5.0
         self._monitor: dict = {}  # timers for phase-limit watchdog
+        self._scorer: FlightScorer | None = None
+        self._landed = False        # True once we've scored the current flight
+        self._prev_phase = "GROUND"
 
     def stop(self) -> None:
         self._running = False
@@ -170,6 +174,16 @@ class Autopilot:
                         if hasattr(self.adapter, "set_home"):
                             self.adapter.set_home(telemetry.lat_deg, telemetry.lon_deg, alt_m, telemetry.heading_deg)
                         print(f"NAV: dist={dist_nm:.1f}nm → cruise alt {cruise_alt_agl:.0f}ft AGL ({ctx['targets']['target_alt_ft']:.0f}ft MSL)")
+                        # Start scorer for this flight
+                        dest = ctx["destination"]
+                        self._scorer = FlightScorer(
+                            dest_icao=dest.get("icao", "???"),
+                            dest_lat=float(dest["lat"]),
+                            dest_lon=float(dest["lon"]),
+                            cruise_target_ft=ctx["targets"]["target_alt_ft"],
+                            log_dir="logs",
+                        )
+                        self._landed = False
             stale = (not telemetry.is_valid()) or is_telemetry_stale(telemetry, self.telemetry_timeout_s)
 
             now = time.time()
@@ -212,6 +226,26 @@ class Autopilot:
                 targets = self.guidance.compute(telemetry, desired)
                 dt = max(loop_start - self._last_step, 1e-3)
                 act = self.controller.compute(telemetry, targets, dt)
+
+                phase = self.mode_manager.name
+                # Update scorer every tick during flight
+                if self._scorer is not None:
+                    self._scorer.update(phase, telemetry.altitude_ft)
+                # Finalize score once on first LAND tick with wheels on ground
+                if (phase == "LAND"
+                        and self._prev_phase != "LAND"
+                        and not self._landed
+                        and self._scorer is not None
+                        and telemetry.has_position()):
+                    self._landed = True
+                    score = self._scorer.finalize(
+                        landing_lat=telemetry.lat_deg,
+                        landing_lon=telemetry.lon_deg,
+                        landing_speed_kts=telemetry.airspeed_kts,
+                    )
+                    self._scorer.print_summary(score)
+                    self._scorer.save(score)
+                self._prev_phase = phase
 
             act = self.safety.clamp(act)
             self._safe_write(act)

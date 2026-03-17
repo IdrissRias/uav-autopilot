@@ -52,7 +52,8 @@ class XPlaneUDP(SimAdapter):
 
         self._last_values: Dict[int, float] = {}
         self._last_ts: float = 0.0
-        self._gear_state: bool | None = None  # track last commanded gear position
+        self._gear_state: bool | None = None   # track last commanded gear position
+        self._flap_state: float | None = None  # track last commanded flap position
         self._home: tuple | None = None  # (lat, lon, alt_m, heading) set on first arm
 
         for idx, dataref in self.DATAREFS.items():
@@ -119,6 +120,7 @@ class XPlaneUDP(SimAdapter):
         self.set_yaw(act.yaw)
         self.set_brakes(act.brake_ratio)
         self.set_gear(act.gear_down)
+        self.set_flaps(act.flap_ratio)
 
     def set_throttle(self, value: float) -> None:
         self._send_dref(value, "sim/cockpit2/engine/actuators/throttle_ratio_all")
@@ -140,6 +142,14 @@ class XPlaneUDP(SimAdapter):
         self._send_dref(value, "sim/flightmodel/controls/parkbrake")
         self._send_dref(value, "sim/cockpit2/controls/left_brake_ratio")
         self._send_dref(value, "sim/cockpit2/controls/right_brake_ratio")
+
+    def set_flaps(self, ratio: float) -> None:
+        """Set flap position. 0.0 = retracted, 1.0 = full deflection.
+        Only writes when value changes by >0.02 to avoid flooding X-Plane."""
+        if self._flap_state is not None and abs(ratio - self._flap_state) < 0.02:
+            return
+        self._flap_state = ratio
+        self._send_dref(ratio, "sim/flightmodel/controls/flaprqst")
 
     def set_gear(self, gear_down: bool) -> None:
         # sim/cockpit/switches/gear_handle_status is read-only — use commands instead.
