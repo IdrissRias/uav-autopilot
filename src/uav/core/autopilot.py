@@ -8,6 +8,8 @@ from uav.core.safety.limits import SafetyLimits, abort_actuators
 from uav.core.safety.failsafe import is_telemetry_stale
 from uav.logging.recorder import Recorder
 from uav.scoring.flight_scorer import FlightScorer
+from uav.learning.flight_observer import FlightObserver
+from uav.learning.envelope_updater import update_envelope
 from uav.sim.adapter_base import SimAdapter
 from uav.sim.types import Actuators, Telemetry
 
@@ -23,6 +25,7 @@ class Autopilot:
         recorder: Recorder,
         loop_rate_hz: float,
         telemetry_timeout_s: float,
+        icao_type: str = "SF50",
     ) -> None:
         self.adapter = adapter
         self.controller = controller
@@ -40,6 +43,10 @@ class Autopilot:
         self._scorer: FlightScorer | None = None
         self._landed = False        # True once we've scored the current flight
         self._prev_phase = "GROUND"
+        self._icao_type = icao_type
+        # Flight observer: watches every tick, learns aircraft performance
+        self._observer: FlightObserver | None = None
+        self._observer_finalized = False
 
     def stop(self) -> None:
         self._running = False
@@ -184,6 +191,10 @@ class Autopilot:
                             log_dir="logs",
                         )
                         self._landed = False
+                        # Start flight observer for this flight
+                        self._observer = FlightObserver(self._icao_type)
+                        self._observer_finalized = False
+                        print(f"[PEREGRINE] Flight observer started for {self._icao_type}")
             stale = (not telemetry.is_valid()) or is_telemetry_stale(telemetry, self.telemetry_timeout_s)
 
             now = time.time()
@@ -228,10 +239,16 @@ class Autopilot:
                 act = self.controller.compute(telemetry, targets, dt)
 
                 phase = self.mode_manager.name
+
+                # ── Flight observer: feed every tick ──
+                if self._observer is not None:
+                    self._observer.observe(phase, telemetry, act)
+
                 # Update scorer every tick during flight
                 if self._scorer is not None:
                     self._scorer.update(phase, telemetry.altitude_ft)
-                # Finalize score once on first LAND tick with wheels on ground
+
+                # Finalize score + observer on first LAND tick with wheels on ground
                 if (phase == "LAND"
                         and self._prev_phase != "LAND"
                         and not self._landed
@@ -245,6 +262,19 @@ class Autopilot:
                     )
                     self._scorer.print_summary(score)
                     self._scorer.save(score)
+
+                    # ── Finalize observer: compile + write to Supabase ──
+                    if self._observer is not None and not self._observer_finalized:
+                        self._observer_finalized = True
+                        try:
+                            print(self._observer.summary())
+                            learned = self._observer.compile()
+                            updated = update_envelope(self._icao_type, learned)
+                            flights = updated.get("total_flights", "?")
+                            print(f"[PEREGRINE] Envelope updated → flight #{flights}")
+                        except Exception as e:
+                            print(f"[PEREGRINE] Envelope update failed: {e}")
+
                 self._prev_phase = phase
 
             act = self.safety.clamp(act)

@@ -1,0 +1,38 @@
+airframe_id: "sf50"
+name: "Cirrus Vision SF50"
+type: "light_jet"
+
+# These are FALLBACK values only — used if Supabase is unreachable.
+# In normal operation, all speeds come from the database via load_aircraft().
+speeds_kts:
+  v_stall: 86
+  v_rotate: 90
+  v_takeoff: 95
+  v_climb: 160
+  v_cruise: 200
+  v_approach: 83
+  v_land: 77
+  v_never_exceed: 250
+
+rates_fpm:
+  climb: 1600
+  descent: 700
+
+throttle:
+  takeoff: 1.0
+  climb: 0.95
+  cruise: 0.65
+  approach: 0.25
+  idle: 0.0
+
+limits:
+  max_roll_cmd: 0.35
+  max_pitch_cmd: 0.25
+  max_yaw_cmd: 1.0
+
+thresholds:
+  takeoff_to_climb_speed_kts: 90
+  rotate_altitude_gain_ft: 200
+  climb_to_cruise_altitude_tolerance_ft: 10
+  approach_transition_alt_ft: 1500
+  land_transition_alt_ft: 200

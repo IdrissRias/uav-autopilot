@@ -3,25 +3,16 @@ ports:
   xplane_port: 49000
   local_port: 49005
 
+# Which aircraft to load from the database.
+# All speeds, PID gains, and performance numbers come from Supabase.
 airframe:
-  id: "c172"
+  icao_type: "SF50"
 
 loop:
   rate_hz: 15
 
-controller:
-  heading_kp: 0.003
-  heading_ki: 0.0
-  heading_kd: 0.002
-  altitude_kp: 0.005
-  altitude_ki: 0.0
-  altitude_kd: 0.002
-  airspeed_kp: 0.02
-  airspeed_ki: 0.0
-  airspeed_kd: 0.005
-  cruise_throttle: 0.55
-  pitch_rate_limit_per_s: 1.0
-
+# Safety limits — these are structural, not aircraft-specific.
+# They cap the raw actuator commands regardless of what the controller asks for.
 safety:
   max_roll: 0.20
   max_pitch: 0.25
@@ -29,6 +20,7 @@ safety:
   throttle_min: 0.0
   throttle_max: 1.0
   telemetry_timeout_s: 2.0
+  pitch_rate_limit_per_s: 1.0
 
 mode:
   start_mode: "CRUISE"
@@ -38,19 +30,22 @@ mode:
   demo_sequence: false
   lock_heading: true
 
-targets:
-  target_alt_ft: 3000.0
-  target_hdg_deg: 90.0
-  target_airspeed_kts: 95.0
-
+# Takeoff behaviour — mechanical limits, not speed targets.
+# v_rotate comes from the aircraft envelope in the database.
 takeoff:
   throttle: 1.0
   max_roll_cmd: 0.08
-  max_pitch_cmd: 0.12
+  max_pitch_cmd: 0.10
   yaw_kp: 0.07
   yaw_ki: 0.02
   yaw_limit: 1.0
   yaw_full_deg: 0.3
+
+# Climb behaviour — mechanical limits only.
+climb:
+  max_roll_cmd: 0.15
+  max_pitch_cmd: 0.15
+  pitch_protect_gain: 0.03
 
 nav:
   apt_dat_path: "/Users/idrisss/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
@@ -61,9 +56,3 @@ nav:
     name: "Fergus Falls Municipal"
     lat: 46.28440
     lon: -96.15640
-
-climb:
-  max_roll_cmd: 0.15
-  max_pitch_cmd: 0.15
-  recover_fpm: 900
-  pitch_protect_gain: 0.03
