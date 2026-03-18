@@ -240,6 +240,7 @@ class ReactiveFlightDirector:
             throttle=throttle,
             brake_ratio=0.0,
             gear_down=True,
+            flap_ratio=0.5,     # SF50 takeoff flaps = 50%
             roll_limit=max_roll,
             pitch_limit=max_pitch,
             yaw_hold=True,
@@ -324,6 +325,10 @@ class ReactiveFlightDirector:
             yaw_hold = False
             yaw_kp = yaw_ki = yaw_limit = yaw_full_deg = None
 
+        # Retract takeoff flaps once above 300ft AGL and accelerating.
+        # Below 300ft keep 50% flaps for safety margin near stall.
+        climb_flaps = 0.5 if agl_ft < 300.0 else 0.0
+
         return Targets(
             heading_deg=hold_hdg,
             altitude_ft=next_tgt,
@@ -332,6 +337,7 @@ class ReactiveFlightDirector:
             throttle=min(float(climb_cfg.get("throttle_cap", 1.0)), throttle_cmd),
             brake_ratio=0.0,
             gear_down=gear_down,
+            flap_ratio=climb_flaps,
             roll_limit=roll_lim,
             pitch_limit=float(climb_cfg.get("max_pitch_cmd", 0.15)),
             pitch_protect_kts=v_climb - 10.0,
@@ -470,9 +476,15 @@ class ReactiveFlightDirector:
         target_alt_ft = min(target_alt_ft, telemetry.altitude_ft + nose_up_ft)
 
         # Flap schedule: half flap on approach, full inside 1nm.
-        # Flaps increase lift so the plane can fly slower without stalling —
-        # lowers approach speed from ~110kts toward the 70kts target.
-        flap_ratio = 1.0 if dist_nm < 1.0 else 0.5
+        # Speed-gated: SF50 VFE is 190kts for 50% flaps, 150kts for full.
+        # Don't deploy flaps until speed is below the limit — structural protection.
+        speed = telemetry.airspeed_kts
+        if dist_nm < 1.0 and speed < 150.0:
+            flap_ratio = 1.0   # full flaps for final
+        elif speed < 190.0:
+            flap_ratio = 0.5   # half flaps once slow enough
+        else:
+            flap_ratio = 0.0   # too fast for flaps
 
         return Targets(
             heading_deg=hold_hdg,
