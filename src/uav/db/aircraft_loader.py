@@ -1,18 +1,19 @@
-"""Peregrine — Load aircraft envelope from Supabase at startup.
+"""Peregrine — Load aircraft envelope from local SQLite database.
 
 The autopilot config (default.yaml) only specifies *which* aircraft to fly
 via `airframe.icao_type`. All speeds, PID gains, and performance numbers
-are pulled from the `aircraft` table.
+are pulled from the local SQLite `aircraft` table.
 
 Priority: learned_envelope (from Learn Mode) > seed values (from POH).
+Background sync keeps SQLite ↔ Supabase in agreement.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from .client import get_client
+from . import local_db
 
 
 @dataclass
@@ -54,9 +55,17 @@ class AircraftEnvelope:
     # Source tracking
     source: str = "seed"  # "seed", "learned", "hybrid"
 
+    # Control sensitivity (measured during calibration)
+    pitch_sensitivity: float = 0.0    # deg/s pitch rate per unit elevator input
+    roll_sensitivity: float = 0.0     # deg/s roll rate per unit aileron input
+    yaw_sensitivity: float = 0.0      # deg/s yaw rate per unit rudder input
+    throttle_sensitivity: float = 0.0 # kts/s acceleration per unit throttle
+    calibration_confidence: float = 0.0  # 0.0 = uncalibrated, 1.0 = fully calibrated
+    calibration_samples: int = 0
+
 
 def load_aircraft(icao_type: str) -> AircraftEnvelope:
-    """Fetch aircraft envelope from Supabase.
+    """Fetch aircraft envelope from local SQLite database.
 
     Reads the `aircraft` row for the given ICAO type code.
     If a `learned_envelope` JSON blob exists, its values take priority
@@ -64,16 +73,14 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
 
     Raises RuntimeError if the aircraft isn't in the database.
     """
-    client = get_client()
-    result = client.table("aircraft").select("*").eq("icao_type", icao_type).execute()
+    row = local_db.get_aircraft(icao_type)
 
-    if not result.data:
+    if not row:
         raise RuntimeError(
-            f"Aircraft '{icao_type}' not found in database. "
-            f"Add it via the Peregrine app or run a seed migration."
+            f"Aircraft '{icao_type}' not found in local database. "
+            f"Run a sync or check seed data."
         )
 
-    row = result.data[0]
     learned: Dict[str, Any] = row.get("envelope") or {}
     learned_speeds = learned.get("speeds_kts", {})
     learned_perf = learned.get("performance", {})
@@ -102,6 +109,9 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
     confidence = learned_count / len(speed_keys) if speed_keys else 0.0
     source = "learned" if confidence > 0.7 else "hybrid" if confidence > 0 else "seed"
 
+    # Load calibration sensitivity data
+    calibration = learned.get("calibration", {})
+
     envelope = AircraftEnvelope(
         icao_type=row.get("icao_type", icao_type),
         name=row.get("name", ""),
@@ -126,14 +136,25 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
 
         confidence=confidence,
         source=source,
+
+        pitch_sensitivity=float(calibration.get("pitch_sensitivity", 0.0)),
+        roll_sensitivity=float(calibration.get("roll_sensitivity", 0.0)),
+        yaw_sensitivity=float(calibration.get("yaw_sensitivity", 0.0)),
+        throttle_sensitivity=float(calibration.get("throttle_sensitivity", 0.0)),
+        calibration_confidence=float(calibration.get("confidence", 0.0)),
+        calibration_samples=int(calibration.get("samples", 0)),
     )
 
-    print(f"[PEREGRINE] Aircraft loaded: {envelope.name} ({envelope.icao_type})")
+    print(f"[PEREGRINE] Aircraft loaded from SQLite: {envelope.name} ({envelope.icao_type})")
     print(f"  Source: {envelope.source} | Confidence: {envelope.confidence:.0%}")
     print(f"  V_rotate={envelope.v_rotate} V_cruise={envelope.v_cruise} "
           f"V_approach={envelope.v_approach} V_land={envelope.v_land}")
     print(f"  Takeoff roll={envelope.takeoff_roll_ft}ft "
           f"Best climb={envelope.best_climb_fpm}fpm "
           f"Ceiling={envelope.service_ceiling}ft")
+    if envelope.calibration_confidence > 0:
+        print(f"  Calibration: {envelope.calibration_confidence:.0%} "
+              f"(pitch={envelope.pitch_sensitivity:.1f} roll={envelope.roll_sensitivity:.1f} "
+              f"throttle={envelope.throttle_sensitivity:.1f} deg-or-kts/s per unit)")
 
     return envelope

@@ -1,8 +1,10 @@
 """Peregrine — Envelope Updater.
 
 After each flight, merges new observations into the aircraft's
-learned_envelope in Supabase. Uses exponential moving average so
-recent flights have more weight, but old measurements aren't lost.
+learned_envelope in local SQLite. Background sync pushes to Supabase.
+
+Uses exponential moving average so recent flights have more weight,
+but old measurements aren't lost.
 
 Confidence increases with more samples:
   1 flight  → ~50% confidence
@@ -12,11 +14,12 @@ Confidence increases with more samples:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any, Dict, Optional
 
-from ..db.client import get_client
+from ..db import local_db
 
 log = logging.getLogger(__name__)
 
@@ -36,19 +39,12 @@ def update_envelope(icao_type: str, new_observations: Dict[str, Any]) -> Dict[st
     Returns:
         The updated learned_envelope dict (after merge)
     """
-    client = get_client()
+    row = local_db.get_aircraft(icao_type)
 
-    # Fetch current envelope
-    result = client.table("aircraft").select(
-        "id, envelope, flights_completed"
-    ).eq("icao_type", icao_type).execute()
-
-    if not result.data:
+    if not row:
         log.error(f"Aircraft {icao_type} not found in database")
         return {}
 
-    row = result.data[0]
-    aircraft_id = row["id"]
     existing: Dict[str, Any] = row.get("envelope") or {}
     flights_done = (row.get("flights_completed") or 0) + 1
 
@@ -75,12 +71,39 @@ def update_envelope(icao_type: str, new_observations: Dict[str, Any]) -> Dict[st
     if "pid_tuned" in existing:
         updated_envelope["pid_tuned"] = existing["pid_tuned"]
 
-    # Write back to Supabase
+    # Merge calibration sensitivity data (EMA blend)
+    new_cal = new_observations.get("calibration", {})
+    existing_cal = existing.get("calibration", {})
+    if new_cal.get("confidence", 0) > 0:
+        if existing_cal.get("confidence", 0) > 0:
+            # EMA blend existing + new
+            updated_envelope["calibration"] = {
+                "pitch_sensitivity": round(
+                    EMA_ALPHA * new_cal.get("pitch_sensitivity", 0)
+                    + (1 - EMA_ALPHA) * existing_cal.get("pitch_sensitivity", 0), 2),
+                "roll_sensitivity": round(
+                    EMA_ALPHA * new_cal.get("roll_sensitivity", 0)
+                    + (1 - EMA_ALPHA) * existing_cal.get("roll_sensitivity", 0), 2),
+                "yaw_sensitivity": round(
+                    EMA_ALPHA * new_cal.get("yaw_sensitivity", 0)
+                    + (1 - EMA_ALPHA) * existing_cal.get("yaw_sensitivity", 0), 2),
+                "throttle_sensitivity": round(
+                    EMA_ALPHA * new_cal.get("throttle_sensitivity", 0)
+                    + (1 - EMA_ALPHA) * existing_cal.get("throttle_sensitivity", 0), 2),
+                "confidence": round(min(0.95,
+                    max(new_cal.get("confidence", 0), existing_cal.get("confidence", 0))), 3),
+                "samples": existing_cal.get("samples", 0) + new_cal.get("samples", 0),
+            }
+        else:
+            # First calibration observation
+            updated_envelope["calibration"] = new_cal
+    elif existing_cal:
+        updated_envelope["calibration"] = existing_cal
+
+    # Write to SQLite (sync queue auto-pushes to Supabase)
     try:
-        client.table("aircraft").update({
-            "envelope": updated_envelope,
-            "flights_completed": flights_done,
-        }).eq("id", aircraft_id).execute()
+        local_db.update_aircraft_envelope(icao_type, updated_envelope, flights_done)
+        local_db.increment_flight_count(icao_type)
 
         log.info(f"[ENVELOPE] Updated {icao_type} envelope (flight #{flights_done})")
         _log_changes(existing_speeds, merged_speeds, existing_perf, merged_perf)

@@ -69,6 +69,216 @@ class CurveSample:
     lon: float
 
 
+# ── Control Sensitivity Tracker ──────────────────────────────
+
+class SensitivityTracker:
+    """Measures control sensitivity: how much aircraft response per unit input.
+
+    Passively observes actuator commands vs telemetry response.
+    Correlates input changes with delayed response changes (~0.3s lag).
+
+    Outputs:
+        pitch_sensitivity:    deg/s pitch rate per unit elevator input
+        roll_sensitivity:     deg/s roll rate per unit aileron input
+        yaw_sensitivity:      deg/s yaw rate per unit rudder input
+        throttle_sensitivity: kts/s acceleration per unit throttle
+    """
+
+    # Response delay: typical aircraft control lag
+    _RESPONSE_DELAY_S = 0.3
+    # Minimum input change to count as a meaningful sample
+    _MIN_INPUT_DELTA = 0.02
+    # Rolling window size for computing sensitivity
+    _WINDOW_SIZE = 200
+
+    def __init__(self) -> None:
+        # Buffers: (timestamp, input_value, response_rate)
+        self._pitch_samples: list[tuple[float, float, float]] = []
+        self._roll_samples: list[tuple[float, float, float]] = []
+        self._yaw_samples: list[tuple[float, float, float]] = []
+        self._throttle_samples: list[tuple[float, float, float]] = []
+
+        # Previous values for delta computation
+        self._prev_pitch_cmd: float | None = None
+        self._prev_roll_cmd: float | None = None
+        self._prev_yaw_cmd: float | None = None
+        self._prev_throttle: float | None = None
+
+        # Delayed input buffer: store (timestamp, cmd) to correlate with later response
+        self._pitch_cmd_history: list[tuple[float, float]] = []
+        self._roll_cmd_history: list[tuple[float, float]] = []
+        self._yaw_cmd_history: list[tuple[float, float]] = []
+        self._throttle_cmd_history: list[tuple[float, float]] = []
+
+        # Previous telemetry for rate computation
+        self._prev_pitch_deg: float | None = None
+        self._prev_roll_deg: float | None = None
+        self._prev_hdg_deg: float | None = None
+        self._prev_speed_kts: float | None = None
+        self._prev_time: float | None = None
+
+    def tick(self, telemetry: Any, actuators: Any, now: float) -> None:
+        """Call every autopilot tick with telemetry and actuator commands."""
+        if actuators is None:
+            return
+
+        pitch_deg = getattr(telemetry, 'pitch_deg', 0.0)
+        roll_deg = getattr(telemetry, 'roll_deg', 0.0)
+        hdg_deg = getattr(telemetry, 'heading_deg', 0.0)
+        speed_kts = getattr(telemetry, 'airspeed_kts', 0.0)
+
+        pitch_cmd = getattr(actuators, 'pitch', 0.0)
+        roll_cmd = getattr(actuators, 'roll', 0.0)
+        yaw_cmd = getattr(actuators, 'yaw', 0.0)
+        throttle = getattr(actuators, 'throttle', 0.0)
+
+        # Compute telemetry rates
+        if self._prev_time is not None:
+            dt = now - self._prev_time
+            if dt > 0.01:
+                pitch_rate = (pitch_deg - (self._prev_pitch_deg or 0)) / dt
+                roll_rate = (roll_deg - (self._prev_roll_deg or 0)) / dt
+                # Heading rate with wrapping
+                hdg_delta = hdg_deg - (self._prev_hdg_deg or 0)
+                if hdg_delta > 180: hdg_delta -= 360
+                if hdg_delta < -180: hdg_delta += 360
+                hdg_rate = hdg_delta / dt
+                speed_rate = (speed_kts - (self._prev_speed_kts or 0)) / dt
+
+                # Store command history for delayed correlation
+                self._pitch_cmd_history.append((now, pitch_cmd))
+                self._roll_cmd_history.append((now, roll_cmd))
+                self._yaw_cmd_history.append((now, yaw_cmd))
+                self._throttle_cmd_history.append((now, throttle))
+
+                # Trim old history
+                cutoff = now - 2.0
+                self._pitch_cmd_history = [(t, v) for t, v in self._pitch_cmd_history if t > cutoff]
+                self._roll_cmd_history = [(t, v) for t, v in self._roll_cmd_history if t > cutoff]
+                self._yaw_cmd_history = [(t, v) for t, v in self._yaw_cmd_history if t > cutoff]
+                self._throttle_cmd_history = [(t, v) for t, v in self._throttle_cmd_history if t > cutoff]
+
+                # Correlate: find command from RESPONSE_DELAY_S ago
+                delayed_pitch = self._get_delayed_cmd(self._pitch_cmd_history, now)
+                delayed_roll = self._get_delayed_cmd(self._roll_cmd_history, now)
+                delayed_yaw = self._get_delayed_cmd(self._yaw_cmd_history, now)
+                delayed_thr = self._get_delayed_cmd(self._throttle_cmd_history, now)
+
+                # Record samples where input was non-trivial
+                if delayed_pitch is not None and abs(delayed_pitch) > self._MIN_INPUT_DELTA:
+                    self._pitch_samples.append((now, delayed_pitch, pitch_rate))
+                if delayed_roll is not None and abs(delayed_roll) > self._MIN_INPUT_DELTA:
+                    self._roll_samples.append((now, delayed_roll, roll_rate))
+                if delayed_yaw is not None and abs(delayed_yaw) > self._MIN_INPUT_DELTA:
+                    self._yaw_samples.append((now, delayed_yaw, hdg_rate))
+                if delayed_thr is not None and abs(delayed_thr) > self._MIN_INPUT_DELTA:
+                    self._throttle_samples.append((now, delayed_thr, speed_rate))
+
+                # Trim to window size
+                for buf in (self._pitch_samples, self._roll_samples,
+                            self._yaw_samples, self._throttle_samples):
+                    if len(buf) > self._WINDOW_SIZE:
+                        del buf[:-self._WINDOW_SIZE]
+
+        self._prev_pitch_deg = pitch_deg
+        self._prev_roll_deg = roll_deg
+        self._prev_hdg_deg = hdg_deg
+        self._prev_speed_kts = speed_kts
+        self._prev_time = now
+
+        self._prev_pitch_cmd = pitch_cmd
+        self._prev_roll_cmd = roll_cmd
+        self._prev_yaw_cmd = yaw_cmd
+        self._prev_throttle = throttle
+
+    def _get_delayed_cmd(self, history: list[tuple[float, float]], now: float) -> float | None:
+        """Find the command value from RESPONSE_DELAY_S ago."""
+        target_time = now - self._RESPONSE_DELAY_S
+        best = None
+        best_dt = float('inf')
+        for t, v in history:
+            dt = abs(t - target_time)
+            if dt < best_dt:
+                best_dt = dt
+                best = v
+        # Only use if we found something within 0.1s of target
+        return best if best_dt < 0.1 else None
+
+    def _compute_sensitivity(self, samples: list[tuple[float, float, float]]) -> float:
+        """Compute sensitivity as slope of response_rate vs input using least squares.
+
+        Returns response_rate per unit input (deg/s per unit, or kts/s per unit).
+        """
+        if len(samples) < 20:
+            return 0.0
+
+        # Use numpy-free least squares: slope = Σ(xi*yi) / Σ(xi²)
+        # where x = input command, y = response rate
+        sum_xy = 0.0
+        sum_xx = 0.0
+        for _, cmd, rate in samples:
+            sum_xy += cmd * rate
+            sum_xx += cmd * cmd
+
+        if sum_xx < 1e-8:
+            return 0.0
+
+        slope = sum_xy / sum_xx
+        return abs(slope)  # sensitivity is always positive
+
+    @property
+    def pitch_sensitivity(self) -> float:
+        return self._compute_sensitivity(self._pitch_samples)
+
+    @property
+    def roll_sensitivity(self) -> float:
+        return self._compute_sensitivity(self._roll_samples)
+
+    @property
+    def yaw_sensitivity(self) -> float:
+        return self._compute_sensitivity(self._yaw_samples)
+
+    @property
+    def throttle_sensitivity(self) -> float:
+        return self._compute_sensitivity(self._throttle_samples)
+
+    @property
+    def total_samples(self) -> int:
+        return (len(self._pitch_samples) + len(self._roll_samples)
+                + len(self._yaw_samples) + len(self._throttle_samples))
+
+    @property
+    def confidence(self) -> float:
+        """Calibration confidence based on sample count and diversity."""
+        min_samples = min(
+            len(self._pitch_samples),
+            len(self._roll_samples),
+            len(self._throttle_samples),
+        )
+        # Need at least 20 samples per axis for any confidence
+        if min_samples < 20:
+            return 0.0
+        # Confidence grows: 50 samples → 0.5, 100 → 0.77, 200 → 0.95
+        return min(0.95, min_samples / (min_samples + 50))
+
+    def compile(self) -> dict:
+        """Return calibration data for storage."""
+        return {
+            "pitch_sensitivity": round(self.pitch_sensitivity, 2),
+            "roll_sensitivity": round(self.roll_sensitivity, 2),
+            "yaw_sensitivity": round(self.yaw_sensitivity, 2),
+            "throttle_sensitivity": round(self.throttle_sensitivity, 2),
+            "confidence": round(self.confidence, 3),
+            "samples": self.total_samples,
+            "per_axis_samples": {
+                "pitch": len(self._pitch_samples),
+                "roll": len(self._roll_samples),
+                "yaw": len(self._yaw_samples),
+                "throttle": len(self._throttle_samples),
+            },
+        }
+
+
 def _haversine_ft(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in feet between two lat/lon points."""
     R = 20_902_231.0  # earth radius in feet
@@ -171,6 +381,9 @@ class FlightObserver:
         self._prev_speed: Optional[float] = None
         self._vertical_speed_fpm: float = 0.0
 
+        # ── Control sensitivity tracker (calibration) ──
+        self._sensitivity = SensitivityTracker()
+
     # ── Tick-level observation ───────────────────────────────
 
     def observe(self, phase: str, telemetry: Any, actuators: Any = None) -> None:
@@ -224,6 +437,9 @@ class FlightObserver:
 
         # ── Air deceleration tracking (runs across phases) ──
         self._track_deceleration(speed, alt, agl_ft, throttle, lat, lon, now)
+
+        # ── Control sensitivity measurement (runs every tick) ──
+        self._sensitivity.tick(telemetry, actuators, now)
 
         # ── Passive stall detection ──
         if (speed < self._min_speed_observed * 1.2
@@ -710,6 +926,9 @@ class FlightObserver:
             for p in self._phase_history
         ]
 
+        # Control sensitivity (calibration data)
+        learned["calibration"] = self._sensitivity.compile()
+
         return learned
 
     def summary(self) -> str:
@@ -761,6 +980,17 @@ class FlightObserver:
                 gates = c["speed_gates"]
                 gate_str = " | ".join(f"{k}={v}kts" for k, v in gates.items())
                 lines.append(f"║  Gates: {gate_str}")
+
+        # Calibration
+        cal = data.get("calibration", {})
+        if cal.get("confidence", 0) > 0:
+            lines.append("╠══════════════════════════════════════════════╣")
+            lines.append("║  CONTROL SENSITIVITY (CALIBRATION)           ║")
+            lines.append(f"║  Pitch:    {cal.get('pitch_sensitivity', 0):>6.1f} deg/s per unit       ║")
+            lines.append(f"║  Roll:     {cal.get('roll_sensitivity', 0):>6.1f} deg/s per unit       ║")
+            lines.append(f"║  Yaw:      {cal.get('yaw_sensitivity', 0):>6.1f} deg/s per unit       ║")
+            lines.append(f"║  Throttle: {cal.get('throttle_sensitivity', 0):>6.1f} kts/s per unit       ║")
+            lines.append(f"║  Confidence: {cal.get('confidence', 0):>3.0%} ({cal.get('samples', 0)} samples)       ║")
 
         lines.append("╚══════════════════════════════════════════════╝")
         return "\n".join(lines)
