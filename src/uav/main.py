@@ -121,9 +121,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--director",
-        choices=["pid", "rl", "blended"],
-        default="pid",
-        help="Flight director: pid (default), rl (full RL), blended (PID+RL per phase)",
+        choices=["pid", "ribbon", "rl", "blended"],
+        default="ribbon",
+        help="Flight director: ribbon (default, V2 path follower), pid (V1 reactive), rl (full RL), blended (PID+RL per phase)",
     )
     parser.add_argument(
         "--rl-model",
@@ -303,6 +303,10 @@ def main() -> None:
             ctx=ctx, rl_model_path=args.rl_model, rl_phases=rl_phases,
         )
         print(f"[PEREGRINE] Director: Blended (RL phases: {rl_phases})")
+    elif args.director == "ribbon":
+        from uav.core.flight_engine import FlightEngine
+        mode_manager = FlightEngine(ctx=ctx)
+        print("[PEREGRINE] Director: Ribbon (V2 path follower)")
     else:
         mode_manager = ReactiveFlightDirector(ctx=ctx)
         print("[PEREGRINE] Director: PID")
@@ -339,6 +343,12 @@ def main() -> None:
         wait_for_fly_command=args.wait_for_fly,
         aircraft_id=aircraft_id,
     )
+
+    # Wire up safety envelope for V2 (always active, protects all directors)
+    from uav.core.safety_envelope import enforce_envelope
+    autopilot._safety_envelope = enforce_envelope
+    autopilot._v_stall = float(airframe.get("speeds_kts", {}).get("v_stall", 77.0))
+    autopilot._v_ne = float(airframe.get("speeds_kts", {}).get("v_never_exceed", 250.0))
 
     _autopilot_ref[0] = autopilot  # wire up broadcast command handler
 

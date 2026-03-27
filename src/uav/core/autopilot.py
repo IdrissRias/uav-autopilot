@@ -69,6 +69,11 @@ class Autopilot:
         self._snapshot_tick: int = 0      # tick counter for snapshots
         self._end_flight_requested = False  # set by app "end_flight" command
 
+        # Safety envelope (V2): descent rate + stall + overspeed + bank
+        self._safety_envelope = None  # set externally if desired
+        self._v_stall = 77.0
+        self._v_ne = 250.0
+
     def handle_command(self, data: dict) -> None:
         """Handle a command from the app (via Supabase Broadcast).
 
@@ -336,6 +341,168 @@ class Autopilot:
 
         broadcast.publish_telemetry(data)
 
+    def _build_and_broadcast_plan(self, telemetry, ctx, dest, ground_msl_ft, initial_target, dist_nm) -> None:
+        """Build flight plan (V2 ribbon or V1 waypoints), create scorer, observer, flight record."""
+        # ── Try V2 ribbon path first ──
+        from uav.core.flight_engine import FlightEngine
+        if isinstance(self.mode_manager, FlightEngine):
+            try:
+                from uav.nav.flight_plan_v2 import plan_path, format_ribbon
+                dest_rwy = ctx.get("dest_runway")
+                rwy = self._runway_detection
+                ribbon = plan_path(
+                    dep_lat=telemetry.lat_deg,
+                    dep_lon=telemetry.lon_deg,
+                    dep_alt_ft=telemetry.altitude_ft,
+                    dep_heading=rwy.runway_heading_deg if rwy and rwy.detected else telemetry.heading_deg,
+                    dest_lat=float(dest["lat"]),
+                    dest_lon=float(dest["lon"]),
+                    dest_alt_ft=float(dest_rwy["elevation_ft"]) if dest_rwy and dest_rwy.get("elevation_ft") is not None else ground_msl_ft,
+                    dest_rwy_heading=dest_rwy["heading"] if dest_rwy else None,
+                    dest_threshold_lat=dest_rwy["threshold_lat"] if dest_rwy else None,
+                    dest_threshold_lon=dest_rwy["threshold_lon"] if dest_rwy else None,
+                    cruise_alt_ft=initial_target,
+                    v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
+                    v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 160.0)),
+                    v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
+                    v_approach=float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0)),
+                    v_land=float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0)),
+                    climb_fpm=float(ctx["airframe"].get("rates_fpm", {}).get("climb", 1600.0)),
+                    takeoff_roll_ft=float(ctx["airframe"].get("takeoff_roll_ft", 2000.0)),
+                )
+                # Pre-build ribbon so FlightEngine doesn't rebuild it
+                self.mode_manager._ribbon = ribbon
+                self.mode_manager._built = True
+                self.mode_manager._idx = 0
+                print(format_ribbon(ribbon))
+
+                # Broadcast ribbon waypoints to the app for map display
+                # Sample every ~10 points to keep the broadcast small
+                step = max(1, len(ribbon.points) // 50)
+                try:
+                    broadcast.publish_status({
+                        "event": "flight_plan",
+                        "waypoints": [
+                            {
+                                "name": p.phase,
+                                "lat": round(p.lat, 6),
+                                "lon": round(p.lon, 6),
+                                "alt_ft": round(p.alt_ft, 0),
+                                "speed_kts": round(p.speed_kts, 1),
+                                "phase": p.phase,
+                                "heading": round(p.heading_deg, 1),
+                            }
+                            for i, p in enumerate(ribbon.points) if i % step == 0
+                        ],
+                    })
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[RIBBON] Flight plan generation failed: {e}")
+                import traceback; traceback.print_exc()
+        else:
+            # ── V1 flight plan (legacy) ──
+            try:
+                from uav.nav.flight_plan import build_flight_plan, format_plan
+                dest_rwy = ctx.get("dest_runway")
+                rwy = self._runway_detection
+                plan = build_flight_plan(
+                    dep_lat=telemetry.lat_deg,
+                    dep_lon=telemetry.lon_deg,
+                    dep_alt_ft=telemetry.altitude_ft,
+                    dep_heading=rwy.runway_heading_deg if rwy and rwy.detected else telemetry.heading_deg,
+                    dest_lat=float(dest["lat"]),
+                    dest_lon=float(dest["lon"]),
+                    dest_alt_ft=float(ctx.get("dest_runway", {}).get("elevation_ft", ground_msl_ft) or ground_msl_ft),
+                    dest_rwy_heading=ctx.get("dest_runway", {}).get("heading"),
+                    dest_threshold_lat=ctx.get("dest_runway", {}).get("threshold_lat"),
+                    dest_threshold_lon=ctx.get("dest_runway", {}).get("threshold_lon"),
+                    v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
+                    v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 130.0)),
+                    v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
+                    v_approach=float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0)),
+                    v_land=float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0)),
+                    cruise_alt_ft=initial_target,
+                    takeoff_roll_ft=float(ctx["airframe"].get("takeoff_roll_ft", 2000.0)),
+                )
+                ctx["flight_plan"] = plan
+                print(format_plan(plan))
+                try:
+                    broadcast.publish_status({
+                        "event": "flight_plan",
+                        "waypoints": [
+                            {
+                                "name": wp.name,
+                                "lat": round(wp.lat, 6),
+                                "lon": round(wp.lon, 6),
+                                "alt_ft": round(wp.alt_ft, 0),
+                                "speed_kts": round(wp.speed_kts, 1),
+                                "phase": wp.phase,
+                                "heading": round(wp.heading, 1) if wp.heading is not None else None,
+                            }
+                            for wp in plan.waypoints
+                        ],
+                    })
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[GPS] Flight plan generation failed: {e}")
+                import traceback; traceback.print_exc()
+
+        # ── Scorer + Observer + Flight Record (shared by V1 and V2) ──
+        dest_info = ctx["destination"]
+        self._scorer = FlightScorer(
+            dest_icao=dest_info.get("icao", "???"),
+            dest_lat=float(dest_info["lat"]),
+            dest_lon=float(dest_info["lon"]),
+            cruise_target_ft=ctx["targets"]["target_alt_ft"],
+            log_dir="logs",
+        )
+        self._landed = False
+
+        self._observer = FlightObserver(self._icao_type)
+        self._observer_finalized = False
+        print(f"[PEREGRINE] Flight observer started for {self._icao_type}")
+
+        # Finalize any previous in-progress flight
+        if self._flight_id:
+            self._finalize_active_flight(telemetry, status="aborted", reason="New flight started")
+
+        # Create flight record in database
+        try:
+            rwy = self._runway_detection
+            dep_icao = rwy.airport_icao if rwy and rwy.detected else None
+            dep_rwy = rwy.runway_designator if rwy and rwy.detected else None
+            arr_icao = dest_info.get("icao")
+            arr_rwy_data = ctx.get("dest_runway")
+            arr_rwy = arr_rwy_data.get("designator") if arr_rwy_data else None
+
+            flight_rec = local_db.create_flight(
+                aircraft_id=self._aircraft_id,
+                dep_airport_icao=dep_icao,
+                dep_runway_designator=dep_rwy,
+                arr_airport_icao=arr_icao,
+                arr_runway_designator=arr_rwy,
+                route_distance_nm=dist_nm,
+                cruise_alt_target_ft=ctx["targets"]["target_alt_ft"],
+            )
+            self._flight_id = flight_rec["id"]
+            print(f"[PEREGRINE] Flight record created: {self._flight_id[:8]}... ({dep_icao} → {arr_icao})")
+
+            local_db.log_event(
+                self._flight_id, "takeoff_roll",
+                message=f"Takeoff roll started on {dep_rwy or 'unknown'} at {dep_icao or 'unknown'}",
+                altitude_ft=telemetry.altitude_ft,
+                airspeed_kts=telemetry.airspeed_kts,
+                heading_deg=telemetry.heading_deg,
+                lat=telemetry.lat_deg if telemetry.has_position() else None,
+                lon=telemetry.lon_deg if telemetry.has_position() else None,
+                phase="GROUND",
+            )
+        except Exception as e:
+            print(f"[PEREGRINE] Flight record creation failed: {e}")
+            self._flight_id = None
+
     def stop(self) -> None:
         self._running = False
 
@@ -567,54 +734,8 @@ class Autopilot:
                                 ctx["takeoff_alt_ft"] = telemetry.altitude_ft
                                 print(f"NAV: dist={dist_nm:.1f}nm → cruise alt {cruise_alt_agl:.0f}ft AGL ({initial_target:.0f}ft MSL) [fixed]")
 
-                                # ── Build flight plan (GPS waypoints) ──
-                                try:
-                                    from uav.nav.flight_plan import build_flight_plan, format_plan
-                                    dest_rwy = ctx.get("dest_runway")
-                                    rwy = self._runway_detection
-                                    plan = build_flight_plan(
-                                        dep_lat=telemetry.lat_deg,
-                                        dep_lon=telemetry.lon_deg,
-                                        dep_alt_ft=telemetry.altitude_ft,
-                                        dep_heading=rwy.runway_heading_deg if rwy and rwy.detected else telemetry.heading_deg,
-                                        dest_lat=float(dest["lat"]),
-                                        dest_lon=float(dest["lon"]),
-                                        dest_alt_ft=float(dest_rwy["elevation_ft"]) if dest_rwy and dest_rwy.get("elevation_ft") is not None else ground_msl_ft,
-                                        dest_rwy_heading=dest_rwy["heading"] if dest_rwy else None,
-                                        dest_threshold_lat=dest_rwy["threshold_lat"] if dest_rwy else None,
-                                        dest_threshold_lon=dest_rwy["threshold_lon"] if dest_rwy else None,
-                                        v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
-                                        v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 130.0)),
-                                        v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
-                                        v_approach=float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0)),
-                                        v_land=float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0)),
-                                        cruise_alt_ft=initial_target,
-                                        takeoff_roll_ft=float(ctx["airframe"].get("takeoff_roll_ft", 2000.0)),
-                                    )
-                                    ctx["flight_plan"] = plan
-                                    print(format_plan(plan))
-                                    # Broadcast waypoints to the app for map display
-                                    try:
-                                        broadcast.publish_status({
-                                            "event": "flight_plan",
-                                            "waypoints": [
-                                                {
-                                                    "name": wp.name,
-                                                    "lat": round(wp.lat, 6),
-                                                    "lon": round(wp.lon, 6),
-                                                    "alt_ft": round(wp.alt_ft, 0),
-                                                    "speed_kts": round(wp.speed_kts, 1),
-                                                    "phase": wp.phase,
-                                                    "heading": round(wp.heading, 1) if wp.heading is not None else None,
-                                                }
-                                                for wp in plan.waypoints
-                                            ],
-                                        })
-                                    except Exception:
-                                        pass
-                                except Exception as e:
-                                    print(f"[GPS] Flight plan generation failed: {e}")
-                                    import traceback; traceback.print_exc()
+                                # ── Build flight plan ──
+                                self._build_and_broadcast_plan(telemetry, ctx, dest, ground_msl_ft, initial_target, dist_nm)
                             except Exception as e:
                                 print(f"[NAV] Cruise alt calc failed: {e}")
                     self._fly_command_received = True
@@ -724,109 +845,9 @@ class Autopilot:
                             self.adapter.set_home(telemetry.lat_deg, telemetry.lon_deg, alt_m, telemetry.heading_deg)
                         print(f"NAV: dist={dist_nm:.1f}nm → cruise alt {cruise_alt_agl:.0f}ft AGL ({initial_target:.0f}ft MSL) [fixed]")
 
-                        # ── Build flight plan (GPS waypoints) ──
-                        try:
-                            from uav.nav.flight_plan import build_flight_plan, format_plan
-                            dest = ctx["destination"]
-                            dest_rwy = ctx.get("dest_runway")
-                            rwy = self._runway_detection
-                            plan = build_flight_plan(
-                                dep_lat=telemetry.lat_deg,
-                                dep_lon=telemetry.lon_deg,
-                                dep_alt_ft=telemetry.altitude_ft,
-                                dep_heading=rwy.runway_heading_deg if rwy and rwy.detected else telemetry.heading_deg,
-                                dest_lat=float(dest["lat"]),
-                                dest_lon=float(dest["lon"]),
-                                dest_alt_ft=ground_msl_ft,  # assume similar field elevation
-                                dest_rwy_heading=dest_rwy["heading"] if dest_rwy else None,
-                                dest_threshold_lat=dest_rwy["threshold_lat"] if dest_rwy else None,
-                                dest_threshold_lon=dest_rwy["threshold_lon"] if dest_rwy else None,
-                                v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
-                                v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 130.0)),
-                                v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
-                                v_approach=float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0)),
-                                v_land=float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0)),
-                                cruise_alt_ft=initial_target,
-                                takeoff_roll_ft=float(ctx["airframe"].get("takeoff_roll_ft", 2000.0)),
-                            )
-                            ctx["flight_plan"] = plan
-                            print(format_plan(plan))
-                            # Broadcast waypoints to the app for map display
-                            try:
-                                broadcast.publish_status({
-                                    "event": "flight_plan",
-                                    "waypoints": [
-                                        {
-                                            "name": wp.name,
-                                            "lat": round(wp.lat, 6),
-                                            "lon": round(wp.lon, 6),
-                                            "alt_ft": round(wp.alt_ft, 0),
-                                            "speed_kts": round(wp.speed_kts, 1),
-                                            "phase": wp.phase,
-                                            "heading": round(wp.heading, 1) if wp.heading is not None else None,
-                                        }
-                                        for wp in plan.waypoints
-                                    ],
-                                })
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            print(f"[GPS] Flight plan generation failed: {e}")
-                            import traceback; traceback.print_exc()
-                        # Start scorer for this flight
+                        # ── Build flight plan + scorer + flight record ──
                         dest = ctx["destination"]
-                        self._scorer = FlightScorer(
-                            dest_icao=dest.get("icao", "???"),
-                            dest_lat=float(dest["lat"]),
-                            dest_lon=float(dest["lon"]),
-                            cruise_target_ft=ctx["targets"]["target_alt_ft"],
-                            log_dir="logs",
-                        )
-                        self._landed = False
-                        # Start flight observer for this flight
-                        self._observer = FlightObserver(self._icao_type)
-                        self._observer_finalized = False
-                        print(f"[PEREGRINE] Flight observer started for {self._icao_type}")
-
-                        # ── Finalize any previous in-progress flight ──
-                        if self._flight_id:
-                            self._finalize_active_flight(telemetry, status="aborted", reason="New flight started")
-
-                        # ── Create flight record in database ──
-                        try:
-                            rwy = self._runway_detection
-                            dep_icao = rwy.airport_icao if rwy and rwy.detected else None
-                            dep_rwy = rwy.runway_designator if rwy and rwy.detected else None
-                            arr_icao = dest.get("icao")
-                            arr_rwy_data = ctx.get("dest_runway")
-                            arr_rwy = arr_rwy_data.get("designator") if arr_rwy_data else None
-
-                            flight_rec = local_db.create_flight(
-                                aircraft_id=self._aircraft_id,
-                                dep_airport_icao=dep_icao,
-                                dep_runway_designator=dep_rwy,
-                                arr_airport_icao=arr_icao,
-                                arr_runway_designator=arr_rwy,
-                                route_distance_nm=dist_nm,
-                                cruise_alt_target_ft=ctx["targets"]["target_alt_ft"],
-                            )
-                            self._flight_id = flight_rec["id"]
-                            print(f"[PEREGRINE] Flight record created: {self._flight_id[:8]}... ({dep_icao} → {arr_icao})")
-
-                            # Log takeoff event
-                            local_db.log_event(
-                                self._flight_id, "takeoff_roll",
-                                message=f"Takeoff roll started on {dep_rwy or 'unknown'} at {dep_icao or 'unknown'}",
-                                altitude_ft=telemetry.altitude_ft,
-                                airspeed_kts=telemetry.airspeed_kts,
-                                heading_deg=telemetry.heading_deg,
-                                lat=telemetry.lat_deg if telemetry.has_position() else None,
-                                lon=telemetry.lon_deg if telemetry.has_position() else None,
-                                phase="GROUND",
-                            )
-                        except Exception as e:
-                            print(f"[PEREGRINE] Flight record creation failed: {e}")
-                            self._flight_id = None
+                        self._build_and_broadcast_plan(telemetry, ctx, dest, ground_msl_ft, initial_target, dist_nm)
             stale = (not telemetry.is_valid()) or is_telemetry_stale(telemetry, self.telemetry_timeout_s)
 
             now = time.time()
@@ -1061,6 +1082,13 @@ class Autopilot:
                 self._observer_finalized = False
                 broadcast.publish_status({"event": "flight_ended", "reason": "user_ended"})
                 print("[END FLIGHT] Flight ended — back to preflight")
+
+            # Safety envelope: descent rate, stall, overspeed, bank limits
+            if targets is not None and self._safety_envelope:
+                targets, act, _corr = self._safety_envelope(
+                    telemetry, targets, act,
+                    v_stall=self._v_stall, v_never_exceed=self._v_ne,
+                )
 
             act = self.safety.clamp(act)
             self._safe_write(act)
