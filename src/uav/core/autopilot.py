@@ -350,6 +350,18 @@ class Autopilot:
                 from uav.nav.flight_plan_v2 import plan_path, format_ribbon
                 dest_rwy = ctx.get("dest_runway")
                 rwy = self._runway_detection
+
+                # Sanity cap: v_approach must never exceed v_land + 15.
+                # Bad calibration data can produce absurd approach speeds
+                # (e.g. 147 kts on an SF50 when it should be ~80).
+                v_land_cap = float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0))
+                v_approach_raw = float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0))
+                v_approach_capped = min(v_approach_raw, v_land_cap + 15.0)
+                if v_approach_capped != v_approach_raw:
+                    print(f"[NAV] Capping v_approach {v_approach_raw:.0f} → {v_approach_capped:.0f} kts (v_land + 15)")
+                    # Write back to ctx so flight engine and controller also see capped value
+                    ctx["airframe"]["speeds_kts"]["v_approach"] = v_approach_capped
+
                 ribbon = plan_path(
                     dep_lat=telemetry.lat_deg,
                     dep_lon=telemetry.lon_deg,
@@ -365,7 +377,7 @@ class Autopilot:
                     v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
                     v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 160.0)),
                     v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
-                    v_approach=float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0)),
+                    v_approach=v_approach_capped,
                     v_land=float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0)),
                     climb_fpm=float(ctx["airframe"].get("rates_fpm", {}).get("climb", 1600.0)),
                     takeoff_roll_ft=float(ctx["airframe"].get("takeoff_roll_ft", 2000.0)),
@@ -507,86 +519,13 @@ class Autopilot:
         self._running = False
 
     def _check_phase_limits(self, mode: str, telemetry) -> str | None:
-        """Return a failure reason string if the flight is in an unacceptable state, else None."""
-        now = time.time()
-        ctx = self.mode_manager.ctx
-        ms = self._monitor
+        """Return a failure reason string if the flight is in an unacceptable state, else None.
 
-        if mode == "CLIMB":
-            target_alt = ctx.get("targets", {}).get("target_alt_ft", telemetry.altitude_ft)
-            # If we're massively above cruise target, X-Plane started mid-air at wrong altitude.
-            if telemetry.altitude_ft > target_alt + 1000.0:
-                if "climb_high_since" not in ms:
-                    ms["climb_high_since"] = now
-                elif now - ms["climb_high_since"] >= 5.0:
-                    ms.pop("climb_high_since", None)
-                    return f"CLIMB alt {telemetry.altitude_ft:.0f}ft >1000ft above cruise target {target_alt:.0f}ft"
-            else:
-                ms.pop("climb_high_since", None)
-
-        elif mode == "CRUISE":
-            target_alt = ctx.get("targets", {}).get("target_alt_ft", telemetry.altitude_ft)
-            alt_error = telemetry.altitude_ft - target_alt
-
-            # Hard upper limit: if the plane is way above target for a sustained
-            # period, it's out of control.  Short overshoots during turns are normal.
-            if alt_error > 800.0:
-                if "high_since" not in ms:
-                    ms["high_since"] = now
-                elif now - ms["high_since"] >= 10.0:
-                    ms.pop("high_since", None)
-                    return f"CRUISE alt {telemetry.altitude_ft:.0f}ft is >800ft above target {target_alt:.0f}ft for >10s"
-            else:
-                ms.pop("high_since", None)
-
-            # Sustained low altitude (altitude loss from turns not recovering).
-            if alt_error < -500.0:
-                if "low_since" not in ms:
-                    ms["low_since"] = now
-                elif now - ms["low_since"] >= 15.0:
-                    ms.pop("low_since", None)
-                    return f"CRUISE alt {telemetry.altitude_ft:.0f}ft >500ft below target for >15s"
-            else:
-                ms.pop("low_since", None)
-
-            # Circling: stuck with large heading error for too long.
-            dest = ctx.get("destination")
-            if dest and telemetry.has_position():
-                try:
-                    from uav.nav.geo import bearing_deg as _bd
-                    true_bearing = _bd(
-                        telemetry.lat_deg, telemetry.lon_deg,
-                        float(dest["lat"]), float(dest["lon"]),
-                    )
-                    raw_err = true_bearing - telemetry.heading_deg
-                    while raw_err > 180.0:
-                        raw_err -= 360.0
-                    while raw_err < -180.0:
-                        raw_err += 360.0
-                    hdg_err = abs(raw_err)
-                    if hdg_err > 90.0:
-                        if "circle_since" not in ms:
-                            ms["circle_since"] = now
-                        elif now - ms["circle_since"] >= 30.0:
-                            ms.pop("circle_since", None)
-                            return f"CRUISE heading error {hdg_err:.0f}° for >30s (circling)"
-                    else:
-                        ms.pop("circle_since", None)
-                except Exception:
-                    pass
-
-        elif mode == "APPROACH":
-            # Airspeed is now managed by the PID, so no hard reset threshold here.
-            pass
-
-        # Clear stale timers when not in a monitored phase.
-        if mode not in ("CRUISE",):
-            ms.pop("low_since", None)
-            ms.pop("high_since", None)
-            ms.pop("circle_since", None)
-        if mode not in ("CLIMB",):
-            ms.pop("climb_high_since", None)
-
+        NOTE: Disabled for V2 ribbon autopilot.  The V1 watchdog was triggering
+        false resets during normal ribbon-following (altitude deviations during
+        descent, heading changes during turns).  The ribbon + safety envelope
+        provide their own protection now.
+        """
         return None
 
     def _safe_write(self, act: Actuators) -> None:
@@ -1091,6 +1030,9 @@ class Autopilot:
                 )
 
             act = self.safety.clamp(act)
+            if act.flap_ratio > 0.01 and not getattr(self, '_flap_dbg', False):
+                print(f"[DEBUG-FLAP] flap_ratio={act.flap_ratio:.2f} phase={getattr(targets, 'flap_ratio', '?')}", flush=True)
+                self._flap_dbg = True
             self._safe_write(act)
 
             # If we were in a reset grace window and telemetry is good again, re-arm modes.

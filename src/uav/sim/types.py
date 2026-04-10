@@ -16,6 +16,8 @@ class Telemetry:
     lat_deg: float = math.nan
     lon_deg: float = math.nan
     agl_m: float = math.nan
+    vs_fpm: float = math.nan       # vertical speed (ft/min) — positive = climbing
+    groundspeed_kts: float = math.nan
 
     def is_valid(self) -> bool:
         # Valid attitude/airspeed/alt/heading telemetry (position optional).
@@ -66,6 +68,7 @@ class Targets:
     pitch_protect_kts: float | None = None
     pitch_protect_gain: float | None = None
     flap_ratio: float | None = None   # 0.0 = up, 1.0 = full; None = don't change
+    reset_alt_pid: bool = False        # True on phase entry to clear accumulated bias
 
 
 class Mode(str, Enum):

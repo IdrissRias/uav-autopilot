@@ -88,8 +88,8 @@ class SimpleFixedWingController(Controller):
         altitude_pid: PID,
         airspeed_pid: PID,
         cruise_throttle: float,
-        pitch_rate_limit_per_s: float = 2.0,
-        roll_rate_limit_per_s: float = 0.3,
+        pitch_rate_limit_per_s: float = 2.0,   # smooth pitch transitions
+        roll_rate_limit_per_s: float = 0.25,  # slower roll transitions for smoothness
         gains: ControlGains | None = None,
     ) -> None:
         self.heading_pid = heading_pid  # kept for API compat but no longer drives roll
@@ -103,6 +103,13 @@ class SimpleFixedWingController(Controller):
         self._prev_roll_cmd = 0.0
         self._prev_bank_deg = 0.0   # for bank rate damping
         self._prev_hdg_deg = None    # for heading rate damping (yaw) — None = first tick
+        # Vertical speed PID — closed-loop descent control.
+        # Input: VS error (target_vs - actual_vs) in fpm
+        # Output: ABSOLUTE pitch command (not cumulative adjustment)
+        # Kp=0.00004: 500fpm error → 0.02 pitch (very gentle)
+        # Ki=0.000005: very slow integral — just eliminates steady-state offset
+        # Kd=0.00006: strong damping to prevent overshoot/oscillation
+        self.vs_pid = PID(kp=0.00004, ki=0.000005, kd=0.00006, integral_limit=0.08)
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -149,20 +156,53 @@ class SimpleFixedWingController(Controller):
         pitch_cmd = self.altitude_pid.update(alt_error, dt)
         throttle_cmd = self.cruise_throttle
 
-        # CLIMB behavior: constant moderate pitch while below target.
-        # Like a real pilot: set pitch and power, climb at whatever rate results.
-        # Near the target, blend smoothly to level flight.
+        # FIXED RATE climb/descent with CLOSED-LOOP VS control.
+        # The VS PID compares actual vertical speed to target and adjusts
+        # pitch incrementally. No open-loop formula — pure feedback.
         if targets.throttle is not None and targets.climb_rate_fpm is not None:
             throttle_cmd = targets.throttle
-            if alt_error > 200.0:
-                # Well below target: hold steady climb pitch
-                pitch_cmd = 0.07
-            elif alt_error > 0:
-                # Approaching target: blend from climb pitch to level (0.07 → 0.0)
-                pitch_cmd = 0.07 * (alt_error / 200.0)
+            rate_fpm = targets.climb_rate_fpm
+            import math as _m
+
+            if rate_fpm >= 0:
+                # CLIMB: fixed pitch, blend to level near target altitude
+                if alt_error > 200.0:
+                    pitch_cmd = 0.07
+                elif alt_error > 0:
+                    pitch_cmd = 0.07 * (alt_error / 200.0)
+                else:
+                    pitch_cmd = max(-0.15, alt_error * 0.0003)
+                self.vs_pid.reset()
+                if hasattr(self, '_descent_baseline'):
+                    del self._descent_baseline
             else:
-                # Above target: gentle push down, proportional
-                pitch_cmd = max(-0.15, alt_error * 0.0003)
+                # DESCENT — closed-loop vertical speed control.
+                # The VS PID reads ACTUAL vertical speed from X-Plane
+                # and outputs a pitch correction to track the target VS.
+                #
+                # The PID output is an ABSOLUTE pitch offset from a
+                # neutral baseline — NOT cumulative. This prevents
+                # double-integration oscillation.
+                actual_vs = telemetry.vs_fpm if not _m.isnan(telemetry.vs_fpm) else 0.0
+                target_vs = rate_fpm  # negative (e.g. -600 fpm)
+
+                # VS error: negative = need more descent, positive = descending too fast
+                vs_error = target_vs - actual_vs
+
+                # PID outputs an ABSOLUTE pitch offset from neutral
+                pitch_offset = self.vs_pid.update(vs_error, dt)
+
+                # Baseline: whatever pitch was holding level flight
+                # (typically negative at high speed, e.g. -0.10)
+                baseline = getattr(self, '_descent_baseline', self._prev_pitch_cmd)
+                if not hasattr(self, '_descent_baseline'):
+                    self._descent_baseline = self._prev_pitch_cmd
+
+                pitch_cmd = baseline + pitch_offset
+
+                # Clamp: don't pitch beyond reasonable descent limits
+                pitch_cmd = max(-0.25, min(0.02, pitch_cmd))
+
             self.altitude_pid.reset()
             self.airspeed_pid.reset()
         else:

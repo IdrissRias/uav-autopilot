@@ -24,6 +24,8 @@ class XPlaneUDP(SimAdapter):
         5: "sim/flightmodel/position/latitude",
         6: "sim/flightmodel/position/longitude",
         7: "sim/flightmodel/position/y_agl",  # metres above ground
+        8: "sim/flightmodel/position/vh_ind_fpm",  # vertical speed (ft/min)
+        9: "sim/flightmodel/position/groundspeed",  # m/s
     }
 
     def __init__(
@@ -77,6 +79,13 @@ class XPlaneUDP(SimAdapter):
         self.sock.sendto(msg, self.xplane_addr)
 
     def read_telemetry(self) -> Telemetry:
+        # Re-subscribe if data is stale (X-Plane may have restarted)
+        if self._last_ts and (time.time() - self._last_ts) > 5.0:
+            for idx, dataref in self.DATAREFS.items():
+                self._send_rref(self.freq_hz, idx, dataref)
+            self._last_values.clear()  # don't serve ancient cached values
+            self._last_ts = 0.0
+
         while True:
             try:
                 data, _ = self.sock.recvfrom(1024)
@@ -101,6 +110,9 @@ class XPlaneUDP(SimAdapter):
         lat = self._last_values.get(5, math.nan)
         lon = self._last_values.get(6, math.nan)
         agl_m = self._last_values.get(7, math.nan)
+        vs_fpm = self._last_values.get(8, math.nan)
+        gs_ms = self._last_values.get(9, math.nan)
+        gs_kts = gs_ms * 1.94384 if not math.isnan(gs_ms) else math.nan  # m/s → kts
         return Telemetry(
             airspeed_kts=airspeed,
             altitude_ft=alt,
@@ -111,6 +123,8 @@ class XPlaneUDP(SimAdapter):
             lat_deg=lat,
             lon_deg=lon,
             agl_m=agl_m,
+            vs_fpm=vs_fpm,
+            groundspeed_kts=gs_kts,
         )
 
     def write_actuators(self, act: Actuators) -> None:
@@ -171,8 +185,8 @@ class XPlaneUDP(SimAdapter):
 
     def _send_posi(self, lat: float, lon: float, alt_m: float, pitch: float, roll: float, heading: float) -> None:
         """Teleport aircraft via XPlaneConnect POSI packet."""
-        # Format: header(5s) + ac_idx(b) + lat(d) + lon(f) + alt_m(f) + pitch(f) + roll(f) + hdg(f) + gear(f)
-        data = struct.pack(b"<5sbdfffffff",
+        # Format: header(5s) + ac_idx(b) + lat(d) + lon(d) + alt_m(d) + pitch(f) + roll(f) + hdg(f) + gear(f)
+        data = struct.pack(b"<5sbdddffff",
             b"POSI\0", 0,
             float(lat), float(lon), float(alt_m),
             float(pitch), float(roll), float(heading),

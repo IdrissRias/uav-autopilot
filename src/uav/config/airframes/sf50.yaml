@@ -27,7 +27,7 @@ throttle:
 
 limits:
   max_roll_cmd: 0.35
-  max_pitch_cmd: 0.25
+  max_pitch_cmd: 1.0
   max_yaw_cmd: 1.0
 
 thresholds:

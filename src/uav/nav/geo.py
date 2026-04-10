@@ -22,3 +22,24 @@ def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
     brng = math.degrees(math.atan2(y, x))
     return (brng + 360.0) % 360.0
+
+
+def destination_point(
+    lat: float, lon: float, distance_m: float, bearing: float,
+) -> tuple[float, float]:
+    """Compute destination lat/lon from a start point, bearing (deg), and distance (m)."""
+    R = 6371000.0
+    brng = math.radians(bearing)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+    d = distance_m / R
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(d) +
+        math.cos(lat1) * math.sin(d) * math.cos(brng)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(brng) * math.sin(d) * math.cos(lat1),
+        math.cos(d) - math.sin(lat1) * math.sin(lat2),
+    )
+    return (math.degrees(lat2), math.degrees(lon2))

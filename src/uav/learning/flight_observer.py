@@ -97,6 +97,8 @@ class SensitivityTracker:
         self._roll_samples: list[tuple[float, float, float]] = []
         self._yaw_samples: list[tuple[float, float, float]] = []
         self._throttle_samples: list[tuple[float, float, float]] = []
+        self._tick_count = 0
+        self._last_debug = 0.0
 
         # Previous values for delta computation
         self._prev_pitch_cmd: float | None = None
@@ -187,6 +189,23 @@ class SensitivityTracker:
         self._prev_time = now
 
         self._prev_pitch_cmd = pitch_cmd
+
+        # Debug: periodic status
+        self._tick_count += 1
+        if now - self._last_debug > 5.0:
+            self._last_debug = now
+            # Check delayed cmd state for debug
+            dp = self._get_delayed_cmd(self._pitch_cmd_history, now)
+            dr = self._get_delayed_cmd(self._roll_cmd_history, now)
+            dt_ = self._get_delayed_cmd(self._throttle_cmd_history, now)
+            print(f"[SENSITIVITY] ticks={self._tick_count} "
+                  f"samples=P{len(self._pitch_samples)}/R{len(self._roll_samples)}"
+                  f"/T{len(self._throttle_samples)} "
+                  f"cmd=[p={pitch_cmd:.3f} r={roll_cmd:.3f} t={throttle:.3f}] "
+                  f"delayed=[p={dp} r={dr} t={dt_}] "
+                  f"hist_len=P{len(self._pitch_cmd_history)}/R{len(self._roll_cmd_history)} "
+                  f"prev_time={'set' if self._prev_time else 'None'}",
+                  flush=True)
         self._prev_roll_cmd = roll_cmd
         self._prev_yaw_cmd = yaw_cmd
         self._prev_throttle = throttle

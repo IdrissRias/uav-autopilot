@@ -65,6 +65,12 @@ async def _run_broadcast(command_callback: Optional[Callable] = None) -> None:
         log.warning("Supabase credentials not found — broadcast disabled")
         return
 
+    # Bypass HTTP proxy for WebSocket connections (proxies break WSS)
+    _saved_proxies = {}
+    for pvar in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        if pvar in os.environ:
+            _saved_proxies[pvar] = os.environ.pop(pvar)
+
     try:
         _client = AsyncRealtimeClient(ws_url, token=key)
         await _client.connect()
@@ -126,6 +132,9 @@ async def _run_broadcast(command_callback: Optional[Callable] = None) -> None:
 
         _connected = True
 
+        # Restore proxy env vars now that WSS is connected
+        os.environ.update(_saved_proxies)
+
         # Keep the connection alive
         while True:
             await asyncio.sleep(1)
@@ -133,6 +142,8 @@ async def _run_broadcast(command_callback: Optional[Callable] = None) -> None:
     except Exception as e:
         log.warning(f"Broadcast connection failed: {e}")
         _connected = False
+        # Restore proxy env vars on failure too
+        os.environ.update(_saved_proxies)
 
 
 def start(command_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
@@ -304,7 +315,7 @@ def publish_heartbeat(aircraft_id: str, data: Dict[str, Any]) -> None:
         clean = {k: v for k, v in data.items() if v is not None}
         client.table("aircraft").update(clean).eq("id", aircraft_id).execute()
     except Exception as e:
-        log.debug(f"Heartbeat write failed: {e}")
+        print(f"[HEARTBEAT] Write failed: {e}", flush=True)
 
 
 def poll_fly_command(aircraft_id: str) -> Optional[Dict[str, Any]]:
@@ -347,6 +358,32 @@ def poll_fly_command(aircraft_id: str) -> Optional[Dict[str, Any]]:
         log.debug(f"Fly command poll failed: {e}")
 
     return None
+
+
+def poll_aircraft_status(aircraft_id: str) -> Optional[str]:
+    """Read the current status field from the aircraft row.
+
+    Returns the status string, or None on failure.
+    Clears calibrate_requested after reading to prevent re-triggering.
+    """
+    client = _get_supabase_client()
+    if client is None:
+        return None
+
+    try:
+        row = (client.table("aircraft")
+               .select("status")
+               .eq("id", aircraft_id)
+               .single()
+               .execute())
+        status = row.data.get("status") if row.data else None
+        if status == "calibrate_requested":
+            # Clear so we don't re-trigger
+            client.table("aircraft").update({"status": "calibrating"}).eq("id", aircraft_id).execute()
+        return status
+    except Exception as e:
+        log.debug(f"Status poll failed: {e}")
+        return None
 
 
 def poll_end_flight(aircraft_id: str) -> bool:

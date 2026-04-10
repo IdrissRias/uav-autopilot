@@ -65,6 +65,9 @@ class CalibrationDirector:
     _MAX_PITCH_DEG = 15.0        # max pitch during calibration
     _STALL_MARGIN_KTS = 15.0     # keep above stall + this margin
 
+    # Altitude AGL at which we transition from takeoff to calibration
+    _CALIBRATION_ALT_AGL_FT = 2000.0
+
     def __init__(
         self,
         ctx: dict,
@@ -90,8 +93,19 @@ class CalibrationDirector:
         self._hold_altitude: float = 0.0
         self._hold_speed: float = 0.0
 
-        # Define calibration steps
+        # Takeoff delegation — use the reactive director for takeoff + climb.
+        # Enable demo_sequence so the reactive director doesn't require a destination.
+        from uav.core.reactive_director import ReactiveFlightDirector
+        if "mode" not in ctx:
+            ctx["mode"] = {}
+        ctx["mode"]["demo_sequence"] = True
+        self._takeoff_director = ReactiveFlightDirector(ctx=ctx)
+        self._takeoff_complete = False
+        self._field_elevation_set = False
+
+        # Define calibration steps (takeoff is handled separately before these)
         self._steps = [
+            CalibrationStep("takeoff", "Taking off and climbing to safe altitude", 120.0),
             CalibrationStep("stabilize", "Stabilizing — straight and level", 10.0),
             CalibrationStep("pitch_test", "Pitch sensitivity test", 30.0),
             CalibrationStep("roll_test", "Roll sensitivity test", 30.0),
@@ -129,25 +143,62 @@ class CalibrationDirector:
         agl_ft = (telemetry.agl_m * 3.28084) if not math.isnan(telemetry.agl_m) else 0.0
         now = time.monotonic()
 
-        # First tick: capture reference values
+        # First tick: start the takeoff step
         if not self._started:
             self._started = True
-            self._hold_heading = telemetry.heading_deg
-            self._hold_altitude = telemetry.altitude_ft
-            self._hold_speed = telemetry.airspeed_kts
             self._steps[0].started_at = now
+            self._phase = "TAKEOFF"
             self._report_progress()
-            print(f"[CALIBRATION] Starting — hold HDG={self._hold_heading:.0f} "
-                  f"ALT={self._hold_altitude:.0f} SPD={self._hold_speed:.0f}")
+            print(f"[CALIBRATION] Taking off — will climb to "
+                  f"{self._CALIBRATION_ALT_AGL_FT:.0f}ft AGL before starting maneuvers")
 
-        # Safety check: if too low or too slow, hold steady
+        current = self._steps[self._current_step_idx]
+
+        # ── Step 0: Takeoff — delegate to ReactiveFlightDirector ──
+        if current.name == "takeoff":
+            if not self._takeoff_complete:
+                # Set calibration target altitude based on field elevation
+                if not self._field_elevation_set and agl_ft < 50.0:
+                    field_elev = telemetry.altitude_ft
+                    cal_target = field_elev + self._CALIBRATION_ALT_AGL_FT + 500.0
+                    if "targets" in self.ctx:
+                        self.ctx["targets"]["target_alt_ft"] = cal_target
+                    self._field_elevation_set = True
+                    print(f"[CALIBRATION] Field elevation ~{field_elev:.0f}ft MSL, "
+                          f"climbing to {cal_target:.0f}ft MSL")
+
+                # Let the reactive director handle takeoff + climb
+                targets = self._takeoff_director.step(telemetry, stale)
+                self._phase = f"TAKEOFF ({self._takeoff_director.name})"
+
+                # Check if we've reached calibration altitude
+                if agl_ft >= self._CALIBRATION_ALT_AGL_FT:
+                    self._takeoff_complete = True
+                    # Capture reference values at calibration altitude
+                    self._hold_heading = telemetry.heading_deg
+                    self._hold_altitude = telemetry.altitude_ft
+                    v_cruise = float(self.ctx.get("airframe", {}).get("speeds_kts", {}).get("v_cruise", 200.0))
+                    self._hold_speed = v_cruise
+                    self._phase = "CALIBRATING"
+                    print(f"[CALIBRATION] Reached {agl_ft:.0f}ft AGL — starting calibration maneuvers")
+                    print(f"[CALIBRATION] Hold HDG={self._hold_heading:.0f} "
+                          f"ALT={self._hold_altitude:.0f} SPD={self._hold_speed:.0f}")
+                    # Advance to next step
+                    current.completed = True
+                    self._current_step_idx += 1
+                    self._steps[self._current_step_idx].started_at = now
+                    self._maneuver_phase = 0
+                    self._maneuver_timer = now
+                    self._report_progress()
+                return targets
+
+        # ── Safety check for calibration maneuvers (not during takeoff) ──
         airframe = self.ctx.get("airframe", {})
         v_stall = float(airframe.get("speeds_kts", {}).get("v_stall", 60.0))
         if agl_ft < self._MIN_AGL_FT or telemetry.airspeed_kts < v_stall + self._STALL_MARGIN_KTS:
             return self._hold_steady(telemetry)
 
         # Get current step
-        current = self._steps[self._current_step_idx]
         if not current.started_at:
             current.started_at = now
             self._maneuver_phase = 0

@@ -39,7 +39,7 @@ def enforce_envelope(
     *,
     v_stall: float = 77.0,
     v_never_exceed: float = 250.0,
-    max_bank_deg: float = 30.0,
+    max_bank_deg: float = 70.0,
 ) -> tuple[Targets, Actuators, EnvelopeCorrection]:
     """Apply safety envelope overrides.
 

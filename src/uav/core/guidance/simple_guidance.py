@@ -36,4 +36,5 @@ class SimpleGuidance(Guidance):
             yaw_full_deg=desired.yaw_full_deg,
             pitch_protect_kts=desired.pitch_protect_kts,
             pitch_protect_gain=desired.pitch_protect_gain,
+            reset_alt_pid=desired.reset_alt_pid,
         )

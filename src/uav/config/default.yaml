@@ -15,12 +15,12 @@ loop:
 # They cap the raw actuator commands regardless of what the controller asks for.
 safety:
   max_roll: 0.20
-  max_pitch: 0.25
+  max_pitch: 1.0
   max_yaw: 0.35
   throttle_min: 0.0
   throttle_max: 1.0
   telemetry_timeout_s: 2.0
-  pitch_rate_limit_per_s: 1.0
+  pitch_rate_limit_per_s: 0.5
 
 mode:
   start_mode: "CRUISE"
@@ -35,15 +35,13 @@ mode:
 takeoff:
   throttle: 1.0
   max_roll_cmd: 0.08
-  max_pitch_cmd: 0.10
-  yaw_kp: 0.07
-  yaw_ki: 0.02
-  yaw_limit: 1.0
-  yaw_full_deg: 0.3
+  max_pitch_cmd: 0.15
+  yaw_kp: 0.035
+  yaw_limit: 0.20
 
 # Climb behaviour — mechanical limits only.
 climb:
-  max_roll_cmd: 0.15
+  max_roll_cmd: 0.20
   max_pitch_cmd: 0.15
   pitch_protect_gain: 0.03
 
@@ -51,8 +49,4 @@ nav:
   apt_dat_path: "/Users/idrisss/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
   min_distance_nm: 20.0
   max_distance_nm: 80.0
-  fixed_destination:
-    icao: "KFFM"
-    name: "Fergus Falls Municipal"
-    lat: 46.28440
-    lon: -96.15640
+  fixed_destination: null
