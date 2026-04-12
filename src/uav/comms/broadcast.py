@@ -309,10 +309,16 @@ def publish_heartbeat(aircraft_id: str, data: Dict[str, Any]) -> None:
         return
 
     try:
-        import datetime
+        import datetime, math
         data["last_heartbeat"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        # Strip None values so Supabase doesn't overwrite with null
-        clean = {k: v for k, v in data.items() if v is not None}
+        # Strip None and NaN/Inf values — JSON doesn't support them
+        def _safe(v):
+            if v is None:
+                return False
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return False
+            return True
+        clean = {k: v for k, v in data.items() if _safe(v)}
         client.table("aircraft").update(clean).eq("id", aircraft_id).execute()
     except Exception as e:
         print(f"[HEARTBEAT] Write failed: {e}", flush=True)

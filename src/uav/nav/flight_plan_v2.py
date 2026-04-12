@@ -6,13 +6,18 @@ as a dense ribbon of hundreds of PathPoints, spaced ~0.1 nm apart.
 Each point carries lat, lon, altitude, speed, heading, phase, and
 gear/flap config.
 
-Build-from-both-ends strategy:
-  FORWARD  from departure runway:  GROUND → CLIMB  →  top-of-climb
-  BACKWARD from destination runway: ROLLOUT ← FLARE ← APPROACH ← DESCENT ← TOD
-  CRUISE fills the gap between top-of-climb and TOD.
+Architecture: BUILD FORWARD ONLY.
+  1. GROUND — takeoff roll on departure heading
+  2. CLIMB  — climb to cruise alt, turning toward destination
+  3. CRUISE — straight line toward destination (optional, skipped if short)
+  4. DESCENT — constant-rate descent, decelerating to approach speed
+  5. APPROACH — final segment on runway heading, 3° glideslope
+  6. FLARE  — last 50ft, arresting descent
+  7. ROLLOUT — on the ground, braking
 
-Both runway endpoints are pinned to exact database coordinates.
-Any accumulated error lives in CRUISE where it doesn't matter.
+The landing segments (APPROACH/FLARE/ROLLOUT) are pinned to the destination
+runway threshold. The planner computes where to START descending by working
+backward from the threshold mathematically, then flies forward to that point.
 """
 from __future__ import annotations
 
@@ -53,12 +58,6 @@ class RibbonPath:
 
     def nearest_ahead(self, lat: float, lon: float, heading: float,
                       last_idx: int = 0) -> int:
-        """Return the index of the nearest ribbon point that is ahead of
-        (lat, lon) travelling on *heading*.
-
-        Searches forward from *last_idx* (monotonic — never goes backward)
-        within a window of 200 points.  This keeps the search O(1) per tick.
-        """
         best_idx = last_idx
         best_dist = math.inf
         end = min(last_idx + 200, len(self.points))
@@ -69,9 +68,8 @@ class RibbonPath:
             p = self.points[i]
             dlat = p.lat - lat
             dlon = (p.lon - lon) * math.cos(math.radians(lat))
-            # Project onto heading vector — positive = ahead
             along = dlat * cos_h + dlon * sin_h
-            if along < -0.001:  # behind us
+            if along < -0.001:
                 continue
             d = dlat * dlat + dlon * dlon
             if d < best_dist:
@@ -81,7 +79,6 @@ class RibbonPath:
         return best_idx
 
     def lookahead(self, idx: int, dist_nm: float) -> int:
-        """Return the index of the point ~dist_nm ahead of *idx*."""
         target = self.points[idx].dist_from_start_nm + dist_nm
         for i in range(idx, len(self.points)):
             if self.points[i].dist_from_start_nm >= target:
@@ -91,15 +88,14 @@ class RibbonPath:
 
 # ─── Helpers ──────────────────────────────────────────────────────────
 
-def _destination_point(lat: float, lon: float, bearing_deg_: float,
-                       dist_m: float) -> tuple[float, float]:
+def _dest_pt(lat: float, lon: float, bearing_deg_: float,
+             dist_m: float) -> tuple[float, float]:
     """Return (lat, lon) that is *dist_m* metres from (lat, lon) on bearing."""
     R = 6_371_000.0
     d = dist_m / R
     brng = math.radians(bearing_deg_)
     lat1 = math.radians(lat)
     lon1 = math.radians(lon)
-
     lat2 = math.asin(
         math.sin(lat1) * math.cos(d) +
         math.cos(lat1) * math.sin(d) * math.cos(brng)
@@ -125,10 +121,9 @@ def _wrap180(a: float) -> float:
 
 # ─── Path Builder ─────────────────────────────────────────────────────
 
-_STEP_NM = 0.1          # ribbon density: one point every ~185 m
+_STEP_NM = 0.1
 _STEP_M = _STEP_NM * 1852.0
-_GLIDESLOPE_DEG = 3.0   # 318 ft per nm descent
-_GLIDE_FT_PER_NM = 318.0
+_GLIDE_FT_PER_NM = 318.0   # 3° glideslope
 
 
 def plan_path(
@@ -153,56 +148,71 @@ def plan_path(
     climb_fpm: float = 1600.0,
     takeoff_roll_ft: float = 2000.0,
 ) -> RibbonPath:
-    """Build the full ribbon from departure to arrival.
+    """Build the full ribbon FORWARD from departure to arrival.
 
-    Strategy: build from BOTH ENDS and meet in the middle.
-
-      FORWARD  (from departure):  GROUND → CLIMB  →  top-of-climb
-      BACKWARD (from destination): ROLLOUT ← FLARE ← APPROACH ← DESCENT ← TOD
-      CRUISE connects top-of-climb to TOD.
-
-    Both runway endpoints are exact coordinates — no drift.
+    Key principles:
+      - Cruise is straight — no turns. Turns happen only in CLIMB.
+      - Short flights skip cruise entirely.
+      - Descent uses constant V/S — the plane decelerates and descends simultaneously.
+      - Landing segments are pinned to the actual runway threshold.
     """
-
-    # ── Resolve destination runway ────────────────────────────────────
-    thr_lat = dest_threshold_lat if dest_threshold_lat is not None else dest_lat
-    thr_lon = dest_threshold_lon if dest_threshold_lon is not None else dest_lon
-    rwy_hdg = dest_rwy_heading if dest_rwy_heading is not None else bearing_deg(
-        dep_lat, dep_lon, dest_lat, dest_lon,
-    )
-    approach_hdg = rwy_hdg
-
-    # ══════════════════════════════════════════════════════════════════
-    # PART 1: BUILD FORWARD — departure end
-    # ══════════════════════════════════════════════════════════════════
-    fwd: list[PathPoint] = []
+    pts: list[PathPoint] = []
     cumul_nm = 0.0
 
-    # ── GROUND (takeoff roll) ────────────────────────────────────────
+    # Resolve destination runway
+    thr_lat = dest_threshold_lat if dest_threshold_lat is not None else dest_lat
+    thr_lon = dest_threshold_lon if dest_threshold_lon is not None else dest_lon
+    approach_hdg = dest_rwy_heading if dest_rwy_heading is not None else bearing_deg(
+        dep_lat, dep_lon, dest_lat, dest_lon,
+    )
+
+    # ── Pre-compute key distances ───────────────────────────────────
+    total_dist_nm = haversine_m(dep_lat, dep_lon, thr_lat, thr_lon) / 1852.0
+
+    # How far does the approach segment extend back from the threshold?
+    approach_alt = dest_alt_ft + 500.0  # approach starts 500ft above runway
+    approach_nm = max(0.5, (approach_alt - dest_alt_ft - 50.0) / _GLIDE_FT_PER_NM)
+
+    # How far does descent extend back from approach start?
+    alt_to_descend = cruise_alt_ft - approach_alt
+    descent_nm = alt_to_descend / _GLIDE_FT_PER_NM if alt_to_descend > 0 else 0.0
+    # Add ~3nm for deceleration at cruise altitude
+    decel_nm = max(1.0, (v_cruise - v_approach) / 40.0)
+    total_descent_nm = descent_nm + decel_nm
+
+    # How far does climb take?
+    time_per_step_s = _STEP_M / (v_climb * 0.5144)
+    alt_per_step = (climb_fpm / 60.0) * time_per_step_s
+    climb_steps = max(1, int((cruise_alt_ft - dep_alt_ft) / max(alt_per_step, 0.1)))
+    climb_nm = climb_steps * _STEP_NM
+
+    # Is there room for cruise?
+    cruise_available_nm = total_dist_nm - climb_nm - total_descent_nm - approach_nm
+    has_cruise = cruise_available_nm > 0.5
+
+    # ── 1. GROUND (takeoff roll) ────────────────────────────────────
+    lat, lon = dep_lat, dep_lon
     roll_nm = takeoff_roll_ft / 6076.0
     n_roll = max(1, int(roll_nm / _STEP_NM))
-    lat, lon = dep_lat, dep_lon
     for i in range(n_roll):
         t = i / max(n_roll - 1, 1)
         spd = _lerp(0.0, v_rotate, t)
-        fwd.append(PathPoint(
+        pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=dep_alt_ft, speed_kts=spd,
             heading_deg=dep_heading, phase="GROUND",
             gear_down=True, flap_ratio=0.5, dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _destination_point(lat, lon, dep_heading, _STEP_M)
+        lat, lon = _dest_pt(lat, lon, dep_heading, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── CLIMB ────────────────────────────────────────────────────────
+    # ── 2. CLIMB — turn toward destination, climb to cruise alt ─────
     alt = dep_alt_ft
-    time_per_step_s = _STEP_M / (v_climb * 0.5144)
-    alt_per_step = (climb_fpm / 60.0) * time_per_step_s
-
     hdg = dep_heading
-    turn_rate = 3.0  # degrees per step — gentle turn during climb
+    turn_rate = 3.0  # degrees per step
 
     while alt < cruise_alt_ft:
         agl = alt - dep_alt_ft
+        # Turn toward destination above 600ft AGL
         if agl > 600.0:
             target_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
             err = _wrap180(target_hdg - hdg)
@@ -212,190 +222,142 @@ def plan_path(
         gear = agl < 50.0
         flap = 0.5 if agl < 300.0 else 0.0
 
-        fwd.append(PathPoint(
+        pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=alt, speed_kts=v_climb,
             heading_deg=hdg, phase="CLIMB",
             gear_down=gear, flap_ratio=flap, dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _destination_point(lat, lon, hdg, _STEP_M)
+        lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
         cumul_nm += _STEP_NM
         alt = min(alt + alt_per_step, cruise_alt_ft)
-
-        if len(fwd) > 5000:
+        if len(pts) > 5000:
             break
 
-    # ── TURN TO COURSE — level off at cruise altitude and complete the
-    # turn toward destination BEFORE entering cruise. The plane should be
-    # wings-level and on heading when cruise begins — no aggressive turns.
-    turn_rate_cruise = 2.0  # gentle 2° per step at cruise alt
-
-    for _ in range(500):  # safety cap
-        # Recalculate bearing each step since position changes during turn
-        target_cruise_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
-        hdg_remaining = abs(_wrap180(target_cruise_hdg - hdg))
-        if hdg_remaining < 2.0:
+    # Complete the turn at cruise altitude before entering cruise
+    for _ in range(500):
+        target_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
+        if abs(_wrap180(target_hdg - hdg)) < 2.0:
             break
-
-        err = _wrap180(target_cruise_hdg - hdg)
-        advance = max(-turn_rate_cruise, min(turn_rate_cruise, err))
+        err = _wrap180(target_hdg - hdg)
+        advance = max(-2.0, min(2.0, err))
         hdg = (hdg + advance) % 360.0
-
-        fwd.append(PathPoint(
+        pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=v_climb,
-            heading_deg=hdg, phase="CLIMB",  # still CLIMB phase during turn
+            heading_deg=hdg, phase="CLIMB",
             gear_down=False, flap_ratio=0.0, dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _destination_point(lat, lon, hdg, _STEP_M)
+        lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
         cumul_nm += _STEP_NM
-
-        if len(fwd) > 5000:
+        if len(pts) > 5000:
             break
 
-    toc_lat, toc_lon = lat, lon
+    # ── 3. CRUISE — straight line, no turns ─────────────────────────
+    if has_cruise:
+        n_cruise = max(1, int(cruise_available_nm / _STEP_NM))
+        for i in range(n_cruise):
+            # Heading: straight toward destination (recalc for great circle)
+            hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
+            # Speed: ramp up from v_climb to v_cruise in first 2nm
+            t_accel = min(1.0, (i * _STEP_NM) / 2.0)
+            spd = _lerp(v_climb, v_cruise, t_accel)
+            pts.append(PathPoint(
+                lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=spd,
+                heading_deg=hdg, phase="CRUISE",
+                gear_down=False, flap_ratio=0.0, dist_from_start_nm=cumul_nm,
+            ))
+            lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
+            cumul_nm += _STEP_NM
+            if len(pts) > 20000:
+                break
 
-    # ══════════════════════════════════════════════════════════════════
-    # PART 2: BUILD BACKWARD — destination end (reversed at the end)
-    # ══════════════════════════════════════════════════════════════════
-    back_hdg = (approach_hdg + 180.0) % 360.0
-    bwd: list[PathPoint] = []
+    # ── 4. DESCENT — decelerate + descend simultaneously ────────────
+    # Compute where approach starts (back from threshold along approach heading)
+    approach_start_lat, approach_start_lon = _dest_pt(
+        thr_lat, thr_lon, (approach_hdg + 180.0) % 360.0,
+        approach_nm * 1852.0,
+    )
 
-    # ── ROLLOUT (on the ground, braking) ─────────────────────────────
-    touchdown_dist_ft = 1000.0
-    td_lat, td_lon = _destination_point(thr_lat, thr_lon, approach_hdg,
-                                         touchdown_dist_ft * 0.3048)
-    rollout_ft = 2000.0
-    n_rollout = max(3, int((rollout_ft / 6076.0) / _STEP_NM))
-    stop_lat, stop_lon = _destination_point(td_lat, td_lon, approach_hdg,
-                                             rollout_ft * 0.3048)
-    rlat, rlon = stop_lat, stop_lon
-    for i in range(n_rollout):
-        t = i / max(n_rollout - 1, 1)
-        spd = _lerp(0.0, v_land, t)
-        bwd.append(PathPoint(
-            lat=rlat, lon=rlon, alt_ft=dest_alt_ft, speed_kts=spd,
-            heading_deg=approach_hdg, phase="ROLLOUT",
-            gear_down=True, flap_ratio=1.0, dist_from_start_nm=0.0,
+    # Fly from current position toward approach start point,
+    # descending and decelerating along the way.
+    dist_to_approach = haversine_m(lat, lon, approach_start_lat, approach_start_lon) / 1852.0
+    n_descent = max(1, int(dist_to_approach / _STEP_NM))
+    descent_start_alt = cruise_alt_ft if has_cruise else alt
+    descent_start_spd = v_cruise if has_cruise else v_climb
+
+    for i in range(n_descent):
+        t = (i + 1) / n_descent
+        # Altitude: linear descent from cruise to approach start altitude
+        alt_here = _lerp(descent_start_alt, approach_alt, t)
+        # Speed: linear deceleration from cruise/climb speed to approach speed
+        spd = _lerp(descent_start_spd, v_approach, t)
+        # Heading: toward the approach start point (smooth great circle)
+        hdg = bearing_deg(lat, lon, approach_start_lat, approach_start_lon)
+        # Flaps: deploy half flaps to help decelerate
+        flap = 0.5
+        # Gear: deploy when slow enough
+        gear = spd < (v_approach + 30.0)
+
+        pts.append(PathPoint(
+            lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
+            heading_deg=hdg, phase="DESCENT",
+            gear_down=gear, flap_ratio=flap, dist_from_start_nm=cumul_nm,
         ))
-        rlat, rlon = _destination_point(rlat, rlon, back_hdg, _STEP_M)
+        lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
+        cumul_nm += _STEP_NM
+        if len(pts) > 25000:
+            break
 
-    # ── FLARE (last 50ft above ground) ──────────────────────────────
+    # ── 5. APPROACH — on runway heading, 3° glideslope ──────────────
+    n_approach = max(1, int(approach_nm / _STEP_NM))
+    for i in range(n_approach):
+        t = (i + 1) / n_approach
+        alt_here = _lerp(approach_alt, dest_alt_ft + 50.0, t)
+        flap = 1.0 if t > 0.5 else 0.5
+
+        pts.append(PathPoint(
+            lat=lat, lon=lon, alt_ft=alt_here, speed_kts=v_approach,
+            heading_deg=approach_hdg, phase="APPROACH",
+            gear_down=True, flap_ratio=flap, dist_from_start_nm=cumul_nm,
+        ))
+        lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
+        cumul_nm += _STEP_NM
+
+    # ── 6. FLARE — last 50ft ────────────────────────────────────────
     flare_alt = dest_alt_ft + 50.0
     n_flare = max(3, int(0.3 / _STEP_NM))
-    flat, flon = td_lat, td_lon
     for i in range(n_flare):
-        t = i / max(n_flare - 1, 1)
-        alt_here = _lerp(dest_alt_ft + 5.0, flare_alt, t)
-        spd = _lerp(v_land, v_approach, t)
-        bwd.append(PathPoint(
-            lat=flat, lon=flon, alt_ft=alt_here, speed_kts=spd,
+        t = (i + 1) / n_flare
+        alt_here = _lerp(flare_alt, dest_alt_ft + 5.0, t)
+        spd = _lerp(v_approach, v_land, t)
+        pts.append(PathPoint(
+            lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
             heading_deg=approach_hdg, phase="FLARE",
-            gear_down=True, flap_ratio=1.0, dist_from_start_nm=0.0,
+            gear_down=True, flap_ratio=1.0, dist_from_start_nm=cumul_nm,
         ))
-        flat, flon = _destination_point(flat, flon, back_hdg, _STEP_M)
+        lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
+        cumul_nm += _STEP_NM
 
-    # ── APPROACH (3° glideslope down to flare height) ────────────────
-    approach_start_alt = dest_alt_ft + 500.0
-    approach_dist_nm = max(0.5, (approach_start_alt - flare_alt) / _GLIDE_FT_PER_NM)
-    n_approach = max(1, int(approach_dist_nm / _STEP_NM))
-    alat, alon = flat, flon
-    for i in range(n_approach):
-        t = i / max(n_approach - 1, 1)
-        alt_here = _lerp(flare_alt, approach_start_alt, t)
-        dist_from_thr = (n_flare + i) * _STEP_NM
-        flap = 1.0 if dist_from_thr < 1.0 else 0.5
-
-        bwd.append(PathPoint(
-            lat=alat, lon=alon, alt_ft=alt_here, speed_kts=v_approach,
-            heading_deg=approach_hdg, phase="APPROACH",
-            gear_down=True, flap_ratio=flap, dist_from_start_nm=0.0,
+    # ── 7. ROLLOUT — on the ground, braking ─────────────────────────
+    n_rollout = max(3, int(0.3 / _STEP_NM))
+    for i in range(n_rollout):
+        t = (i + 1) / n_rollout
+        spd = _lerp(v_land, 0.0, t)
+        pts.append(PathPoint(
+            lat=lat, lon=lon, alt_ft=dest_alt_ft, speed_kts=spd,
+            heading_deg=approach_hdg, phase="ROLLOUT",
+            gear_down=True, flap_ratio=1.0, dist_from_start_nm=cumul_nm,
         ))
-        alat, alon = _destination_point(alat, alon, back_hdg, _STEP_M)
+        lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
+        cumul_nm += _STEP_NM
 
-    # ── DESCENT — two phases: decelerate level, then descend clean ──
-    #
-    # Phase A: DECELERATE at cruise altitude with flaps (speed: cruise → approach)
-    #   Flaps create drag, plane slows down while staying level.
-    #   No altitude change — just speed bleed.
-    #
-    # Phase B: DESCEND clean at approach speed (alt: cruise → approach start)
-    #   Already slow, gentle 3° glideslope, flaps half for drag control.
+    # Recompute cumulative distances from actual point-to-point positions
+    _recompute_distances(pts)
 
-    # Phase B first (built backward): clean descent at approach speed
-    alt_to_lose = cruise_alt_ft - approach_start_alt
-    descent_nm = alt_to_lose / _GLIDE_FT_PER_NM if alt_to_lose > 0 else 0.0
-    n_descent = max(1, int(descent_nm / _STEP_NM))
-    dlat, dlon = alat, alon
-    for i in range(n_descent):
-        t = i / max(n_descent - 1, 1)
-        alt_here = _lerp(approach_start_alt, cruise_alt_ft, t)
-        # Already at approach speed — gentle descent, half flaps for drag
-        bwd.append(PathPoint(
-            lat=dlat, lon=dlon, alt_ft=alt_here, speed_kts=v_approach,
-            heading_deg=approach_hdg, phase="DESCENT",
-            gear_down=True, flap_ratio=0.5, dist_from_start_nm=0.0,
-        ))
-        dlat, dlon = _destination_point(dlat, dlon, back_hdg, _STEP_M)
-
-    # Phase A (built backward): decelerate at cruise altitude with flaps
-    # Estimate ~2nm to decelerate from cruise to approach speed
-    decel_nm = max(1.0, (v_cruise - v_approach) / 40.0)  # ~40 kts per nm
-    n_decel = max(1, int(decel_nm / _STEP_NM))
-    for i in range(n_decel):
-        t = i / max(n_decel - 1, 1)
-        # Speed ramps from approach (bottom/start of decel) to cruise (top/end)
-        spd = _lerp(v_approach, v_cruise, t)
-        bwd.append(PathPoint(
-            lat=dlat, lon=dlon, alt_ft=cruise_alt_ft, speed_kts=spd,
-            heading_deg=approach_hdg, phase="DESCENT",
-            gear_down=False, flap_ratio=0.5, dist_from_start_nm=0.0,
-        ))
-        dlat, dlon = _destination_point(dlat, dlon, back_hdg, _STEP_M)
-
-    tod_lat, tod_lon = dlat, dlon
-
-    # Reverse so it flows TOWARD the runway
-    bwd.reverse()
-
-    # ══════════════════════════════════════════════════════════════════
-    # PART 3: CRUISE — connect top-of-climb to TOD
-    # ══════════════════════════════════════════════════════════════════
-    cruise_dist_nm = haversine_m(toc_lat, toc_lon, tod_lat, tod_lon) / 1852.0
-    n_cruise = max(1, int(cruise_dist_nm / _STEP_NM))
-
-    accel_nm = min(2.0, cruise_dist_nm / 2.0)
-
-    cruise_pts: list[PathPoint] = []
-    clat, clon = toc_lat, toc_lon
-    for i in range(n_cruise):
-        t_accel = min(1.0, (i * _STEP_NM) / accel_nm) if accel_nm > 0 else 1.0
-        spd = _lerp(v_climb, v_cruise, t_accel)
-
-        remaining_nm = cruise_dist_nm - i * _STEP_NM
-        if remaining_nm < 8.0:
-            t_bleed = 1.0 - remaining_nm / 8.0
-            spd = _lerp(v_cruise, v_approach + 10.0, t_bleed)
-
-        hdg = bearing_deg(clat, clon, tod_lat, tod_lon)
-        # Deploy partial flaps in last 4nm of cruise to begin speed bleed
-        flap = 0.5 if remaining_nm < 4.0 else 0.0
-        cruise_pts.append(PathPoint(
-            lat=clat, lon=clon, alt_ft=cruise_alt_ft, speed_kts=spd,
-            heading_deg=hdg, phase="CRUISE",
-            gear_down=False, flap_ratio=flap, dist_from_start_nm=0.0,
-        ))
-        clat, clon = _destination_point(clat, clon, hdg, _STEP_M)
-
-    # ══════════════════════════════════════════════════════════════════
-    # PART 4: STITCH — fwd + cruise + bwd, recompute cumulative distance
-    # ══════════════════════════════════════════════════════════════════
-    all_pts = fwd + cruise_pts + bwd
-    _recompute_distances(all_pts)
-
-    return RibbonPath(all_pts)
+    return RibbonPath(pts)
 
 
 def _recompute_distances(points: list[PathPoint]) -> None:
-    """Set dist_from_start_nm on every point based on actual point-to-point distance."""
+    """Set dist_from_start_nm based on actual point-to-point distance."""
     if not points:
         return
     points[0].dist_from_start_nm = 0.0
@@ -415,7 +377,6 @@ def format_ribbon(ribbon: RibbonPath) -> str:
     lines = [f"[RIBBON] {len(ribbon.points)} points, "
              f"{ribbon.points[-1].dist_from_start_nm:.1f} nm total"]
 
-    # Show phase transitions
     prev_phase = ""
     for i, p in enumerate(ribbon.points):
         if p.phase != prev_phase:

@@ -377,16 +377,19 @@ class FlightEngine:
             flap = cur.flap_ratio if cur.flap_ratio is not None else 0.0
             v_approach = float(speeds.get("v_approach", 83.0))
             gear = telemetry.airspeed_kts < (v_approach + 30.0)
+            # Engine OFF when above target speed — let drag slow us down.
+            # Only add power if we're AT or BELOW target.
+            above_target = telemetry.airspeed_kts > (target_speed + 3.0)
             return Targets(
                 heading_deg=cmd_hdg,
                 altitude_ft=target_alt,
                 airspeed_kts=target_speed,
-                throttle=None,  # PID controls throttle — don't force idle
+                throttle=0.0 if above_target else None,  # idle when fast, PID when slow
                 brake_ratio=0.0,
                 gear_down=gear,
                 flap_ratio=flap,
                 pitch_limit=0.10,
-                roll_limit=0.35,   # allow banking during descent for course corrections
+                roll_limit=0.35,
                 pitch_protect_kts=v_stall + 15.0,
                 pitch_protect_gain=0.03,
             )
@@ -400,21 +403,55 @@ class FlightEngine:
             hold_hdg = self._st["approach_locked_hdg"]
 
             v_approach = float(speeds.get("v_approach", 83.0))
+            v_land = float(speeds.get("v_land", 77.0))
             too_fast = telemetry.airspeed_kts > (v_approach + 5.0)
+            on_ground = agl_ft < 3.0
+            near_ground = agl_ft < 50.0
 
             # Only descend — never climb above current alt on approach
             target_alt = min(target_alt, telemetry.altitude_ft)
 
+            # Near ground: cut throttle and apply brakes if on ground
+            if on_ground:
+                return Targets(
+                    heading_deg=hold_hdg,
+                    altitude_ft=telemetry.altitude_ft,
+                    airspeed_kts=0.0,
+                    throttle=0.0,
+                    brake_ratio=1.0,
+                    gear_down=True,
+                    flap_ratio=1.0,
+                    roll_limit=0.02,
+                )
+            if near_ground:
+                # Flare: idle throttle, target v_land, gentle descent
+                terrain_msl = telemetry.altitude_ft - agl_ft
+                flare_alt = terrain_msl + max(5.0, agl_ft * 0.3)
+                return Targets(
+                    heading_deg=hold_hdg,
+                    altitude_ft=flare_alt,
+                    airspeed_kts=v_land,
+                    throttle=0.0,
+                    brake_ratio=0.0,
+                    gear_down=True,
+                    flap_ratio=1.0,
+                    pitch_limit=0.06,
+                    roll_limit=0.03,
+                )
+
+            # Let PID manage throttle smoothly on approach.
+            # The PID will settle at whatever power holds v_approach
+            # on the glideslope — no bang-bang between 0 and 70%.
             return Targets(
                 heading_deg=hold_hdg,
                 altitude_ft=target_alt,
                 airspeed_kts=v_approach,
-                throttle=float(throttle_cfg.get("idle", 0.0)) if too_fast else None,
+                throttle=None,  # PID manages smoothly
                 brake_ratio=0.0,
                 gear_down=True,
-                flap_ratio=1.0,  # full flaps always on approach
-                pitch_limit=0.08,  # keep nose relatively level
-                roll_limit=0.05,   # wings level on approach
+                flap_ratio=1.0,
+                pitch_limit=0.08,
+                roll_limit=0.05,
                 pitch_protect_kts=v_stall + 10.0,
                 pitch_protect_gain=0.02,
             )

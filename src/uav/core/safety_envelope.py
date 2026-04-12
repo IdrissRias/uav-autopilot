@@ -95,26 +95,11 @@ def enforce_envelope(
             correction.descent_limited = True
 
     # ── 2. Stall protection ─────────────────────────────────────────
-    # V_safe = Vs × 1.3 × sqrt(1/cos(bank))
-    # If airspeed drops below V_safe, force nose down + add throttle.
-    bank_rad = math.radians(min(abs(telemetry.roll_deg), 60.0))
-    cos_bank = max(math.cos(bank_rad), 0.5)
-    v_safe = v_stall * 1.3 * math.sqrt(1.0 / cos_bank)
-
-    if telemetry.airspeed_kts < v_safe:
-        # Nose-down authority: pitch down proportional to deficit
-        deficit = v_safe - telemetry.airspeed_kts
-        pitch_down = min(0.15, deficit * 0.01)  # gentle but effective
-        actuators = Actuators(
-            throttle=min(1.0, actuators.throttle + 0.3),  # add power
-            roll=actuators.roll,
-            pitch=actuators.pitch - pitch_down,
-            yaw=actuators.yaw,
-            brake_ratio=0.0,  # release brakes
-            gear_down=actuators.gear_down,
-            flap_ratio=actuators.flap_ratio,
-        )
-        correction.stall_protected = True
+    # DISABLED: The flight engine has its own pitch_protect logic per phase.
+    # The safety envelope's stall protection was fighting the approach/landing
+    # because v_stall_observed from calibration (156.9 kts) was wildly wrong.
+    # Until calibration data is reliable, let the flight engine handle stall.
+    # TODO: Re-enable once v_stall is validated against actual stall speed.
 
     # ── 3. Overspeed protection ─────────────────────────────────────
     # Never exceed Vne.  If approaching, cut throttle + pitch up.

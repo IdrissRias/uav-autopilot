@@ -28,10 +28,10 @@ def _clamp(value: float, limit: float) -> float:
 # ── Default cascaded heading control constants ──────────────────
 # These are used when the aircraft is uncalibrated (calibration_confidence < 0.3).
 # After calibration, gains are derived from measured control sensitivity.
-MAX_BANK_DEG = 30.0        # max bank angle — drone operations, faster turns
+MAX_BANK_DEG = 70.0        # Full authority — phase roll_limit controls actual max per phase
 BANK_PER_HDG_ERROR = 1.5   # deg bank per deg heading error (1.5:1 — 10° off = 15° bank)
 BANK_INNER_KP = 0.020      # aileron per deg of bank error (inner loop P gain)
-BANK_INNER_KD = 0.008      # aileron per deg/s of bank rate (stronger damping)
+BANK_INNER_KD = 0.010      # aileron per deg/s of bank rate (stronger damping)
 
 
 @dataclass
@@ -89,7 +89,7 @@ class SimpleFixedWingController(Controller):
         airspeed_pid: PID,
         cruise_throttle: float,
         pitch_rate_limit_per_s: float = 2.0,   # smooth pitch transitions
-        roll_rate_limit_per_s: float = 0.25,  # slower roll transitions for smoothness
+        roll_rate_limit_per_s: float = 1.0,   # faster roll response for ribbon tracking
         gains: ControlGains | None = None,
     ) -> None:
         self.heading_pid = heading_pid  # kept for API compat but no longer drives roll
@@ -109,7 +109,7 @@ class SimpleFixedWingController(Controller):
         # Kp=0.00004: 500fpm error → 0.02 pitch (very gentle)
         # Ki=0.000005: very slow integral — just eliminates steady-state offset
         # Kd=0.00006: strong damping to prevent overshoot/oscillation
-        self.vs_pid = PID(kp=0.00004, ki=0.000005, kd=0.00006, integral_limit=0.08)
+        self.vs_pid = PID(kp=0.00003, ki=0.000003, kd=0.00008, integral_limit=0.06)
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
