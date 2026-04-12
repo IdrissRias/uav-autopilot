@@ -638,6 +638,28 @@ class Autopilot:
             self._flight_id = flight_rec["id"]
             print(f"[PEREGRINE] Flight record created: {self._flight_id[:8]}... ({dep_icao} → {arr_icao})")
 
+            # Store ribbon waypoints in the flight record for app reload
+            try:
+                from uav.core.flight_engine import FlightEngine
+                if isinstance(self.mode_manager, FlightEngine) and self.mode_manager._ribbon:
+                    import json
+                    ribbon = self.mode_manager._ribbon
+                    step = max(1, len(ribbon.points) // 60)
+                    wp_json = json.dumps([
+                        {"lat": round(p.lat, 6), "lon": round(p.lon, 6),
+                         "alt_ft": round(p.alt_ft, 0), "speed_kts": round(p.speed_kts, 1),
+                         "phase": p.phase, "heading": round(p.heading_deg, 1)}
+                        for i, p in enumerate(ribbon.points) if i % step == 0
+                    ])
+                    # Use raw SQL since finalize_flight adds ended_at
+                    conn = local_db.get_connection()
+                    conn.execute("UPDATE flights SET ribbon_waypoints = ? WHERE id = ?",
+                                 (wp_json, self._flight_id))
+                    conn.commit()
+                    print(f"[PEREGRINE] Ribbon stored in flight record ({len(ribbon.points)} pts → {len(wp_json)} bytes)")
+            except Exception as e:
+                print(f"[PEREGRINE] Ribbon storage failed: {e}")
+
             local_db.log_event(
                 self._flight_id, "takeoff_roll",
                 message=f"Takeoff roll started on {dep_rwy or 'unknown'} at {dep_icao or 'unknown'}",
