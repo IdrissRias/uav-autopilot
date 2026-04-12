@@ -251,246 +251,21 @@ class FlightEngine:
         agl_ft: float,
         takeoff_cfg: dict, throttle_cfg: dict, speeds: dict,
     ) -> Targets:
-        """Build Targets with phase-specific tuning."""
+        """Pure ribbon follower — read the ribbon, set those targets.
+
+        The ONLY reactive rules:
+          1. Throttle: if ribbon says None → PID manages.
+             If ribbon says 0.0 but we're below target speed → PID adds power.
+          2. AGL safety: if on ground (< 3ft AGL) → brakes + idle regardless of ribbon.
+          3. Ground roll: yaw hold for directional control on the runway.
+        """
         phase = cur.phase
+        on_ground = agl_ft < 3.0
 
-        v_stall = float(speeds.get("v_stall", 77.0))
-        v_climb = float(speeds.get("v_climb", 160.0))
-        climb_cfg = self.ctx.get("climb", {})
-
-        # ── GROUND (takeoff roll) ────────────────────────────────────
-        if phase == "GROUND":
-            if "runway_hdg" not in self._st:
-                self._st["runway_hdg"] = telemetry.heading_deg
-            runway_hdg = self._st["runway_hdg"]
-
-            throttle = float(takeoff_cfg.get("throttle", throttle_cfg.get("takeoff", 1.0)))
-            airborne = agl_ft > 10.0
-            max_roll = float(takeoff_cfg.get("max_roll_cmd", 0.08)) if airborne else 0.0
-
-            base_yaw_limit = float(takeoff_cfg.get("yaw_limit", 0.35))
-            taper = 1.0 - min(max(telemetry.airspeed_kts, 0.0), 50.0) / 50.0
-            yaw_limit = max(0.25, base_yaw_limit * (0.35 + 0.65 * taper))
-
-            return Targets(
-                heading_deg=runway_hdg,
-                altitude_ft=target_alt,
-                airspeed_kts=v_climb,
-                throttle=throttle,
-                brake_ratio=0.0,
-                gear_down=True,
-                flap_ratio=0.5,
-                roll_limit=max_roll,
-                pitch_limit=float(takeoff_cfg.get("max_pitch_cmd", 0.12)),
-                yaw_hold=True,
-                yaw_kp=float(takeoff_cfg.get("yaw_kp", 0.02)),
-                yaw_ki=float(takeoff_cfg.get("yaw_ki", 0.00)),
-                yaw_limit=yaw_limit,
-                yaw_full_deg=float(takeoff_cfg.get("yaw_full_deg", 5.0)),
-                pitch_protect_kts=v_climb - 8.0,
-                pitch_protect_gain=0.02,
-            )
-
-        # ── CLIMB ────────────────────────────────────────────────────
-        if phase == "CLIMB":
-            # Ramp altitude target so PID sees small error
-            now = time.time()
-            rates = self.ctx.get("airframe", {}).get("rates_fpm", {})
-            base_fpm = float(rates.get("climb", 1600.0))
-
-            last_ts = self._st.get("climb_ts", now)
-            dt = max(now - last_ts, 1e-3)
-            self._st["climb_ts"] = now
-
-            prev_tgt = self._st.get("climb_tgt_alt", telemetry.altitude_ft)
-            next_tgt = min(prev_tgt + (base_fpm / 60.0) * dt, target_alt)
-            self._st["climb_tgt_alt"] = next_tgt
-
-            gear = agl_ft < 50.0
-            flap = cur.flap_ratio
-
-            # Roll gate: zero bank below 300ft, ramp to full by 600ft
-            max_roll_climb = 0.35  # 35° max bank during climb turns
-            if agl_ft < 300.0:
-                roll_lim = 0.0
-            elif agl_ft < 600.0:
-                roll_lim = max_roll_climb * (agl_ft - 300.0) / 300.0
-            else:
-                roll_lim = max_roll_climb
-
-            # Yaw hold below 600ft AGL
-            if agl_ft < 600.0:
-                yaw_hold = True
-                yaw_kp = float(takeoff_cfg.get("yaw_kp", 0.07))
-                yaw_ki = float(takeoff_cfg.get("yaw_ki", 0.02))
-                yaw_limit_val = float(takeoff_cfg.get("yaw_limit", 0.5))
-                yaw_full = float(takeoff_cfg.get("yaw_full_deg", 5.0))
-            else:
-                yaw_hold = False
-                yaw_kp = yaw_ki = yaw_limit_val = yaw_full = None
-
-            # Airspeed PID manages throttle dynamically — no fixed value.
-            # throttle=None lets the controller's airspeed PID set power
-            # to match the target speed exactly.
-            return Targets(
-                heading_deg=cmd_hdg,
-                altitude_ft=next_tgt,
-                airspeed_kts=target_speed,
-                climb_rate_fpm=base_fpm,
-                throttle=None,
-                brake_ratio=0.0,
-                gear_down=gear,
-                flap_ratio=flap,
-                roll_limit=roll_lim,
-                pitch_limit=float(climb_cfg.get("max_pitch_cmd", 0.15)),
-                pitch_protect_kts=v_climb - 10.0,
-                pitch_protect_gain=float(climb_cfg.get("pitch_protect_gain", 0.03)),
-                yaw_hold=yaw_hold,
-                yaw_kp=yaw_kp,
-                yaw_ki=yaw_ki,
-                yaw_limit=yaw_limit_val,
-                yaw_full_deg=yaw_full,
-            )
-
-        # ── CRUISE ───────────────────────────────────────────────────
-        if phase == "CRUISE":
-            # Pass through ribbon flap values — ribbon may set flaps in
-            # late cruise to begin speed bleed before descent.
-            flap = cur.flap_ratio if cur.flap_ratio is not None else 0.0
-            return Targets(
-                heading_deg=cmd_hdg,
-                altitude_ft=target_alt,
-                airspeed_kts=target_speed,
-                throttle=None,      # airspeed PID regulates throttle
-                brake_ratio=0.0,
-                gear_down=False,
-                flap_ratio=flap,
-                pitch_limit=0.12,
-                roll_limit=0.12,
-                pitch_protect_kts=v_stall + 20.0,
-                pitch_protect_gain=0.03,
-            )
-
-        # ── DESCENT ──────────────────────────────────────────────────
-        if phase == "DESCENT":
-            # Deploy flaps from the ribbon to create drag and slow down.
-            flap = cur.flap_ratio if cur.flap_ratio is not None else 0.0
-            v_approach = float(speeds.get("v_approach", 83.0))
-            gear = telemetry.airspeed_kts < (v_approach + 30.0)
-            # Engine OFF when above target speed — let drag slow us down.
-            # Only add power if we're AT or BELOW target.
-            above_target = telemetry.airspeed_kts > (target_speed + 3.0)
-            return Targets(
-                heading_deg=cmd_hdg,
-                altitude_ft=target_alt,
-                airspeed_kts=target_speed,
-                throttle=0.0 if above_target else None,  # idle when fast, PID when slow
-                brake_ratio=0.0,
-                gear_down=gear,
-                flap_ratio=flap,
-                pitch_limit=0.10,
-                roll_limit=0.35,
-                pitch_protect_kts=v_stall + 15.0,
-                pitch_protect_gain=0.03,
-            )
-
-        # ── APPROACH ─────────────────────────────────────────────────
-        if phase == "APPROACH":
-            # Lock heading on first approach tick to prevent oscillation
-            if not self._st.get("approach_hdg_locked"):
-                self._st["approach_hdg_locked"] = True
-                self._st["approach_locked_hdg"] = la.heading_deg
-            hold_hdg = self._st["approach_locked_hdg"]
-
-            v_approach = float(speeds.get("v_approach", 83.0))
-            v_land = float(speeds.get("v_land", 77.0))
-            too_fast = telemetry.airspeed_kts > (v_approach + 5.0)
-            on_ground = agl_ft < 3.0
-            near_ground = agl_ft < 50.0
-
-            # Only descend — never climb above current alt on approach
-            target_alt = min(target_alt, telemetry.altitude_ft)
-
-            # Near ground: cut throttle and apply brakes if on ground
-            if on_ground:
-                return Targets(
-                    heading_deg=hold_hdg,
-                    altitude_ft=telemetry.altitude_ft,
-                    airspeed_kts=0.0,
-                    throttle=0.0,
-                    brake_ratio=1.0,
-                    gear_down=True,
-                    flap_ratio=1.0,
-                    roll_limit=0.02,
-                )
-            if near_ground:
-                # Flare: idle throttle, target v_land, gentle descent
-                terrain_msl = telemetry.altitude_ft - agl_ft
-                flare_alt = terrain_msl + max(5.0, agl_ft * 0.3)
-                return Targets(
-                    heading_deg=hold_hdg,
-                    altitude_ft=flare_alt,
-                    airspeed_kts=v_land,
-                    throttle=0.0,
-                    brake_ratio=0.0,
-                    gear_down=True,
-                    flap_ratio=1.0,
-                    pitch_limit=0.06,
-                    roll_limit=0.03,
-                )
-
-            # Let PID manage throttle smoothly on approach.
-            # The PID will settle at whatever power holds v_approach
-            # on the glideslope — no bang-bang between 0 and 70%.
-            return Targets(
-                heading_deg=hold_hdg,
-                altitude_ft=target_alt,
-                airspeed_kts=v_approach,
-                throttle=None,  # PID manages smoothly
-                brake_ratio=0.0,
-                gear_down=True,
-                flap_ratio=1.0,
-                pitch_limit=0.08,
-                roll_limit=0.05,
-                pitch_protect_kts=v_stall + 10.0,
-                pitch_protect_gain=0.02,
-            )
-
-        # ── FLARE ────────────────────────────────────────────────────
-        if phase == "FLARE":
-            hold_hdg = self._st.get(
-                "approach_locked_hdg",
-                self._st.get("runway_hdg", telemetry.heading_deg),
-            )
-            on_ground = agl_ft < 3.0
-            v_land = float(speeds.get("v_land", 77.0))
-            terrain_msl = telemetry.altitude_ft - agl_ft
-
-            # Flare target: aim for just above the ground, progressively lower
-            # This lets the altitude PID gently settle the plane down
-            if on_ground:
-                flare_alt = telemetry.altitude_ft  # hold current
-            else:
-                flare_alt = terrain_msl + max(5.0, agl_ft * 0.3)  # aim 30% of AGL above ground
-
-            return Targets(
-                heading_deg=hold_hdg,
-                altitude_ft=flare_alt,
-                airspeed_kts=v_land,
-                throttle=0.0 if on_ground else float(throttle_cfg.get("idle", 0.0)),
-                brake_ratio=1.0 if on_ground else 0.0,
-                gear_down=True,
-                pitch_limit=0.06,  # very gentle
-                roll_limit=0.03,   # wings dead level
-                flap_ratio=1.0,
-            )
-
-        # ── ROLLOUT ──────────────────────────────────────────────────
-        if phase == "ROLLOUT":
-            hold_hdg = self._st.get(
-                "approach_locked_hdg",
-                self._st.get("runway_hdg", telemetry.heading_deg),
-            )
+        # ── AGL safety override — on the ground, always brake ────────
+        if on_ground and phase in ("FLARE", "ROLLOUT", "APPROACH"):
+            hold_hdg = self._st.get("approach_hdg_locked",
+                        self._st.get("runway_hdg", telemetry.heading_deg))
             return Targets(
                 heading_deg=hold_hdg,
                 altitude_ft=telemetry.altitude_ft,
@@ -499,10 +274,76 @@ class FlightEngine:
                 brake_ratio=1.0,
                 gear_down=True,
                 flap_ratio=1.0,
+                roll_limit=0.02,
             )
 
-        # ── Fallback (shouldn't happen) ──────────────────────────────
-        return self._ground_idle(telemetry)
+        # ── Throttle logic ───────────────────────────────────────────
+        # Ribbon throttle: None = PID manages, 0.0 = idle, 1.0 = full
+        # Reactive rule: if ribbon says idle (0.0) but we're BELOW target
+        # speed by more than 5 kts, let PID add power to prevent stall.
+        ribbon_throttle = cur.throttle
+        if ribbon_throttle is not None and ribbon_throttle < 0.01:
+            # Ribbon wants idle — but check if we need survival power
+            if telemetry.airspeed_kts < (target_speed - 5.0):
+                ribbon_throttle = None  # let PID save us
+
+        # ── Ground roll: yaw hold ────────────────────────────────────
+        yaw_hold = False
+        yaw_kp = yaw_ki = yaw_limit_val = yaw_full = None
+        if phase == "GROUND":
+            if "runway_hdg" not in self._st:
+                self._st["runway_hdg"] = telemetry.heading_deg
+            cmd_hdg = self._st["runway_hdg"]
+            yaw_hold = True
+            yaw_kp = float(takeoff_cfg.get("yaw_kp", 0.02))
+            yaw_ki = 0.0
+            base_yaw_limit = float(takeoff_cfg.get("yaw_limit", 0.35))
+            taper = 1.0 - min(max(telemetry.airspeed_kts, 0.0), 50.0) / 50.0
+            yaw_limit_val = max(0.25, base_yaw_limit * (0.35 + 0.65 * taper))
+            yaw_full = float(takeoff_cfg.get("yaw_full_deg", 5.0))
+        elif phase == "CLIMB" and agl_ft < 600.0:
+            yaw_hold = True
+            yaw_kp = float(takeoff_cfg.get("yaw_kp", 0.07))
+            yaw_ki = float(takeoff_cfg.get("yaw_ki", 0.02))
+            yaw_limit_val = float(takeoff_cfg.get("yaw_limit", 0.5))
+            yaw_full = float(takeoff_cfg.get("yaw_full_deg", 5.0))
+
+        # ── Approach heading lock ────────────────────────────────────
+        if phase in ("APPROACH", "FLARE", "ROLLOUT"):
+            if not self._st.get("approach_hdg_locked"):
+                self._st["approach_hdg_locked"] = True
+                self._st["approach_hdg_locked"] = la.heading_deg
+            cmd_hdg = self._st.get("approach_hdg_locked", cmd_hdg)
+
+        # ── Roll limits by AGL ───────────────────────────────────────
+        if phase == "GROUND":
+            roll_lim = 0.08 if agl_ft > 10.0 else 0.0
+        elif phase == "CLIMB" and agl_ft < 600.0:
+            roll_lim = 0.35 * max(0.0, (agl_ft - 300.0) / 300.0)
+        elif phase in ("FLARE", "ROLLOUT"):
+            roll_lim = 0.03
+        elif phase == "APPROACH":
+            roll_lim = 0.05
+        else:
+            roll_lim = 0.35  # cruise/descent — full authority
+
+        # ── Build targets from ribbon ────────────────────────────────
+        return Targets(
+            heading_deg=cmd_hdg,
+            altitude_ft=target_alt,
+            airspeed_kts=target_speed,
+            throttle=ribbon_throttle,
+            brake_ratio=0.0,
+            gear_down=cur.gear_down,
+            flap_ratio=cur.flap_ratio,
+            roll_limit=roll_lim,
+            pitch_limit=0.12 if phase in ("GROUND", "CLIMB", "CRUISE") else 0.08,
+            yaw_hold=yaw_hold,
+            yaw_kp=yaw_kp,
+            yaw_ki=yaw_ki,
+            yaw_limit=yaw_limit_val,
+            yaw_full_deg=yaw_full,
+        )
 
     # ── Phase mapping ────────────────────────────────────────────────
 

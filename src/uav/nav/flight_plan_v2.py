@@ -40,6 +40,7 @@ class PathPoint:
     phase: str             # GROUND / CLIMB / CRUISE / DESCENT / APPROACH / FLARE / ROLLOUT
     gear_down: bool = True
     flap_ratio: float = 0.0
+    throttle: float | None = None  # None = PID manages; 0.0 = idle; 1.0 = full
     dist_from_start_nm: float = 0.0   # cumulative distance along ribbon
 
 
@@ -191,6 +192,7 @@ def plan_path(
     has_cruise = cruise_available_nm > 0.5
 
     # ── 1. GROUND (takeoff roll) ────────────────────────────────────
+    # Full throttle, half flaps for lift, gear down, hold heading
     lat, lon = dep_lat, dep_lon
     roll_nm = takeoff_roll_ft / 6076.0
     n_roll = max(1, int(roll_nm / _STEP_NM))
@@ -200,19 +202,19 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=dep_alt_ft, speed_kts=spd,
             heading_deg=dep_heading, phase="GROUND",
-            gear_down=True, flap_ratio=0.5, dist_from_start_nm=cumul_nm,
+            gear_down=True, flap_ratio=0.5, throttle=1.0,
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, dep_heading, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── 2. CLIMB — turn toward destination, climb to cruise alt ─────
+    # ── 2. CLIMB — PID throttle, turn toward destination ────────────
     alt = dep_alt_ft
     hdg = dep_heading
-    turn_rate = 3.0  # degrees per step
+    turn_rate = 3.0
 
     while alt < cruise_alt_ft:
         agl = alt - dep_alt_ft
-        # Turn toward destination above 600ft AGL
         if agl > 600.0:
             target_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
             err = _wrap180(target_hdg - hdg)
@@ -225,7 +227,8 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=alt, speed_kts=v_climb,
             heading_deg=hdg, phase="CLIMB",
-            gear_down=gear, flap_ratio=flap, dist_from_start_nm=cumul_nm,
+            gear_down=gear, flap_ratio=flap, throttle=None,  # PID manages
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
         cumul_nm += _STEP_NM
@@ -233,7 +236,7 @@ def plan_path(
         if len(pts) > 5000:
             break
 
-    # Complete the turn at cruise altitude before entering cruise
+    # Complete the turn at cruise altitude
     for _ in range(500):
         target_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
         if abs(_wrap180(target_hdg - hdg)) < 2.0:
@@ -244,41 +247,38 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=v_climb,
             heading_deg=hdg, phase="CLIMB",
-            gear_down=False, flap_ratio=0.0, dist_from_start_nm=cumul_nm,
+            gear_down=False, flap_ratio=0.0, throttle=None,
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
         cumul_nm += _STEP_NM
         if len(pts) > 5000:
             break
 
-    # ── 3. CRUISE — straight line, no turns ─────────────────────────
+    # ── 3. CRUISE — PID throttle, straight line, clean config ───────
     if has_cruise:
         n_cruise = max(1, int(cruise_available_nm / _STEP_NM))
         for i in range(n_cruise):
-            # Heading: straight toward destination (recalc for great circle)
             hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
-            # Speed: ramp up from v_climb to v_cruise in first 2nm
             t_accel = min(1.0, (i * _STEP_NM) / 2.0)
             spd = _lerp(v_climb, v_cruise, t_accel)
             pts.append(PathPoint(
                 lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=spd,
                 heading_deg=hdg, phase="CRUISE",
-                gear_down=False, flap_ratio=0.0, dist_from_start_nm=cumul_nm,
+                gear_down=False, flap_ratio=0.0, throttle=None,  # PID manages
+                dist_from_start_nm=cumul_nm,
             ))
             lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
             cumul_nm += _STEP_NM
             if len(pts) > 20000:
                 break
 
-    # ── 4. DESCENT — decelerate + descend simultaneously ────────────
-    # Compute where approach starts (back from threshold along approach heading)
+    # ── 4. DESCENT — idle throttle, half flaps, decelerating ────────
     approach_start_lat, approach_start_lon = _dest_pt(
         thr_lat, thr_lon, (approach_hdg + 180.0) % 360.0,
         approach_nm * 1852.0,
     )
 
-    # Fly from current position toward approach start point,
-    # descending and decelerating along the way.
     dist_to_approach = haversine_m(lat, lon, approach_start_lat, approach_start_lon) / 1852.0
     n_descent = max(1, int(dist_to_approach / _STEP_NM))
     descent_start_alt = cruise_alt_ft if has_cruise else alt
@@ -286,28 +286,27 @@ def plan_path(
 
     for i in range(n_descent):
         t = (i + 1) / n_descent
-        # Altitude: linear descent from cruise to approach start altitude
         alt_here = _lerp(descent_start_alt, approach_alt, t)
-        # Speed: linear deceleration from cruise/climb speed to approach speed
         spd = _lerp(descent_start_spd, v_approach, t)
-        # Heading: toward the approach start point (smooth great circle)
         hdg = bearing_deg(lat, lon, approach_start_lat, approach_start_lon)
-        # Flaps: deploy half flaps to help decelerate
-        flap = 0.5
-        # Gear: deploy when slow enough
+        # Throttle: idle when above target, PID when at/below
+        # (the engine will read this and follow it)
+        thr = 0.0 if spd < descent_start_spd * 0.95 else 0.0  # always idle during descent
         gear = spd < (v_approach + 30.0)
+        flap = 0.5
 
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
             heading_deg=hdg, phase="DESCENT",
-            gear_down=gear, flap_ratio=flap, dist_from_start_nm=cumul_nm,
+            gear_down=gear, flap_ratio=flap, throttle=0.0,  # idle — gravity + drag
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
         cumul_nm += _STEP_NM
         if len(pts) > 25000:
             break
 
-    # ── 5. APPROACH — on runway heading, 3° glideslope ──────────────
+    # ── 5. APPROACH — idle throttle, full flaps, runway heading ─────
     n_approach = max(1, int(approach_nm / _STEP_NM))
     for i in range(n_approach):
         t = (i + 1) / n_approach
@@ -317,12 +316,13 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=alt_here, speed_kts=v_approach,
             heading_deg=approach_hdg, phase="APPROACH",
-            gear_down=True, flap_ratio=flap, dist_from_start_nm=cumul_nm,
+            gear_down=True, flap_ratio=flap, throttle=0.0,  # idle — descending on glideslope
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── 6. FLARE — last 50ft ────────────────────────────────────────
+    # ── 6. FLARE — idle throttle, full flaps, decelerating ──────────
     flare_alt = dest_alt_ft + 50.0
     n_flare = max(3, int(0.3 / _STEP_NM))
     for i in range(n_flare):
@@ -332,12 +332,13 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
             heading_deg=approach_hdg, phase="FLARE",
-            gear_down=True, flap_ratio=1.0, dist_from_start_nm=cumul_nm,
+            gear_down=True, flap_ratio=1.0, throttle=0.0,  # idle
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── 7. ROLLOUT — on the ground, braking ─────────────────────────
+    # ── 7. ROLLOUT — zero throttle, full flaps, braking ─────────────
     n_rollout = max(3, int(0.3 / _STEP_NM))
     for i in range(n_rollout):
         t = (i + 1) / n_rollout
@@ -345,7 +346,8 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=dest_alt_ft, speed_kts=spd,
             heading_deg=approach_hdg, phase="ROLLOUT",
-            gear_down=True, flap_ratio=1.0, dist_from_start_nm=cumul_nm,
+            gear_down=True, flap_ratio=1.0, throttle=0.0,  # engine off
+            dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
