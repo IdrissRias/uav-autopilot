@@ -171,7 +171,7 @@ def plan_path(
     total_dist_nm = haversine_m(dep_lat, dep_lon, thr_lat, thr_lon) / 1852.0
 
     # How far does the approach segment extend back from the threshold?
-    approach_alt = dest_alt_ft + 200.0  # approach starts 200ft above runway — short final
+    approach_alt = dest_alt_ft + 400.0  # approach starts 400ft above runway
     approach_nm = max(0.3, (approach_alt - dest_alt_ft - 50.0) / _GLIDE_FT_PER_NM)
 
     # How far does descent extend back from approach start?
