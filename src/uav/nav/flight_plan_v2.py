@@ -171,8 +171,8 @@ def plan_path(
     total_dist_nm = haversine_m(dep_lat, dep_lon, thr_lat, thr_lon) / 1852.0
 
     # How far does the approach segment extend back from the threshold?
-    approach_alt = dest_alt_ft + 400.0  # approach starts 400ft above runway
-    approach_nm = max(0.3, (approach_alt - dest_alt_ft - 50.0) / _GLIDE_FT_PER_NM)
+    approach_alt = dest_alt_ft + 600.0  # approach starts 600ft above runway
+    approach_nm = max(0.5, (approach_alt - dest_alt_ft - 50.0) / _GLIDE_FT_PER_NM)
 
     # How far does descent extend back from approach start?
     alt_to_descend = cruise_alt_ft - approach_alt
@@ -273,12 +273,37 @@ def plan_path(
             if len(pts) > 20000:
                 break
 
-    # ── 4. DESCENT — idle throttle, half flaps, decelerating ────────
-    approach_start_lat, approach_start_lon = _dest_pt(
-        thr_lat, thr_lon, (approach_hdg + 180.0) % 360.0,
-        approach_nm * 1852.0,
-    )
+    # ══════════════════════════════════════════════════════════════════
+    # LANDING SEGMENTS — computed from the TOUCHDOWN POINT backward
+    #
+    # The touchdown point is the exact lat/lon where wheels hit the runway.
+    # Everything is computed to converge on that point:
+    #   APPROACH: 3° glideslope aimed at the touchdown point
+    #   FLARE: last 30ft, reducing V/S for gentle contact
+    #   ROLLOUT: on the ground, braking to stop
+    #   DESCENT: from cruise to approach start, blending heading to runway
+    # ══════════════════════════════════════════════════════════════════
 
+    # ── Compute the exact touchdown point ────────────────────────────
+    # 1000ft past the threshold along the runway heading = touchdown zone
+    touchdown_dist_ft = 1000.0
+    td_lat, td_lon = _dest_pt(thr_lat, thr_lon, approach_hdg,
+                               touchdown_dist_ft * 0.3048)
+
+    # ── Approach: 3° glideslope aimed at touchdown point ─────────────
+    # The approach starts at approach_alt and descends to flare_alt (30ft AGL)
+    # along a straight line on the runway heading ending at the touchdown point.
+    flare_alt = dest_alt_ft + 30.0
+    approach_descent_ft = approach_alt - flare_alt
+    approach_dist_nm = approach_descent_ft / _GLIDE_FT_PER_NM
+    n_approach = max(1, int(approach_dist_nm / _STEP_NM))
+
+    # Compute approach start point (back from touchdown along runway heading)
+    back_hdg = (approach_hdg + 180.0) % 360.0
+    approach_start_lat, approach_start_lon = _dest_pt(
+        td_lat, td_lon, back_hdg, approach_dist_nm * 1852.0)
+
+    # ── 4. DESCENT — from current position to approach start ─────────
     dist_to_approach = haversine_m(lat, lon, approach_start_lat, approach_start_lon) / 1852.0
     n_descent = max(1, int(dist_to_approach / _STEP_NM))
     descent_start_alt = cruise_alt_ft if has_cruise else alt
@@ -286,23 +311,29 @@ def plan_path(
 
     for i in range(n_descent):
         t = (i + 1) / n_descent
-        # Altitude: linear descent throughout
         alt_here = _lerp(descent_start_alt, approach_alt, t)
         # Speed: hold cruise for first 60%, decelerate in last 40%
         if t < 0.6:
             spd = descent_start_spd
-            flap = 0.0  # clean — no drag needed while maintaining speed
+            flap = 0.0
         else:
-            decel_t = (t - 0.6) / 0.4  # 0→1 over the last 40%
+            decel_t = (t - 0.6) / 0.4
             spd = _lerp(descent_start_spd, v_approach, decel_t)
-            flap = 0.5  # deploy flaps to help decelerate
-        hdg = bearing_deg(lat, lon, approach_start_lat, approach_start_lon)
+            flap = 0.5
+        # Heading: blend toward runway heading in last 40%
+        bearing_to_app = bearing_deg(lat, lon, approach_start_lat, approach_start_lon)
+        if t < 0.6:
+            hdg = bearing_to_app
+        else:
+            blend_t = (t - 0.6) / 0.4
+            hdg_err = _wrap180(approach_hdg - bearing_to_app)
+            hdg = (bearing_to_app + hdg_err * blend_t) % 360.0
         gear = spd < (v_approach + 30.0)
 
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
             heading_deg=hdg, phase="DESCENT",
-            gear_down=gear, flap_ratio=flap, throttle=None,  # PID manages
+            gear_down=gear, flap_ratio=flap, throttle=None,
             dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
@@ -310,50 +341,61 @@ def plan_path(
         if len(pts) > 25000:
             break
 
-    # ── 5. APPROACH — idle throttle, full flaps, runway heading ─────
-    n_approach = max(1, int(approach_nm / _STEP_NM))
+    # ── 5. APPROACH — straight 3° glideslope to flare point ──────────
+    # Every point is on the runway heading, descending toward td_lat/td_lon
+    alat, alon = approach_start_lat, approach_start_lon
     for i in range(n_approach):
         t = (i + 1) / n_approach
-        alt_here = _lerp(approach_alt, dest_alt_ft + 50.0, t)
+        alt_here = _lerp(approach_alt, flare_alt, t)
+        # Speed: hold v_approach, decelerate slightly in last 20%
+        if t > 0.8:
+            spd = _lerp(v_approach, v_approach - 5.0, (t - 0.8) / 0.2)
+        else:
+            spd = v_approach
         flap = 1.0 if t > 0.5 else 0.5
 
         pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=alt_here, speed_kts=v_approach,
+            lat=alat, lon=alon, alt_ft=alt_here, speed_kts=spd,
             heading_deg=approach_hdg, phase="APPROACH",
-            gear_down=True, flap_ratio=flap, throttle=None,  # PID manages
+            gear_down=True, flap_ratio=flap, throttle=None,
             dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
+        alat, alon = _dest_pt(alat, alon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── 6. FLARE — idle throttle, full flaps, decelerating ──────────
-    flare_alt = dest_alt_ft + 50.0
-    n_flare = max(3, int(0.3 / _STEP_NM))
+    # ── 6. FLARE — last 30ft, reducing V/S for gentle touchdown ──────
+    # From flare_alt (30ft AGL) to dest_alt+2ft (wheels on ground)
+    # Speed: v_approach-5 → v_land
+    # The LAST flare point is AT the touchdown coordinates
+    flare_dist_nm = 0.2  # ~370m flare
+    n_flare = max(3, int(flare_dist_nm / _STEP_NM))
     for i in range(n_flare):
         t = (i + 1) / n_flare
-        alt_here = _lerp(flare_alt, dest_alt_ft + 5.0, t)
-        spd = _lerp(v_approach, v_land, t)
+        alt_here = _lerp(flare_alt, dest_alt_ft + 2.0, t)
+        spd = _lerp(v_approach - 5.0, v_land, t)
         pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
+            lat=alat, lon=alon, alt_ft=alt_here, speed_kts=spd,
             heading_deg=approach_hdg, phase="FLARE",
-            gear_down=True, flap_ratio=1.0, throttle=None,  # PID manages
+            gear_down=True, flap_ratio=1.0, throttle=None,
             dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
+        alat, alon = _dest_pt(alat, alon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── 7. ROLLOUT — zero throttle, full flaps, braking ─────────────
-    n_rollout = max(3, int(0.3 / _STEP_NM))
+    # ── 7. ROLLOUT — on the ground at touchdown point, braking ───────
+    # Starts at touchdown coordinates, decelerates to 0
+    rollout_ft = 2000.0
+    n_rollout = max(3, int((rollout_ft / 6076.0) / _STEP_NM))
     for i in range(n_rollout):
         t = (i + 1) / n_rollout
         spd = _lerp(v_land, 0.0, t)
         pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=dest_alt_ft, speed_kts=spd,
+            lat=alat, lon=alon, alt_ft=dest_alt_ft, speed_kts=spd,
             heading_deg=approach_hdg, phase="ROLLOUT",
-            gear_down=True, flap_ratio=1.0, throttle=None,  # PID manages
+            gear_down=True, flap_ratio=1.0, throttle=None,
             dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _dest_pt(lat, lon, approach_hdg, _STEP_M)
+        alat, alon = _dest_pt(alat, alon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
 
     # Recompute cumulative distances from actual point-to-point positions
