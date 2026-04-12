@@ -323,7 +323,7 @@ class FlightEngine:
         elif phase in ("FLARE", "ROLLOUT"):
             roll_lim = 0.03
         elif phase == "APPROACH":
-            roll_lim = 0.05
+            roll_lim = 0.15  # enough to correct heading on approach
         else:
             roll_lim = 0.35  # cruise/descent — full authority
 

@@ -312,20 +312,20 @@ def plan_path(
     for i in range(n_descent):
         t = (i + 1) / n_descent
         alt_here = _lerp(descent_start_alt, approach_alt, t)
-        # Speed: hold cruise for first 60%, decelerate in last 40%
-        if t < 0.6:
+        # Speed: hold cruise for first 40%, decelerate in last 60%
+        if t < 0.4:
             spd = descent_start_spd
             flap = 0.0
         else:
-            decel_t = (t - 0.6) / 0.4
+            decel_t = (t - 0.4) / 0.6
             spd = _lerp(descent_start_spd, v_approach, decel_t)
             flap = 0.5
-        # Heading: blend toward runway heading in last 40%
+        # Heading: blend toward runway heading in last 50%
         bearing_to_app = bearing_deg(lat, lon, approach_start_lat, approach_start_lon)
-        if t < 0.6:
+        if t < 0.5:
             hdg = bearing_to_app
         else:
-            blend_t = (t - 0.6) / 0.4
+            blend_t = (t - 0.5) / 0.5
             hdg_err = _wrap180(approach_hdg - bearing_to_app)
             hdg = (bearing_to_app + hdg_err * blend_t) % 360.0
         gear = spd < (v_approach + 30.0)
