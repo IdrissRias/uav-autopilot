@@ -341,12 +341,15 @@ def poll_fly_command(aircraft_id: str) -> Optional[Dict[str, Any]]:
                .single()
                .execute())
         data = row.data
-        if data and data.get("status") == "fly_requested":
+        status = data.get("status", "") if data else ""
+        if status in ("fly_requested", "preview_requested"):
             dest_icao = data.get("dest_icao", "")
             # Clear the command so we don't re-trigger
-            client.table("aircraft").update({"status": "flying"}).eq("id", aircraft_id).execute()
+            new_status = "flying" if status == "fly_requested" else "preflight"
+            client.table("aircraft").update({"status": new_status}).eq("id", aircraft_id).execute()
             # Look up destination coordinates from airports table
-            dest = {"icao": dest_icao, "name": "", "lat": 0.0, "lon": 0.0}
+            dest = {"icao": dest_icao, "name": "", "lat": 0.0, "lon": 0.0,
+                    "_action": "fly" if status == "fly_requested" else "preview"}
             try:
                 apt = (client.table("airports")
                        .select("name, lat, lon")

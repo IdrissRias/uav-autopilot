@@ -105,6 +105,14 @@ class Autopilot:
             print("[COMMAND] END FLIGHT received — finalizing and resetting")
             self._end_flight_requested = True
 
+        elif action == "preview_ribbon":
+            # Build a ribbon preview without starting the flight.
+            # Broadcasts waypoints back to the app for map display.
+            dest = data.get("destination")
+            if dest and self.mode_manager and hasattr(self.mode_manager, 'ctx'):
+                print(f"[COMMAND] PREVIEW RIBBON for {dest.get('icao', '?')}")
+                self._preview_ribbon(dest)
+
         elif action == "set_cruise_throttle":
             value = data.get("value")
             if value is not None:
@@ -117,6 +125,135 @@ class Autopilot:
             # Unlock the fly gate so the autopilot loop runs
             self._fly_command_received = True
             self._start_calibration()
+
+    def _preview_ribbon(self, dest: dict) -> None:
+        """Build a ribbon preview and broadcast waypoints without starting a flight."""
+        try:
+            from uav.nav.flight_plan_v2 import plan_path, format_ribbon
+            from uav.nav.geo import haversine_m
+            from uav.comms import broadcast
+
+            ctx = self.mode_manager.ctx
+            airframe = ctx.get("airframe", {})
+            speeds = airframe.get("speeds_kts", {})
+            rates = airframe.get("rates_fpm", {})
+
+            # Use last known telemetry for departure position
+            telemetry = self._last_telemetry if hasattr(self, '_last_telemetry') else None
+            if telemetry is None or not telemetry.is_valid():
+                print("[PREVIEW] No valid telemetry — can't build ribbon")
+                return
+
+            dep_lat = telemetry.lat_deg
+            dep_lon = telemetry.lon_deg
+            dep_alt = telemetry.altitude_ft
+            dep_hdg = telemetry.heading_deg
+
+            dest_lat = float(dest.get("lat", 0))
+            dest_lon = float(dest.get("lon", 0))
+
+            # Compute cruise altitude
+            dist_nm = haversine_m(dep_lat, dep_lon, dest_lat, dest_lon) / 1852.0
+            cruise_alt_agl = max(1500.0, min(5000.0, 55.0 * dist_nm))
+            cruise_alt = dep_alt + cruise_alt_agl
+
+            # Look up destination runway
+            dest_rwy_heading = None
+            dest_thr_lat = None
+            dest_thr_lon = None
+            dest_alt_ft = dep_alt  # fallback
+            try:
+                import sqlite3, os
+                db = sqlite3.connect(os.path.expanduser("~/.peregrine/peregrine.db"))
+                db.row_factory = sqlite3.Row
+                rwys = db.execute("""
+                    SELECT r.*, a.elevation_ft as airport_elevation_ft FROM runways r
+                    JOIN airports a ON r.airport_id = a.id
+                    WHERE a.icao_code = ?
+                    ORDER BY r.length_ft DESC
+                """, (dest.get("icao", ""),)).fetchall()
+                if rwys:
+                    from uav.nav.geo import bearing_deg as _bd
+                    approach_brg = _bd(dep_lat, dep_lon, dest_lat, dest_lon)
+                    best_rwy = None
+                    best_diff = 999.0
+                    for rwy in rwys:
+                        hdg1 = float(rwy["heading_deg"])
+                        hdg2 = (hdg1 + 180.0) % 360.0
+                        for hdg, tlat, tlon in [
+                            (hdg1, rwy["threshold_lat"], rwy["threshold_lon"]),
+                            (hdg2, rwy["end_lat"], rwy["end_lon"]),
+                        ]:
+                            diff = abs(((approach_brg - hdg + 180) % 360) - 180)
+                            if diff < best_diff:
+                                best_diff = diff
+                                best_rwy = (hdg, float(tlat), float(tlon))
+                                dest_alt_ft = float(rwy["airport_elevation_ft"]) if rwy["airport_elevation_ft"] else dep_alt
+                    if best_rwy:
+                        dest_rwy_heading, dest_thr_lat, dest_thr_lon = best_rwy
+                db.close()
+            except Exception as e:
+                print(f"[PREVIEW] Runway lookup failed: {e}")
+
+            # Cap v_approach
+            v_land = float(speeds.get("v_land", 77.0))
+            v_approach = min(float(speeds.get("v_approach", 83.0)), v_land + 15.0)
+
+            ribbon = plan_path(
+                dep_lat=dep_lat, dep_lon=dep_lon,
+                dep_alt_ft=dep_alt, dep_heading=dep_hdg,
+                dest_lat=dest_lat, dest_lon=dest_lon,
+                dest_alt_ft=dest_alt_ft,
+                dest_rwy_heading=dest_rwy_heading,
+                dest_threshold_lat=dest_thr_lat,
+                dest_threshold_lon=dest_thr_lon,
+                cruise_alt_ft=cruise_alt,
+                v_rotate=float(speeds.get("v_rotate", 90.0)),
+                v_climb=float(speeds.get("v_climb", 160.0)),
+                v_cruise=float(speeds.get("v_cruise", 200.0)),
+                v_approach=v_approach,
+                v_land=v_land,
+                climb_fpm=float(rates.get("climb", 1600.0)),
+                takeoff_roll_ft=float(airframe.get("takeoff_roll_ft", 2000.0)),
+            )
+            print(format_ribbon(ribbon))
+
+            # Broadcast waypoints to the app
+            # Sample every Nth point to keep payload small
+            step = max(1, len(ribbon.points) // 60)
+            waypoints = []
+            for i in range(0, len(ribbon.points), step):
+                p = ribbon.points[i]
+                waypoints.append({
+                    "name": p.phase,
+                    "lat": round(p.lat, 6),
+                    "lon": round(p.lon, 6),
+                    "alt_ft": round(p.alt_ft, 0),
+                    "speed_kts": round(p.speed_kts, 1),
+                    "phase": p.phase,
+                    "heading": round(p.heading_deg, 1),
+                })
+            # Always include last point
+            p = ribbon.points[-1]
+            waypoints.append({
+                "name": "END",
+                "lat": round(p.lat, 6),
+                "lon": round(p.lon, 6),
+                "alt_ft": round(p.alt_ft, 0),
+                "speed_kts": round(p.speed_kts, 1),
+                "phase": p.phase,
+                "heading": round(p.heading_deg, 1),
+            })
+
+            broadcast.publish_status({
+                "event": "flight_plan",
+                "waypoints": waypoints,
+            })
+            print(f"[PREVIEW] Broadcast {len(waypoints)} waypoints to app")
+
+        except Exception as e:
+            print(f"[PREVIEW] Failed: {e}")
+            import traceback; traceback.print_exc()
 
     def _start_calibration(self) -> None:
         """Switch to calibration mode — automated maneuvers to measure sensitivity."""
@@ -546,6 +683,7 @@ class Autopilot:
         while self._running:
             loop_start = time.time()
             telemetry = self.adapter.read_telemetry()
+            self._last_telemetry = telemetry
 
             # ── WAIT FOR FLY — top-level guard ──
             # If --wait-for-fly is set and no fly command received yet,
@@ -582,9 +720,8 @@ class Autopilot:
                     }
                     broadcast.publish_heartbeat(self._aircraft_id, hb)
 
-                # Accept fly command from broadcast OR DB poll
+                # Accept fly/preview command from broadcast OR DB poll
                 if not self._fly_destination and self._aircraft_id:
-                    # Poll DB every 3 seconds for fly_requested
                     if not hasattr(self, '_poll_next'):
                         self._poll_next = time.time() + 2.0
                     if time.time() >= self._poll_next:
@@ -592,8 +729,14 @@ class Autopilot:
                         try:
                             row = broadcast.poll_fly_command(self._aircraft_id)
                             if row:
-                                self._fly_destination = row
-                                print(f"[COMMAND] Fly command from DB: {row}")
+                                action = row.pop("_action", "fly")
+                                if action == "preview":
+                                    # Preview only — build ribbon, broadcast, don't fly
+                                    print(f"[COMMAND] Preview ribbon from DB: {row}")
+                                    self._preview_ribbon(row)
+                                else:
+                                    self._fly_destination = row
+                                    print(f"[COMMAND] Fly command from DB: {row}")
                         except Exception as e:
                             print(f"[POLL] Error: {e}")
 
