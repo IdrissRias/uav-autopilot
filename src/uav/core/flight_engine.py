@@ -1,60 +1,47 @@
 """
-V2 Flight Engine — follow the ribbon.
+V2 Flight Engine — pure ribbon follower.
 
-Drop-in replacement for ReactiveFlightDirector.
-Same interface: .name, .ctx, .step(telemetry, stale), .reset()
+One rule: every tick, read the ribbon point at the current cursor, and
+command its targets verbatim. No phase logic, no smoothness, no soft
+limits. All smoothness, pacing, and smarts come from the ribbon itself.
 
-One job: at each tick, find where we are on the ribbon, look ahead,
-and produce Targets that steer the controller toward the lookahead point.
+The engine has ONLY two non-negotiable physical exceptions:
+  1. Wheels-on-ground braking during landing rollout (physics)
+  2. Yaw hold on the takeoff roll (rudder coordination while rolling)
 
-Phase is a PROPERTY of the ribbon point, not a runtime decision.
-No state machines, no phase transitions, no mode logic.
+Everything else — roll limits, pitch limits, terrain floor, heading
+rate-limit, AGL gating — is now the ribbon's responsibility.
+
+Interface contract (matches ReactiveFlightDirector / ModeManager):
+  .name   → current phase label (string)
+  .ctx    → shared context dict
+  .step() → returns Targets
+  .reset()→ called after a flight reset
 """
 from __future__ import annotations
 
 import math
-import time
 from typing import Optional
 
 from uav.nav.flight_plan_v2 import RibbonPath, PathPoint, plan_path, format_ribbon
-from uav.nav.geo import haversine_m, bearing_deg
+from uav.nav.geo import bearing_deg
 from uav.sim.types import Telemetry, Targets
 
 
-def _wrap180(a: float) -> float:
-    while a > 180.0:
-        a -= 360.0
-    while a < -180.0:
-        a += 360.0
-    return a
-
-
 class FlightEngine:
-    """Follow a pre-computed ribbon path.
-
-    Interface contract (matches ReactiveFlightDirector / ModeManager):
-      .name   → current phase label (string)
-      .ctx    → shared context dict
-      .step() → returns Targets
-      .reset()→ called after a flight reset
-    """
-
-    # Lookahead distance: how far ahead on the ribbon to steer toward.
-    # Shorter = tighter tracking, longer = smoother but lazier.
-    _LOOKAHEAD_NM = 0.5       # cruise/climb
-    _LOOKAHEAD_APPROACH = 0.3  # approach/descent — tighter tracking
-    _LOOKAHEAD_GROUND = 0.15   # takeoff roll — very tight
-
-    # Max heading advance per tick (same as ReactiveFlightDirector)
-    _MAX_TURN_DEG_PER_STEP = 3.0
+    # Fixed steering lookahead — use the bearing to a point this far along
+    # the ribbon as the commanded heading. This is what makes the aircraft
+    # track the line, rather than perpetually flying toward "the current point"
+    # (which is by definition wherever the plane already is).
+    _LOOKAHEAD_NM = 0.3
 
     def __init__(self, ctx: dict) -> None:
         self.ctx = ctx
         self._ribbon: Optional[RibbonPath] = None
-        self._idx: int = 0          # current position on ribbon
+        self._idx: int = 0
         self._phase: str = "GROUND"
-        self._built: bool = False   # has ribbon been built for this flight?
-        self._st: dict = {}         # small persistent state
+        self._built: bool = False
+        self._st: dict = {}
 
     # ── Public interface ─────────────────────────────────────────────
 
@@ -84,21 +71,9 @@ class FlightEngine:
             )
 
         cfg = self.ctx
-        airframe = cfg.get("airframe", {})
-        speeds = airframe.get("speeds_kts", {})
-        takeoff_cfg = cfg.get("takeoff", {})
-        throttle_cfg = airframe.get("throttle", {})
         mode_cfg = cfg.get("mode", {})
 
-        # Sanity cap: v_approach must never exceed v_land + 15.
-        # Bad calibration data can produce absurd approach speeds.
-        v_land_cap = float(speeds.get("v_land", 77.0))
-        v_app_raw = float(speeds.get("v_approach", 80.0))
-        if v_app_raw > v_land_cap + 15.0:
-            speeds = dict(speeds)
-            speeds["v_approach"] = v_land_cap + 15.0
-
-        # ── Auto-start guard ────────────────────────────────────────
+        # Auto-start guard
         auto_start = bool(mode_cfg.get("auto_start", True))
         has_dest = cfg.get("destination") is not None
         demo = bool(mode_cfg.get("demo_sequence", False))
@@ -106,22 +81,19 @@ class FlightEngine:
             self._phase = "GROUND"
             return self._ground_idle(telemetry)
 
-        # ── Build ribbon on first tick with a destination ────────────
+        # Build ribbon once on first tick with a destination
         if not self._built and has_dest:
             self._build_ribbon(telemetry)
 
-        # ── No ribbon yet — fall back to V1-style ground hold ───────
         if self._ribbon is None:
             self._phase = "GROUND"
-            return self._ground_hold(telemetry, takeoff_cfg, throttle_cfg, speeds)
+            return self._ground_idle(telemetry)
 
-        # ── Follow the ribbon ───────────────────────────────────────
-        return self._follow(telemetry, takeoff_cfg, throttle_cfg, speeds)
+        return self._follow(telemetry)
 
     # ── Ribbon construction ──────────────────────────────────────────
 
     def _build_ribbon(self, telemetry: Telemetry) -> None:
-        """Build the ribbon path from current position to destination."""
         cfg = self.ctx
         dest = cfg["destination"]
         airframe = cfg.get("airframe", {})
@@ -130,26 +102,22 @@ class FlightEngine:
 
         cruise_alt = float(cfg.get("targets", {}).get("target_alt_ft", 5000.0))
 
-        # Destination runway info
         dest_rwy = cfg.get("dest_runway")
         rwy_hdg = dest_rwy["heading"] if dest_rwy else None
         thr_lat = dest_rwy["threshold_lat"] if dest_rwy else None
         thr_lon = dest_rwy["threshold_lon"] if dest_rwy else None
         dest_alt = float(dest_rwy["elevation_ft"]) if dest_rwy and dest_rwy.get("elevation_ft") else telemetry.altitude_ft
 
-        # Departure heading: prefer detected runway
         dep_hdg = telemetry.heading_deg
         if "runway_hdg" in self._st:
             dep_hdg = self._st["runway_hdg"]
 
-        # Sanity cap v_approach to v_land + 15.
-        # Bad calibration can produce absurd approach speeds.
+        # Sanity cap v_approach — bad calibration can produce absurd speeds.
         v_land_val = float(speeds.get("v_land", 77.0))
         v_approach_raw = float(speeds.get("v_approach", 83.0))
         v_approach_capped = min(v_approach_raw, v_land_val + 15.0)
         if v_approach_capped != v_approach_raw:
             print(f"[FLIGHT_ENGINE] Capping v_approach {v_approach_raw:.0f} → {v_approach_capped:.0f} kts")
-            # Update ctx so later reads also get the capped value
             speeds["v_approach"] = v_approach_capped
 
         try:
@@ -182,92 +150,43 @@ class FlightEngine:
             import traceback; traceback.print_exc()
             self._ribbon = None
 
-    # ── Core: follow the ribbon ──────────────────────────────────────
+    # ── Core: pure follower ──────────────────────────────────────────
 
-    def _follow(self, telemetry: Telemetry, takeoff_cfg: dict,
-                throttle_cfg: dict, speeds: dict) -> Targets:
-        """Track the ribbon — the heart of V2."""
-        ribbon = self._ribbon
-        assert ribbon is not None
+    def _follow(self, telemetry: Telemetry) -> Targets:
+        """Read ribbon, emit its targets verbatim.
 
-        # 1. Find nearest point on ribbon (monotonic forward search)
-        self._idx = ribbon.nearest_ahead(
+        Two exceptions:
+          (a) On-ground during landing  → brakes locked, throttle idle.
+          (b) Takeoff roll               → yaw hold on departure heading.
+        """
+        r = self._ribbon
+        assert r is not None
+
+        # 1. Advance cursor
+        self._idx = r.nearest_ahead(
             telemetry.lat_deg, telemetry.lon_deg,
             telemetry.heading_deg, self._idx,
         )
-        cur = ribbon.points[self._idx]
-        self._phase = self._map_phase(cur.phase)
+        p = r.points[self._idx]
+        self._phase = self._map_phase(p.phase)
 
-        # 2. Choose lookahead distance based on phase
-        if cur.phase == "GROUND":
-            la_nm = self._LOOKAHEAD_GROUND
-        elif cur.phase in ("APPROACH", "DESCENT", "FLARE"):
-            la_nm = self._LOOKAHEAD_APPROACH
-        else:
-            la_nm = self._LOOKAHEAD_NM
-
-        la_idx = ribbon.lookahead(self._idx, la_nm)
-        la = ribbon.points[la_idx]
-
-        # 3. Compute bearing to lookahead point
+        # 2. Heading lookahead — steer toward a point ahead on the ribbon
+        la_idx = r.lookahead(self._idx, self._LOOKAHEAD_NM)
+        la = r.points[la_idx]
         if telemetry.has_position():
-            target_bearing = bearing_deg(
-                telemetry.lat_deg, telemetry.lon_deg,
-                la.lat, la.lon,
+            target_heading = bearing_deg(
+                telemetry.lat_deg, telemetry.lon_deg, la.lat, la.lon,
             )
         else:
-            target_bearing = la.heading_deg
+            target_heading = la.heading_deg
 
-        # 4. Rate-limit heading changes (smooth turns)
-        prev_cmd_hdg = self._st.get("cmd_hdg", telemetry.heading_deg)
-        hdg_err = _wrap180(target_bearing - prev_cmd_hdg)
-        advance = max(-self._MAX_TURN_DEG_PER_STEP,
-                      min(self._MAX_TURN_DEG_PER_STEP, hdg_err))
-        cmd_hdg = (prev_cmd_hdg + advance) % 360.0
-        self._st["cmd_hdg"] = cmd_hdg
-
-        # 5. Altitude target from ribbon point (with terrain floor protection)
+        # 3. AGL (for on-ground override only)
         agl_ft = (telemetry.agl_m * 3.28084) if not math.isnan(telemetry.agl_m) else 0.0
-        target_alt = la.alt_ft
 
-        # Terrain floor: never go below 300ft AGL during cruise/descent
-        if cur.phase in ("CRUISE", "DESCENT"):
-            terrain_floor = (telemetry.altitude_ft - agl_ft) + 300.0
-            target_alt = max(target_alt, terrain_floor)
-
-        # 6. Speed target from ribbon
-        target_speed = la.speed_kts
-
-        # 7. Phase-specific overrides
-        return self._phase_targets(
-            telemetry, cur, la, cmd_hdg, target_alt, target_speed,
-            agl_ft, takeoff_cfg, throttle_cfg, speeds,
-        )
-
-    def _phase_targets(
-        self, telemetry: Telemetry,
-        cur: PathPoint, la: PathPoint,
-        cmd_hdg: float, target_alt: float, target_speed: float,
-        agl_ft: float,
-        takeoff_cfg: dict, throttle_cfg: dict, speeds: dict,
-    ) -> Targets:
-        """Pure ribbon follower — read the ribbon, set those targets.
-
-        The ONLY reactive rules:
-          1. Throttle: if ribbon says None → PID manages.
-             If ribbon says 0.0 but we're below target speed → PID adds power.
-          2. AGL safety: if on ground (< 3ft AGL) → brakes + idle regardless of ribbon.
-          3. Ground roll: yaw hold for directional control on the runway.
-        """
-        phase = cur.phase
-        on_ground = agl_ft < 3.0
-
-        # ── AGL safety override — on the ground, always brake ────────
-        if on_ground and phase in ("FLARE", "ROLLOUT", "APPROACH"):
-            hold_hdg = self._st.get("approach_hdg_locked",
-                        self._st.get("runway_hdg", telemetry.heading_deg))
+        # ── Exception (a): wheels on ground during landing ──────────
+        if agl_ft < 3.0 and p.phase in ("ROLLOUT", "FLARE"):
             return Targets(
-                heading_deg=hold_hdg,
+                heading_deg=p.heading_deg,
                 altitude_ft=telemetry.altitude_ft,
                 airspeed_kts=0.0,
                 throttle=0.0,
@@ -277,67 +196,31 @@ class FlightEngine:
                 roll_limit=0.02,
             )
 
-        # ── Throttle logic ───────────────────────────────────────────
-        # Ribbon throttle: None = PID manages, 0.0 = idle, 1.0 = full
-        # Reactive rule: if ribbon says idle (0.0) but we're BELOW target
-        # speed by more than 5 kts, let PID add power to prevent stall.
-        ribbon_throttle = cur.throttle
-        if ribbon_throttle is not None and ribbon_throttle < 0.01:
-            # Ribbon wants idle — but check if we need survival power
-            if telemetry.airspeed_kts < (target_speed - 5.0):
-                ribbon_throttle = None  # let PID save us
-
-        # ── Ground roll: yaw hold ────────────────────────────────────
+        # ── Exception (b): takeoff roll yaw hold ─────────────────────
         yaw_hold = False
         yaw_kp = yaw_ki = yaw_limit_val = yaw_full = None
-        if phase == "GROUND":
+        if p.phase == "GROUND":
             if "runway_hdg" not in self._st:
                 self._st["runway_hdg"] = telemetry.heading_deg
-            cmd_hdg = self._st["runway_hdg"]
+            target_heading = self._st["runway_hdg"]
+            takeoff_cfg = self.ctx.get("takeoff", {})
             yaw_hold = True
             yaw_kp = float(takeoff_cfg.get("yaw_kp", 0.02))
             yaw_ki = 0.0
-            base_yaw_limit = float(takeoff_cfg.get("yaw_limit", 0.35))
-            taper = 1.0 - min(max(telemetry.airspeed_kts, 0.0), 50.0) / 50.0
-            yaw_limit_val = max(0.25, base_yaw_limit * (0.35 + 0.65 * taper))
-            yaw_full = float(takeoff_cfg.get("yaw_full_deg", 5.0))
-        elif phase == "CLIMB" and agl_ft < 600.0:
-            yaw_hold = True
-            yaw_kp = float(takeoff_cfg.get("yaw_kp", 0.07))
-            yaw_ki = float(takeoff_cfg.get("yaw_ki", 0.02))
-            yaw_limit_val = float(takeoff_cfg.get("yaw_limit", 0.5))
+            yaw_limit_val = float(takeoff_cfg.get("yaw_limit", 0.35))
             yaw_full = float(takeoff_cfg.get("yaw_full_deg", 5.0))
 
-        # ── Approach heading lock ────────────────────────────────────
-        if phase in ("APPROACH", "FLARE", "ROLLOUT"):
-            if not self._st.get("approach_hdg_locked"):
-                self._st["approach_hdg_locked"] = True
-                self._st["approach_hdg_locked"] = la.heading_deg
-            cmd_hdg = self._st.get("approach_hdg_locked", cmd_hdg)
-
-        # ── Roll limits by AGL ───────────────────────────────────────
-        if phase == "GROUND":
-            roll_lim = 0.08 if agl_ft > 10.0 else 0.0
-        elif phase == "CLIMB" and agl_ft < 600.0:
-            roll_lim = 0.35 * max(0.0, (agl_ft - 300.0) / 300.0)
-        elif phase in ("FLARE", "ROLLOUT"):
-            roll_lim = 0.03
-        elif phase == "APPROACH":
-            roll_lim = 0.15  # enough to correct heading on approach
-        else:
-            roll_lim = 0.35  # cruise/descent — full authority
-
-        # ── Build targets from ribbon ────────────────────────────────
+        # ── Pure follower: emit the ribbon point verbatim ────────────
         return Targets(
-            heading_deg=cmd_hdg,
-            altitude_ft=target_alt,
-            airspeed_kts=target_speed,
-            throttle=ribbon_throttle,
+            heading_deg=target_heading,
+            altitude_ft=p.alt_ft,
+            airspeed_kts=p.speed_kts,
+            throttle=p.throttle,
             brake_ratio=0.0,
-            gear_down=cur.gear_down,
-            flap_ratio=cur.flap_ratio,
-            roll_limit=roll_lim,
-            pitch_limit=0.12 if phase in ("GROUND", "CLIMB", "CRUISE") else 0.08,
+            gear_down=p.gear_down,
+            flap_ratio=p.flap_ratio,
+            roll_limit=0.5,      # full authority — ribbon owns smoothness
+            pitch_limit=0.15,    # full authority
             yaw_hold=yaw_hold,
             yaw_kp=yaw_kp,
             yaw_ki=yaw_ki,
@@ -348,23 +231,20 @@ class FlightEngine:
     # ── Phase mapping ────────────────────────────────────────────────
 
     def _map_phase(self, ribbon_phase: str) -> str:
-        """Map ribbon phase names to the phase names autopilot.py expects.
-
-        The autopilot watches for specific phase strings for scoring,
-        DB logging, and phase-limit watchdog.
-        """
+        """Map ribbon phase names to what autopilot.py expects for scoring
+        and watchdog logic."""
         mapping = {
             "GROUND": "GROUND",
             "CLIMB": "CLIMB",
             "CRUISE": "CRUISE",
-            "DESCENT": "CRUISE",    # watchdog treats descent like cruise
+            "DESCENT": "CRUISE",
             "APPROACH": "APPROACH",
             "FLARE": "LAND",
             "ROLLOUT": "LAND",
         }
         return mapping.get(ribbon_phase, ribbon_phase)
 
-    # ── Fallback modes ───────────────────────────────────────────────
+    # ── Idle fallback ────────────────────────────────────────────────
 
     def _ground_idle(self, telemetry: Telemetry) -> Targets:
         return Targets(
@@ -375,10 +255,3 @@ class FlightEngine:
             brake_ratio=1.0,
             gear_down=True,
         )
-
-    def _ground_hold(self, telemetry: Telemetry, takeoff_cfg: dict,
-                     throttle_cfg: dict, speeds: dict) -> Targets:
-        """Hold on ground before ribbon is built — same as V1 GROUND."""
-        if "runway_hdg" not in self._st:
-            self._st["runway_hdg"] = telemetry.heading_deg
-        return self._ground_idle(telemetry)

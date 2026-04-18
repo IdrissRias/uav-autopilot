@@ -166,20 +166,43 @@ def plan_path(
     approach_hdg = dest_rwy_heading if dest_rwy_heading is not None else bearing_deg(
         dep_lat, dep_lon, dest_lat, dest_lon,
     )
+    back_hdg = (approach_hdg + 180.0) % 360.0
 
-    # ── Pre-compute key distances ───────────────────────────────────
-    total_dist_nm = haversine_m(dep_lat, dep_lon, thr_lat, thr_lon) / 1852.0
+    # ── Landing geometry, computed from touchdown point BACKWARD ────
+    # Everything downwind of the threshold lives on the extended runway
+    # centerline so climb → cruise → descent → approach → flare is ONE
+    # straight line from somewhere over the field back to the touchdown.
+    touchdown_dist_ft = 1000.0
+    td_lat, td_lon = _dest_pt(thr_lat, thr_lon, approach_hdg,
+                               touchdown_dist_ft * 0.3048)
 
-    # How far does the approach segment extend back from the threshold?
-    approach_alt = dest_alt_ft + 600.0  # approach starts 600ft above runway
-    approach_nm = max(0.5, (approach_alt - dest_alt_ft - 50.0) / _GLIDE_FT_PER_NM)
+    approach_alt = dest_alt_ft + 600.0         # approach starts 600ft above rwy
+    flare_alt = dest_alt_ft + 30.0
 
-    # How far does descent extend back from approach start?
+    approach_descent_ft = approach_alt - flare_alt
+    approach_dist_nm = approach_descent_ft / _GLIDE_FT_PER_NM
+    approach_nm = max(0.5, approach_dist_nm)
+
+    # Approach start: back along runway axis from touchdown by approach_dist_nm
+    approach_start_lat, approach_start_lon = _dest_pt(
+        td_lat, td_lon, back_hdg, approach_dist_nm * 1852.0,
+    )
+
+    # Descent length: glideslope + decel
     alt_to_descend = cruise_alt_ft - approach_alt
     descent_nm = alt_to_descend / _GLIDE_FT_PER_NM if alt_to_descend > 0 else 0.0
-    # Add ~3nm for deceleration at cruise altitude
     decel_nm = max(1.0, (v_cruise - v_approach) / 40.0)
     total_descent_nm = descent_nm + decel_nm
+
+    # Descent start: further back along runway axis, at cruise altitude.
+    # This is the point cruise targets — when we arrive here the plane is
+    # already on the extended centerline, lined up with the runway.
+    descent_start_lat, descent_start_lon = _dest_pt(
+        approach_start_lat, approach_start_lon,
+        back_hdg, total_descent_nm * 1852.0,
+    )
+
+    total_dist_nm = haversine_m(dep_lat, dep_lon, thr_lat, thr_lon) / 1852.0
 
     # How far does climb take?
     time_per_step_s = _STEP_M / (v_climb * 0.5144)
@@ -188,7 +211,10 @@ def plan_path(
     climb_nm = climb_steps * _STEP_NM
 
     # Is there room for cruise?
-    cruise_available_nm = total_dist_nm - climb_nm - total_descent_nm - approach_nm
+    dep_to_descent_start_nm = haversine_m(
+        dep_lat, dep_lon, descent_start_lat, descent_start_lon,
+    ) / 1852.0
+    cruise_available_nm = dep_to_descent_start_nm - climb_nm
     has_cruise = cruise_available_nm > 0.5
 
     # ── 1. GROUND (takeoff roll) ────────────────────────────────────
@@ -208,7 +234,7 @@ def plan_path(
         lat, lon = _dest_pt(lat, lon, dep_heading, _STEP_M)
         cumul_nm += _STEP_NM
 
-    # ── 2. CLIMB — fixed high throttle, turn toward destination ─────
+    # ── 2. CLIMB — aim at descent_start on extended centerline ──────
     alt = dep_alt_ft
     hdg = dep_heading
     turn_rate = 3.0
@@ -216,7 +242,7 @@ def plan_path(
     while alt < cruise_alt_ft:
         agl = alt - dep_alt_ft
         if agl > 600.0:
-            target_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
+            target_hdg = bearing_deg(lat, lon, descent_start_lat, descent_start_lon)
             err = _wrap180(target_hdg - hdg)
             advance = max(-turn_rate, min(turn_rate, err))
             hdg = (hdg + advance) % 360.0
@@ -236,9 +262,9 @@ def plan_path(
         if len(pts) > 5000:
             break
 
-    # Complete the turn at cruise altitude
+    # Complete the turn at cruise altitude, still aiming at descent_start
     for _ in range(500):
-        target_hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
+        target_hdg = bearing_deg(lat, lon, descent_start_lat, descent_start_lon)
         if abs(_wrap180(target_hdg - hdg)) < 2.0:
             break
         err = _wrap180(target_hdg - hdg)
@@ -247,7 +273,7 @@ def plan_path(
         pts.append(PathPoint(
             lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=v_climb,
             heading_deg=hdg, phase="CLIMB",
-            gear_down=False, flap_ratio=0.0, throttle=0.85,  # reduced power during level turn
+            gear_down=False, flap_ratio=0.0, throttle=0.85,
             dist_from_start_nm=cumul_nm,
         ))
         lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
@@ -255,11 +281,16 @@ def plan_path(
         if len(pts) > 5000:
             break
 
-    # ── 3. CRUISE — PID throttle, straight line, clean config ───────
+    # ── 3. CRUISE — straight line to descent_start ──────────────────
+    # descent_start is on the extended runway centerline, so when cruise
+    # ends the plane is lined up with the runway. No heading blend needed.
     if has_cruise:
-        n_cruise = max(1, int(cruise_available_nm / _STEP_NM))
+        dist_to_descent_start_nm = haversine_m(
+            lat, lon, descent_start_lat, descent_start_lon,
+        ) / 1852.0
+        n_cruise = max(1, int(dist_to_descent_start_nm / _STEP_NM))
         for i in range(n_cruise):
-            hdg = bearing_deg(lat, lon, thr_lat, thr_lon)
+            hdg = bearing_deg(lat, lon, descent_start_lat, descent_start_lon)
             t_accel = min(1.0, (i * _STEP_NM) / 2.0)
             spd = _lerp(v_climb, v_cruise, t_accel)
             pts.append(PathPoint(
@@ -274,40 +305,30 @@ def plan_path(
                 break
 
     # ══════════════════════════════════════════════════════════════════
-    # LANDING SEGMENTS — computed from the TOUCHDOWN POINT backward
-    #
-    # The touchdown point is the exact lat/lon where wheels hit the runway.
-    # Everything is computed to converge on that point:
-    #   APPROACH: 3° glideslope aimed at the touchdown point
-    #   FLARE: last 30ft, reducing V/S for gentle contact
-    #   ROLLOUT: on the ground, braking to stop
-    #   DESCENT: from cruise to approach start, blending heading to runway
+    # LANDING SEGMENTS — pinned to the extended runway centerline
+    #   DESCENT : descent_start   → approach_start   (cruise_alt → approach_alt)
+    #   APPROACH: approach_start  → flare_alt        (3° glideslope)
+    #   FLARE   : last 30ft       → touchdown point
+    #   ROLLOUT : touchdown point → brake to stop
+    # All four legs are colinear with the runway, so the plane just flies
+    # straight down one line. No curves, no blends.
     # ══════════════════════════════════════════════════════════════════
 
-    # ── Compute the exact touchdown point ────────────────────────────
-    # 1000ft past the threshold along the runway heading = touchdown zone
-    touchdown_dist_ft = 1000.0
-    td_lat, td_lon = _dest_pt(thr_lat, thr_lon, approach_hdg,
-                               touchdown_dist_ft * 0.3048)
-
-    # ── Approach: 3° glideslope aimed at touchdown point ─────────────
-    # The approach starts at approach_alt and descends to flare_alt (30ft AGL)
-    # along a straight line on the runway heading ending at the touchdown point.
-    flare_alt = dest_alt_ft + 30.0
-    approach_descent_ft = approach_alt - flare_alt
-    approach_dist_nm = approach_descent_ft / _GLIDE_FT_PER_NM
     n_approach = max(1, int(approach_dist_nm / _STEP_NM))
 
-    # Compute approach start point (back from touchdown along runway heading)
-    back_hdg = (approach_hdg + 180.0) % 360.0
-    approach_start_lat, approach_start_lon = _dest_pt(
-        td_lat, td_lon, back_hdg, approach_dist_nm * 1852.0)
-
-    # ── 4. DESCENT — from current position to approach start ─────────
-    dist_to_approach = haversine_m(lat, lon, approach_start_lat, approach_start_lon) / 1852.0
-    n_descent = max(1, int(dist_to_approach / _STEP_NM))
+    # ── 4. DESCENT — straight line on runway heading ────────────────
+    # Starts at descent_start, ends at approach_start. The plane steps
+    # forward from its actual current position (end of cruise) toward
+    # descent_start for the first few ticks if cruise didn't quite reach,
+    # then descends along the axis.
     descent_start_alt = cruise_alt_ft if has_cruise else alt
     descent_start_spd = v_cruise if has_cruise else v_climb
+
+    # Use the pre-computed descent_start as the anchor; step forward on
+    # runway heading from there. This guarantees descent aligns exactly
+    # with the approach axis.
+    dlat, dlon = descent_start_lat, descent_start_lon
+    n_descent = max(1, int(total_descent_nm / _STEP_NM))
 
     for i in range(n_descent):
         t = (i + 1) / n_descent
@@ -320,23 +341,15 @@ def plan_path(
             decel_t = (t - 0.4) / 0.6
             spd = _lerp(descent_start_spd, v_approach, decel_t)
             flap = 0.5
-        # Heading: blend toward runway heading in last 50%
-        bearing_to_app = bearing_deg(lat, lon, approach_start_lat, approach_start_lon)
-        if t < 0.5:
-            hdg = bearing_to_app
-        else:
-            blend_t = (t - 0.5) / 0.5
-            hdg_err = _wrap180(approach_hdg - bearing_to_app)
-            hdg = (bearing_to_app + hdg_err * blend_t) % 360.0
         gear = spd < (v_approach + 30.0)
 
         pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=alt_here, speed_kts=spd,
-            heading_deg=hdg, phase="DESCENT",
+            lat=dlat, lon=dlon, alt_ft=alt_here, speed_kts=spd,
+            heading_deg=approach_hdg, phase="DESCENT",
             gear_down=gear, flap_ratio=flap, throttle=None,
             dist_from_start_nm=cumul_nm,
         ))
-        lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
+        dlat, dlon = _dest_pt(dlat, dlon, approach_hdg, _STEP_M)
         cumul_nm += _STEP_NM
         if len(pts) > 25000:
             break
