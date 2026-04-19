@@ -158,12 +158,43 @@ class XPlaneUDP(SimAdapter):
         self._send_dref(value, "sim/cockpit2/controls/right_brake_ratio")
 
     def set_flaps(self, ratio: float) -> None:
-        """Set flap position. 0.0 = retracted, 1.0 = full deflection.
-        Only writes when value changes by >0.02 to avoid flooding X-Plane."""
-        if self._flap_state is not None and abs(ratio - self._flap_state) < 0.02:
-            return
-        self._flap_state = ratio
-        self._send_dref(ratio, "sim/flightmodel/controls/flaprqst")
+        """Set flap position using SF50 notch commands.
+        SF50 has 2 notches: 0=up, 1=50%, 2=full.
+        ratio 0.0 → notch 0, 0.01-0.74 → notch 1, 0.75-1.0 → notch 2.
+        Re-sends commands every 60 ticks to ensure X-Plane received them."""
+        if ratio < 0.01:
+            target_notch = 0
+        elif ratio < 0.75:
+            target_notch = 1
+        else:
+            target_notch = 2
+
+        current_notch = self._flap_state if self._flap_state is not None else 0
+        current_notch = int(round(current_notch))
+
+        # Count ticks at same target to periodically re-send
+        if not hasattr(self, '_flap_ticks'):
+            self._flap_ticks = 0
+        self._flap_ticks += 1
+
+        if target_notch == current_notch:
+            # Re-send every 60 ticks (~3s) to ensure X-Plane got it
+            if self._flap_ticks % 60 != 0:
+                return
+
+        self._flap_ticks = 0
+        # Reset to notch 0 first, then step to target (absolute positioning)
+        # This avoids drift from missed commands
+        if current_notch != target_notch or self._flap_state is None:
+            # Retract fully first
+            for _ in range(3):
+                self._send_cmnd("sim/flight_controls/flaps_up")
+            # Then step to target
+            for _ in range(target_notch):
+                self._send_cmnd("sim/flight_controls/flaps_down")
+            print(f"[FLAPS] notch {current_notch} → {target_notch} (ratio={ratio:.2f})")
+
+        self._flap_state = float(target_notch)
 
     def set_gear(self, gear_down: bool) -> None:
         # sim/cockpit/switches/gear_handle_status is read-only — use commands instead.

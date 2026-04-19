@@ -1,23 +1,32 @@
 """
-V2 Flight Plan — Dense ribbon of PathPoints.
+V2 Flight Plan — Keyframe ribbon (commander).
 
-The path planner runs ONCE before takeoff.  It computes the entire flight
-as a dense ribbon of hundreds of PathPoints, spaced ~0.1 nm apart.
-Each point carries lat, lon, altitude, speed, heading, phase, and
-gear/flap config.
+The commander describes the flight as ~12 keyframes.  Each keyframe is:
+  * a PHASE (GROUND / CLIMB / CRUISE / DESCENT / APPROACH / FLARE / ROLLOUT)
+  * a COMMAND BLOCK (throttle, altitude, speed, heading, gear, flap, brake…)
+  * a TRIGGER that advances to the next keyframe
 
-Architecture: BUILD FORWARD ONLY.
-  1. GROUND — takeoff roll on departure heading
-  2. CLIMB  — climb to cruise alt, turning toward destination
-  3. CRUISE — straight line toward destination (optional, skipped if short)
-  4. DESCENT — constant-rate descent, decelerating to approach speed
-  5. APPROACH — final segment on runway heading, 3° glideslope
-  6. FLARE  — last 50ft, arresting descent
-  7. ROLLOUT — on the ground, braking
+The soldier (FlightEngine) walks keyframes forward: every tick, if the
+current keyframe's trigger has fired, advance; then emit its targets.
 
-The landing segments (APPROACH/FLARE/ROLLOUT) are pinned to the destination
-runway threshold. The planner computes where to START descending by working
-backward from the threshold mathematically, then flies forward to that point.
+One configuration knob: `v_stall` (default 77).  All other speeds derive
+from it via fixed ratios:
+    V_rotate   = 1.17 × Vs   (takeoff rotation)
+    V_approach = 1.08 × Vs
+    V_land     = 1.00 × Vs
+    gear_safe  = 1.30 × Vs
+    flap_safe  = 1.50 × Vs
+
+Cruise throttle = alt-scaled:  clip(0.72 + 0.005 × alt_kft, 0.72, 0.92).
+Speed emerges from throttle+drag; no cruise-speed target.
+
+Landing geometry is backward-solved from the runway threshold, exactly
+like v1:  threshold → touchdown → flare_start → approach_start →
+descent_start, all collinear with the runway axis.  Cruise/climb aim
+at descent_start so the plane arrives on the extended centerline.
+
+A sparse preview (`.points`) is emitted for app map display — the engine
+doesn't use it.
 """
 from __future__ import annotations
 
@@ -25,81 +34,254 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from uav.nav.geo import haversine_m, bearing_deg
+from uav.nav.geo import bearing_deg, haversine_m
 
 
-# ─── Data ─────────────────────────────────────────────────────────────
+# ═══ Ratios & constants ═════════════════════════════════════════════════
 
+_VS_DEFAULT = 77.0
+_RATIO_V_ROTATE = 1.17
+_RATIO_V_APPROACH = 1.08
+_RATIO_V_LAND = 1.00
+_RATIO_GEAR_SAFE = 1.30
+_RATIO_FLAP_SAFE = 1.50
+_RATIO_V_CRUISE = 2.0        # cruise target speed — throttle PID holds this
+
+_GLIDE_FT_PER_NM = 500.0    # ~4.7° glideslope — SF50 handles this cleanly with
+# gear+flaps deployed, and the flight-20260419_143638 map showed the old 3°
+# slope (318 ft/nm) produced a 10+ nm descent string that the plane couldn't
+# track cleanly. Shorter slope keeps the plane closer to the destination during
+# descent and shortens the ribbon corridor.
+_APPROACH_ALT_AGL_FT = 600.0  # where approach begins (above threshold alt)
+_FLARE_ALT_AGL_FT = 30.0      # where flare begins
+_TOUCHDOWN_FT_PAST_THR = 1000.0
+_FLARE_LEN_NM = 0.2
+
+# ═══ Measured physics model (SF50, from flight logs) ═══════════════════
+# Numbers extracted from tools/measure_physics.py over 12 flights on
+# 2026-04-19. Planning numbers are conservative relative to measured
+# grand-medians, so the ribbon never assumes better performance than
+# the jet can deliver.
+#
+#   metric               measured   planning  units
+#   decel_rate_clean      0.84       0.70     kts/sec (idle, clean, level)
+#   sink_rate_drag        50         50       ft/sec  (flaps+gear at idle)
+#   climb_rate            34         30       ft/sec  (full throttle, climb)
+#
+# Source notes:
+#  * Decel is the aircraft's drag-limited bleed rate at idle. Used to
+#    size the DECELERATE leg so the plane reliably reaches flap_safe
+#    before the ribbon demands flap deployment. Flight 20260419-145406
+#    crashed because the decel leg was 3 nm but the measured bleed over
+#    that distance was only ~36 kts (needed 55) — hence the sizing is
+#    now physics-based, not heuristic.
+#  * Sink rate in drag config is far steeper than any glideslope we
+#    command (14.7° natural vs our 4.7° ask), so descent-slope sizing
+#    is bounded by glide geometry, not sink authority.
+_DECEL_RATE_CLEAN_KPS = 0.70        # conservative; measured 0.84
+_SINK_RATE_DRAG_FPS = 50.0           # reference only; slope is geometry-bounded
+_CLIMB_RATE_FPS = 30.0               # conservative; measured 34
+_DECEL_SAFETY_MARGIN_NM = 1.0        # extra runway beyond calc'd bleed dist
+_DECEL_LEN_MAX_NM = 15.0             # cap for extreme-alt descents
+_INTERCEPT_ANGLE_DEG = 30.0  # shallow intercept onto extended centerline
+_JOIN_MIN_OFFSET_NM = 3.0    # join point always ≥ 3 nm behind decel_start
+_JOIN_MAX_OFFSET_NM = 80.0   # cap so we don't fly wildly off course
+
+
+# ═══ Data model ═════════════════════════════════════════════════════════
+
+@dataclass
+class Trigger:
+    """Condition that advances the ribbon to the next keyframe.
+
+    Supported kinds:
+        speed_gte      airspeed_kts >= value
+        speed_lte      airspeed_kts <= value
+        agl_gte        agl_ft       >= value
+        agl_lte        agl_ft       <= value
+        alt_reached    |altitude_ft - value| < 50
+        near_point     horizontal distance to (lat, lon) <= value  (nm)
+        any            ANY of `subs` fires  (OR over a tuple of Triggers)
+        all            ALL of `subs` fire   (AND over a tuple of Triggers)
+        always         fires immediately
+        never          terminal; never fires
+    """
+    kind: str = "never"
+    value: float = 0.0
+    lat: float = 0.0
+    lon: float = 0.0
+    # For kind="any": tuple of sub-triggers that are OR'd together.
+    subs: tuple = ()
+
+    def fired(self, telemetry, agl_ft: float) -> bool:
+        k = self.kind
+        if k == "never":
+            return False
+        if k == "always":
+            return True
+        if k == "any":
+            return any(s.fired(telemetry, agl_ft) for s in self.subs)
+        if k == "all":
+            return all(s.fired(telemetry, agl_ft) for s in self.subs)
+        spd = telemetry.airspeed_kts
+        alt = telemetry.altitude_ft
+        if k == "speed_gte":
+            return spd >= self.value
+        if k == "speed_lte":
+            return spd <= self.value
+        if k == "agl_gte":
+            return agl_ft >= self.value
+        if k == "agl_lte":
+            return agl_ft <= self.value
+        if k == "alt_reached":
+            return abs(alt - self.value) < 50.0
+        if k == "near_point":
+            if not telemetry.has_position():
+                return False
+            d_nm = haversine_m(
+                telemetry.lat_deg, telemetry.lon_deg, self.lat, self.lon,
+            ) / 1852.0
+            return d_nm <= self.value
+        return False
+
+    def describe(self) -> str:
+        k = self.kind
+        if k in ("never", "always"):
+            return k
+        if k == "any":
+            return " OR ".join(s.describe() for s in self.subs)
+        if k == "all":
+            return " AND ".join(s.describe() for s in self.subs)
+        if k in ("speed_gte", "speed_lte"):
+            op = "≥" if k.endswith("gte") else "≤"
+            return f"spd {op} {self.value:.0f}kts"
+        if k in ("agl_gte", "agl_lte"):
+            op = "≥" if k.endswith("gte") else "≤"
+            return f"agl {op} {self.value:.0f}ft"
+        if k == "alt_reached":
+            return f"alt→{self.value:.0f}ft"
+        if k == "near_point":
+            return f"≤{self.value:.1f}nm to ({self.lat:.4f},{self.lon:.4f})"
+        return k
+
+
+@dataclass
+class Keyframe:
+    """One stable commander-state.  Fields default to None = 'inherit prior'."""
+    name: str
+    phase: str                    # GROUND | CLIMB | CRUISE | DESCENT | APPROACH | FLARE | ROLLOUT
+
+    # Throttle
+    throttle_mode: str = "explicit"   # "explicit" | "alt_scaled" | "idle" | "speed_pid"
+    throttle: Optional[float] = None  # used only when mode == "explicit"
+
+    # Speed target (None = throttle-driven, no speed regulation)
+    target_speed_kts: Optional[float] = None
+
+    # Altitude
+    alt_mode: str = "target"          # "target" | "hold" | "glideslope"
+    target_alt_ft: Optional[float] = None
+
+    # Heading
+    heading_mode: str = "hold"        # "hold" | "fixed" | "aim_at" | "dep_runway" | "dest_runway"
+    target_heading_deg: Optional[float] = None
+    aim_lat: float = 0.0
+    aim_lon: float = 0.0
+
+    # Levers
+    gear_down: Optional[bool] = None
+    flap_ratio: Optional[float] = None
+    brake_ratio: Optional[float] = None
+
+    # Commander-issued limits (None = full authority)
+    roll_limit: Optional[float] = None
+    pitch_limit: Optional[float] = None
+    pitch_down_limit: Optional[float] = None  # opt-in nose-down cap (descent only)
+
+    # Yaw coordination (for takeoff roll)
+    yaw_hold: Optional[bool] = None
+    yaw_kp: Optional[float] = None
+    yaw_limit: Optional[float] = None
+
+    # Trigger that advances to the next keyframe
+    trigger: Trigger = field(default_factory=lambda: Trigger("never"))
+
+
+@dataclass
+class Geometry:
+    """Backward-solved landing geometry.  Computed once per flight plan."""
+    dep_lat: float
+    dep_lon: float
+    dep_alt_ft: float
+    dep_heading: float
+    # Runway
+    thr_lat: float
+    thr_lon: float
+    thr_alt_ft: float
+    rwy_heading: float
+    # Derived landing chain (all collinear with runway axis)
+    touchdown_lat: float
+    touchdown_lon: float
+    flare_start_lat: float
+    flare_start_lon: float
+    approach_start_lat: float
+    approach_start_lon: float
+    approach_start_alt_ft: float       # = thr_alt + 600
+    descent_start_lat: float
+    descent_start_lon: float
+    decel_start_lat: float                 # 5 nm back from descent_start
+    decel_start_lon: float
+    join_lat: float                        # intercept point on extended centerline
+    join_lon: float
+    cruise_alt_ft: float
+    # Speeds (derived from Vs)
+    v_stall: float
+    v_rotate: float
+    v_cruise: float
+    v_approach: float
+    v_land: float
+    gear_safe_kts: float
+    flap_safe_kts: float
+
+
+# Legacy PathPoint retained for the map-preview list (`.points`).
 @dataclass
 class PathPoint:
     lat: float
     lon: float
-    alt_ft: float          # MSL
+    alt_ft: float
     speed_kts: float
-    heading_deg: float     # track over ground
-    phase: str             # GROUND / CLIMB / CRUISE / DESCENT / APPROACH / FLARE / ROLLOUT
+    heading_deg: float
+    phase: str
     gear_down: bool = True
     flap_ratio: float = 0.0
-    throttle: float | None = None  # None = PID manages; 0.0 = idle; 1.0 = full
-    dist_from_start_nm: float = 0.0   # cumulative distance along ribbon
+    throttle: Optional[float] = None
+    dist_from_start_nm: float = 0.0
 
 
-class RibbonPath:
-    """Immutable dense ribbon.  Provides spatial queries for the engine."""
-
-    def __init__(self, points: List[PathPoint]) -> None:
-        if not points:
-            raise ValueError("RibbonPath needs at least one point")
-        self.points = points
+@dataclass
+class Ribbon:
+    """Ribbon = keyframes (commander) + geometry (reference frame) + sparse
+    preview points (for app map display)."""
+    keyframes: List[Keyframe]
+    geometry: Geometry
+    points: List[PathPoint] = field(default_factory=list)
 
     def __len__(self) -> int:
-        return len(self.points)
-
-    # -- Spatial queries --------------------------------------------------
-
-    def nearest_ahead(self, lat: float, lon: float, heading: float,
-                      last_idx: int = 0) -> int:
-        best_idx = last_idx
-        best_dist = math.inf
-        end = min(last_idx + 200, len(self.points))
-        cos_h = math.cos(math.radians(heading))
-        sin_h = math.sin(math.radians(heading))
-
-        for i in range(last_idx, end):
-            p = self.points[i]
-            dlat = p.lat - lat
-            dlon = (p.lon - lon) * math.cos(math.radians(lat))
-            along = dlat * cos_h + dlon * sin_h
-            if along < -0.001:
-                continue
-            d = dlat * dlat + dlon * dlon
-            if d < best_dist:
-                best_dist = d
-                best_idx = i
-
-        return best_idx
-
-    def lookahead(self, idx: int, dist_nm: float) -> int:
-        target = self.points[idx].dist_from_start_nm + dist_nm
-        for i in range(idx, len(self.points)):
-            if self.points[i].dist_from_start_nm >= target:
-                return i
-        return len(self.points) - 1
+        return len(self.keyframes)
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────
+# ═══ Helpers ════════════════════════════════════════════════════════════
 
-def _dest_pt(lat: float, lon: float, bearing_deg_: float,
-             dist_m: float) -> tuple[float, float]:
-    """Return (lat, lon) that is *dist_m* metres from (lat, lon) on bearing."""
+def _dest_pt(lat: float, lon: float, bearing: float, dist_m: float) -> tuple[float, float]:
     R = 6_371_000.0
     d = dist_m / R
-    brng = math.radians(bearing_deg_)
+    brng = math.radians(bearing)
     lat1 = math.radians(lat)
     lon1 = math.radians(lon)
     lat2 = math.asin(
-        math.sin(lat1) * math.cos(d) +
-        math.cos(lat1) * math.sin(d) * math.cos(brng)
+        math.sin(lat1) * math.cos(d)
+        + math.cos(lat1) * math.sin(d) * math.cos(brng)
     )
     lon2 = lon1 + math.atan2(
         math.sin(brng) * math.sin(d) * math.cos(lat1),
@@ -108,24 +290,544 @@ def _dest_pt(lat: float, lon: float, bearing_deg_: float,
     return math.degrees(lat2), math.degrees(lon2)
 
 
-def _lerp(a: float, b: float, t: float) -> float:
+def _interp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
-def _wrap180(a: float) -> float:
-    while a > 180.0:
-        a -= 360.0
-    while a < -180.0:
-        a += 360.0
-    return a
+def _decel_len_nm(v_from_kts: float, v_to_kts: float) -> float:
+    """Distance needed to bleed from v_from→v_to at idle, clean config,
+    level flight. Returns nautical miles including a safety margin.
+
+    Physics: at a constant decel rate R (kts/sec), bleeding delta
+    ΔV (kts) takes t = ΔV/R seconds. Forward distance covered is
+    V_avg × t, where V_avg = (v_from + v_to) / 2 because velocity
+    decreases linearly under constant decel. Converting kts→nm/s
+    (÷3600) and adding a safety margin gives the leg length.
+    """
+    delta_kts = max(0.0, v_from_kts - v_to_kts)
+    time_s = delta_kts / _DECEL_RATE_CLEAN_KPS
+    avg_kts = (v_from_kts + v_to_kts) / 2.0
+    dist_nm = (avg_kts / 3600.0) * time_s
+    return min(_DECEL_LEN_MAX_NM, dist_nm + _DECEL_SAFETY_MARGIN_NM)
 
 
-# ─── Path Builder ─────────────────────────────────────────────────────
+# ═══ Join-point (intercept) ═══════════════════════════════════════════
 
-_STEP_NM = 0.1
-_STEP_M = _STEP_NM * 1852.0
-_GLIDE_FT_PER_NM = 318.0   # 3° glideslope
+def _compute_join_point(
+    dep_lat: float, dep_lon: float,
+    thr_lat: float, thr_lon: float,
+    back_hdg: float,
+    decel_lat: float, decel_lon: float,
+) -> tuple[float, float]:
+    """Point on the extended approach centerline where cruise meets final.
 
+    We want the aircraft to intercept the runway axis at a shallow angle
+    (30° — standard IFR vectored-approach).  The join is placed on the
+    centerline such that the bearing from dep to join differs from the
+    runway heading by ~30°; at the join, the turn-to-final is therefore
+    only ~30° instead of whatever arbitrary angle dep sits at.
+
+    Flat-earth approximation around the threshold; good enough for
+    placements up to ~200 nm.
+
+    Geometry:
+        • t = along-track position from threshold, positive in back_hdg.
+        • F = foot of perpendicular from dep onto the centerline.
+        • d_perp = |dep − F|.
+        • Ideal join: t_J = t_F − d_perp / tan(30°).   [30° intercept]
+        • Clamp: t_decel + 3 nm ≤ t_J ≤ t_decel + 80 nm.
+    """
+    mean_lat_rad = math.radians((thr_lat + dep_lat) / 2.0)
+    dep_e = (dep_lon - thr_lon) * 60.0 * math.cos(mean_lat_rad)
+    dep_n = (dep_lat - thr_lat) * 60.0
+    decel_e = (decel_lon - thr_lon) * 60.0 * math.cos(mean_lat_rad)
+    decel_n = (decel_lat - thr_lat) * 60.0
+
+    bh_rad = math.radians(back_hdg)
+    ue, un = math.sin(bh_rad), math.cos(bh_rad)  # along-track unit vector (east, north)
+
+    t_dep = dep_e * ue + dep_n * un
+    t_decel = decel_e * ue + decel_n * un
+
+    perp_e = dep_e - t_dep * ue
+    perp_n = dep_n - t_dep * un
+    d_perp = math.hypot(perp_e, perp_n)
+
+    intercept_off = d_perp / math.tan(math.radians(_INTERCEPT_ANGLE_DEG))
+    t_join = t_dep - intercept_off
+    # Must be behind decel_start so there's a straight final leg from J→decel.
+    t_join = max(t_join, t_decel + _JOIN_MIN_OFFSET_NM)
+    # Cap so we don't route through the middle of nowhere.
+    t_join = min(t_join, t_decel + _JOIN_MAX_OFFSET_NM)
+
+    return _dest_pt(thr_lat, thr_lon, back_hdg, t_join * 1852.0)
+
+
+# ═══ Geometry solver ═══════════════════════════════════════════════════
+
+def _solve_geometry(
+    *,
+    dep_lat: float,
+    dep_lon: float,
+    dep_alt_ft: float,
+    dep_heading: float,
+    dest_lat: float,
+    dest_lon: float,
+    dest_alt_ft: float,
+    dest_rwy_heading: Optional[float],
+    dest_threshold_lat: Optional[float],
+    dest_threshold_lon: Optional[float],
+    cruise_alt_ft: float,
+    v_stall: float,
+) -> Geometry:
+    # Resolve runway
+    thr_lat = dest_threshold_lat if dest_threshold_lat is not None else dest_lat
+    thr_lon = dest_threshold_lon if dest_threshold_lon is not None else dest_lon
+    rwy_hdg = (dest_rwy_heading
+               if dest_rwy_heading is not None
+               else bearing_deg(dep_lat, dep_lon, dest_lat, dest_lon))
+    back_hdg = (rwy_hdg + 180.0) % 360.0
+
+    # Touchdown: 1000 ft past threshold along runway
+    td_lat, td_lon = _dest_pt(thr_lat, thr_lon, rwy_hdg, _TOUCHDOWN_FT_PAST_THR * 0.3048)
+
+    # Flare start: touchdown - flare_len back
+    flare_lat, flare_lon = _dest_pt(td_lat, td_lon, back_hdg, _FLARE_LEN_NM * 1852.0)
+
+    # Approach start: 3° glideslope from 600ft AGL down to 30ft AGL
+    approach_alt = dest_alt_ft + _APPROACH_ALT_AGL_FT
+    approach_descent_ft = _APPROACH_ALT_AGL_FT - _FLARE_ALT_AGL_FT
+    approach_len_nm = max(0.5, approach_descent_ft / _GLIDE_FT_PER_NM)
+    app_lat, app_lon = _dest_pt(flare_lat, flare_lon, back_hdg, approach_len_nm * 1852.0)
+
+    # Descent start: glideslope from cruise_alt down to approach_alt
+    alt_to_descend = max(0.0, cruise_alt_ft - approach_alt)
+    descent_len_nm = alt_to_descend / _GLIDE_FT_PER_NM if alt_to_descend > 0 else 0.0
+    desc_lat, desc_lon = _dest_pt(app_lat, app_lon, back_hdg, descent_len_nm * 1852.0)
+
+    # Speeds (computed early so decel-leg sizing can use them)
+    v_rot = _RATIO_V_ROTATE * v_stall
+    v_cru = _RATIO_V_CRUISE * v_stall
+    v_app = _RATIO_V_APPROACH * v_stall
+    v_land = _RATIO_V_LAND * v_stall
+    gear_safe = _RATIO_GEAR_SAFE * v_stall
+    flap_safe = _RATIO_FLAP_SAFE * v_stall
+
+    # Decel start: physics-sized from measured decel rate (0.70 kts/sec
+    # at idle, clean, level), not an altitude heuristic. Distance = what
+    # the jet actually needs to bleed Vcruise→Vfe at drag-limited idle.
+    # See _decel_len_nm() for math and _DECEL_RATE_CLEAN_KPS for source.
+    decel_len_nm = _decel_len_nm(v_cru, flap_safe)
+    decel_lat, decel_lon = _dest_pt(desc_lat, desc_lon, back_hdg, decel_len_nm * 1852.0)
+
+    # Join point: where cruise meets the extended centerline at a 30° angle.
+    # Cruise aims here, then a short INBOUND leg runs along the centerline to
+    # decel_start.  Prevents the 90° elbow that used to happen when dep was
+    # off the runway axis.
+    join_lat, join_lon = _compute_join_point(
+        dep_lat, dep_lon, thr_lat, thr_lon,
+        back_hdg, decel_lat, decel_lon,
+    )
+
+    return Geometry(
+        dep_lat=dep_lat, dep_lon=dep_lon,
+        dep_alt_ft=dep_alt_ft, dep_heading=dep_heading,
+        thr_lat=thr_lat, thr_lon=thr_lon,
+        thr_alt_ft=dest_alt_ft,
+        rwy_heading=rwy_hdg,
+        touchdown_lat=td_lat, touchdown_lon=td_lon,
+        flare_start_lat=flare_lat, flare_start_lon=flare_lon,
+        approach_start_lat=app_lat, approach_start_lon=app_lon,
+        approach_start_alt_ft=approach_alt,
+        descent_start_lat=desc_lat, descent_start_lon=desc_lon,
+        decel_start_lat=decel_lat, decel_start_lon=decel_lon,
+        join_lat=join_lat, join_lon=join_lon,
+        cruise_alt_ft=cruise_alt_ft,
+        v_stall=v_stall, v_rotate=v_rot, v_cruise=v_cru,
+        v_approach=v_app, v_land=v_land,
+        gear_safe_kts=gear_safe, flap_safe_kts=flap_safe,
+    )
+
+
+# ═══ Keyframe builder ══════════════════════════════════════════════════
+
+def _build_keyframes(g: Geometry) -> List[Keyframe]:
+    """Emit the ~12-row flight plan."""
+    return [
+        # ── 1. TAKEOFF_ROLL ──────────────────────────────────────────
+        # Full throttle, flaps 0.5 for lift, hold runway heading with yaw
+        # coordination.  Advances when airspeed crosses V_rotate.
+        Keyframe(
+            name="TAKEOFF_ROLL", phase="GROUND",
+            throttle_mode="explicit", throttle=1.0,
+            alt_mode="hold",
+            heading_mode="dep_runway",
+            gear_down=True, flap_ratio=0.5, brake_ratio=0.0,
+            yaw_hold=True, yaw_kp=0.02, yaw_limit=0.35,
+            trigger=Trigger("speed_gte", value=g.v_rotate),
+        ),
+
+        # ── 2. CLIMB_ROTATE ──────────────────────────────────────────
+        # Rotation + initial climb.  Hold departure runway heading, climb
+        # to cruise alt.  Gear still down, flaps still 0.5.  Pitch limit
+        # 0.20 (≈12°) so alt-PID can't command 90° nose-up and stall us.
+        # Advance when clear of obstacles — agl ≥ 50 ft.
+        Keyframe(
+            name="CLIMB_ROTATE", phase="CLIMB",
+            throttle_mode="explicit", throttle=0.95,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="dep_runway",
+            gear_down=True, flap_ratio=0.5,
+            pitch_limit=0.20,
+            trigger=Trigger("agl_gte", value=50.0),
+        ),
+
+        # ── 3. CLIMB_GEAR_UP ─────────────────────────────────────────
+        # Gear retracted, still straight-out on dep-runway heading.
+        # Pitch still capped.  Advance when safely above pattern
+        # altitude — agl ≥ 300 ft.
+        Keyframe(
+            name="CLIMB_GEAR_UP", phase="CLIMB",
+            throttle_mode="explicit", throttle=0.95,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="dep_runway",
+            gear_down=False, flap_ratio=0.5,
+            pitch_limit=0.20,
+            trigger=Trigger("agl_gte", value=300.0),
+        ),
+
+        # ── 4. CLIMB_CLEAN ───────────────────────────────────────────
+        # Flaps retracted, turn toward the join point (where we meet the
+        # extended runway centerline at a 30° intercept).  Pitch still
+        # capped.  roll_limit kept shallow (0.25 ≈ ~15° bank) because
+        # CLIMB_CLEAN begins at 300 AGL — a tight aim_at turn at
+        # saturation (flight 20260419_145024 drove R to -1.0 at ~500 AGL
+        # and hit terrain).  Advance at cruise altitude.
+        Keyframe(
+            name="CLIMB_CLEAN", phase="CLIMB",
+            throttle_mode="explicit", throttle=0.95,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="aim_at",
+            aim_lat=g.join_lat, aim_lon=g.join_lon,
+            gear_down=False, flap_ratio=0.0,
+            roll_limit=0.25,
+            pitch_limit=0.20,
+            trigger=Trigger("alt_reached", value=g.cruise_alt_ft),
+        ),
+
+        # ── 5. CRUISE ────────────────────────────────────────────────
+        # Speed-PID throttle holds Vcruise; alt-hold holds cruise altitude.
+        # Both metrics tracked — no more free-drifting speed or altitude.
+        # Aim at the join point (30° intercept with runway axis).
+        Keyframe(
+            name="CRUISE", phase="CRUISE",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_cruise,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="aim_at",
+            aim_lat=g.join_lat, aim_lon=g.join_lon,
+            gear_down=False, flap_ratio=0.0,
+            # Bank ≤ ~31° during intercept turn (observed 60° in flight
+            # 135940 caused 2g at cruise speed). Pitch ≤ ~14° nose-up cap.
+            roll_limit=0.35, pitch_limit=0.15,
+            trigger=Trigger("near_point", value=1.0,
+                           lat=g.join_lat, lon=g.join_lon),
+        ),
+
+        # ── 6. INBOUND ───────────────────────────────────────────────
+        # On the extended centerline.  Still Vcruise + cruise alt; this
+        # is the gentle roll-out of the intercept turn toward decel_start.
+        Keyframe(
+            name="INBOUND", phase="CRUISE",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_cruise,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="aim_at",
+            aim_lat=g.decel_start_lat, aim_lon=g.decel_start_lon,
+            gear_down=False, flap_ratio=0.0,
+            roll_limit=0.25, pitch_limit=0.15,  # gentle roll-out, level flight
+            trigger=Trigger("near_point", value=0.3,
+                           lat=g.decel_start_lat, lon=g.decel_start_lon),
+        ),
+
+        # ── 7. DECELERATE ────────────────────────────────────────────
+        # Level flight at cruise altitude, clean config, IDLE power.
+        # Trigger is speed-only — we MUST hit flap_safe before
+        # descending. Flight 20260419_145404 released DECELERATE at 132
+        # kts via a near_point fallback; DESCENT then converted PE→KE
+        # faster than clean-config drag could bleed, speed climbed to
+        # 168 kts and the jet hit terrain. Decel zone was bumped to
+        # min 5 nm (was 3) to give ~110 s of idle-coast from Vcruise
+        # (170) to flap_safe (115) at ~0.5 kt/sec.
+        #
+        # Flight 20260419 showed speed_pid getting stuck: as error
+        # closed toward 0, the PID eased throttle back toward 0.17–0.20,
+        # finding equilibrium with drag at ~133 kts. The plane stopped
+        # decelerating 18 kts short of target. `idle` forces thrust
+        # fully off for the entire phase — target_speed_kts is kept
+        # for the trigger and telemetry display but throttle is flat
+        # zero until we bleed through 115.
+        Keyframe(
+            name="DECELERATE", phase="CRUISE",
+            throttle_mode="idle",
+            target_speed_kts=g.flap_safe_kts,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="aim_at",
+            aim_lat=g.descent_start_lat, aim_lon=g.descent_start_lon,
+            gear_down=False, flap_ratio=0.0,
+            roll_limit=0.25, pitch_limit=0.15,
+            trigger=Trigger("speed_lte", value=g.flap_safe_kts),
+        ),
+
+        # ── 8. DESCENT ───────────────────────────────────────────────
+        # Idle-coast descent: we're too fast and too high entering this
+        # phase — a fixed-thrust setting (previously 0.30) plus a
+        # glideslope pitch loop feeds gravitational PE into airspeed
+        # whenever the jet drops below the slope. Idle throttle + a
+        # pitch-down cap prevents the pitch loop from staging a
+        # catch-up dive that shreds the flap envelope (flight
+        # 20260419_142509: pitch -0.53, 167 kts with flaps deployed).
+        # No flaps yet — advance when speed bleeds below flap_safe AND
+        # we're below 2000 ft AGL.
+        Keyframe(
+            name="DESCENT", phase="DESCENT",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.flap_safe_kts,  # hold ~115 kts during clean descent
+            alt_mode="glideslope",
+            heading_mode="aim_at",
+            aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
+            pitch_limit=0.15,
+            # pitch_down_limit 0.40 (~23° stick) so plane can actually
+            # descend when behind the glideslope. Previous 0.15 (~8.6°)
+            # was too restrictive: flight 20260419_173924 arrived at
+            # threshold 1700ft HIGH because pitch was pegged at -0.15
+            # but only produced +3° nose-up (thrust + trim overpowering
+            # the gentle stick). Speed PID now (kp=0.05) will slam
+            # throttle to idle on any overspeed, so PE→KE conversion
+            # during a steeper dive won't shred the flap envelope.
+            pitch_down_limit=0.40,
+            gear_down=False, flap_ratio=0.0,
+            # Flaps only deploy when BOTH: speed below Vfe AND we're
+            # low enough (2000ft AGL). Using `any` let flaps out at 170
+            # kts in flight 135940; `all` prevents that structural
+            # violation.
+            trigger=Trigger(
+                "all",
+                subs=(
+                    Trigger("speed_lte", value=g.flap_safe_kts),
+                    Trigger("agl_lte", value=2000.0),
+                ),
+            ),
+        ),
+
+        # ── 9. DESCENT_FLAP ──────────────────────────────────────────
+        # Half flaps deployed (more drag, less thrust needed).  Idle
+        # throttle + pitch cap here for the same reason as DESCENT:
+        # holding 0.25 thrust while glideslope pitch pointed the nose
+        # down let the jet accelerate from 115 → 167 kts with flaps
+        # extended (flight 20260419_142509). Advance when speed bleeds
+        # below gear_safe AND we're at 1200 ft AGL, OR 800 AGL reached.
+        Keyframe(
+            name="DESCENT_FLAP", phase="DESCENT",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.gear_safe_kts,  # bleed from ~115 to ~100 kts
+            alt_mode="glideslope",
+            heading_mode="aim_at",
+            aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
+            pitch_limit=0.15,
+            pitch_down_limit=0.40,
+            gear_down=False, flap_ratio=0.5,
+            # Gear drop logic:
+            #   (A) Normal: speed ≤ Vlo AND ≤ 1200 AGL  — clean config
+            #       change while still high enough to stabilise.
+            #   (B) Safety floor: ≤ 800 AGL regardless of speed.
+            # Flight 20260419_180202 spent the entire descent in this
+            # keyframe: glideslope PE→KE held speed at 111 kts (above
+            # gear_safe 100) with throttle already at idle (0.06). Gear
+            # never came down, plane touched down wheels-up. The AGL
+            # floor guarantees gear by short final even if speed won't
+            # bleed. At 111 kts we're far below Vlo (~170 kts for SF50)
+            # so structural concern that motivated the `all` gate
+            # doesn't apply here. Flight 135940's 166-kt gear drop is
+            # still prevented because we don't reach 800 AGL with 166
+            # kts on the glideslope.
+            trigger=Trigger(
+                "any",
+                subs=(
+                    Trigger(
+                        "all",
+                        subs=(
+                            Trigger("speed_lte", value=g.gear_safe_kts),
+                            Trigger("agl_lte", value=1200.0),
+                        ),
+                    ),
+                    Trigger("agl_lte", value=800.0),
+                ),
+            ),
+        ),
+
+        # ── 10. DESCENT_GEAR ─────────────────────────────────────────
+        # Gear down (even more drag).  Idle throttle — gear+flap drag is
+        # plenty to stabilise speed on a 3° slope; fixed thrust here
+        # had the same catch-up-dive failure mode as DESCENT_FLAP.
+        # Advance at 500 ft AGL → APPROACH.
+        Keyframe(
+            name="DESCENT_GEAR", phase="DESCENT",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_approach,  # stabilise at ~83 kts before flare
+            alt_mode="glideslope",
+            heading_mode="aim_at",
+            aim_lat=g.flare_start_lat, aim_lon=g.flare_start_lon,
+            pitch_limit=0.15,
+            pitch_down_limit=0.40,
+            gear_down=True, flap_ratio=0.5,
+            trigger=Trigger("agl_lte", value=500.0),
+        ),
+
+        # ── 11. APPROACH ─────────────────────────────────────────────
+        # Full flaps + gear down on the glideslope.  Previously idle-only
+        # throttle here: when the prior descent phase delivered us below
+        # V_approach (flight 20260419_143638 arrived at APPROACH at 79 kts
+        # and bled to 60 kts with pitch saturated +1.0 — imminent stall),
+        # idle meant no thrust to defend minimum speed.  Now speed_pid
+        # with V_approach target so throttle adds thrust below ~83 kts.
+        # Aim at the touchdown point so the ribbon corridor stays tight.
+        # Advance at 30 ft AGL → FLARE.
+        Keyframe(
+            name="APPROACH", phase="APPROACH",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_approach,
+            alt_mode="glideslope",
+            heading_mode="aim_at",
+            aim_lat=g.touchdown_lat, aim_lon=g.touchdown_lon,
+            pitch_limit=0.15,
+            # APPROACH stays tighter than outer DESCENT keyframes (0.20)
+            # because we're short final: a big dive here would smash the
+            # gear. Still relaxed from 0.15 so we can catch a
+            # behind-schedule glideslope without the previous failure mode.
+            pitch_down_limit=0.20,
+            gear_down=True, flap_ratio=1.0,
+            trigger=Trigger("agl_lte", value=_FLARE_ALT_AGL_FT),
+        ),
+
+        # ── 12. FLARE ────────────────────────────────────────────────
+        # Throttle idle, bleed to V_land.  Advance when wheels on ground
+        # (agl < 3 ft) → ROLLOUT.
+        Keyframe(
+            name="FLARE", phase="FLARE",
+            throttle_mode="idle",
+            target_speed_kts=g.v_land,
+            alt_mode="glideslope",
+            heading_mode="dest_runway",
+            gear_down=True, flap_ratio=1.0,
+            trigger=Trigger("agl_lte", value=3.0),
+        ),
+
+        # ── 13. ROLLOUT ──────────────────────────────────────────────
+        # Full brakes, wings level (tight roll limit), heading hold on
+        # dest runway.  Advance when decelerated to taxi speed.
+        Keyframe(
+            name="ROLLOUT", phase="ROLLOUT",
+            throttle_mode="idle",
+            alt_mode="hold",
+            heading_mode="dest_runway",
+            gear_down=True, flap_ratio=1.0, brake_ratio=1.0,
+            roll_limit=0.02,
+            trigger=Trigger("speed_lte", value=5.0),
+        ),
+
+        # ── 14. STOP (terminal) ──────────────────────────────────────
+        Keyframe(
+            name="STOP", phase="ROLLOUT",
+            throttle_mode="idle",
+            alt_mode="hold",
+            heading_mode="dest_runway",
+            gear_down=True, flap_ratio=1.0, brake_ratio=1.0,
+            roll_limit=0.02,
+            trigger=Trigger("never"),
+        ),
+    ]
+
+
+# ═══ Map preview (sparse points for app display) ═══════════════════════
+
+def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
+    """Emit a sparse (~25 point) path for app map display."""
+    pts: List[PathPoint] = []
+    back_hdg = (g.rwy_heading + 180.0) % 360.0
+
+    # Takeoff roll: 2 points along the DEPARTURE runway heading (g.dep_heading),
+    # not the destination runway heading (g.rwy_heading). Previously both points
+    # used g.rwy_heading, which meant a KRPD→KUBE flight (dep rwy 010°, dest
+    # rwy 270°) laid the takeoff roll 1500ft WEST of the KRPD threshold instead
+    # of NNE up the runway — the ribbon appeared "beside" the plane rather than
+    # underneath it. The rest of the ribbon (descent/approach/flare) still uses
+    # g.rwy_heading because those points are back-solved from the destination
+    # runway threshold along back_hdg — that's correct.
+    pts.append(PathPoint(g.dep_lat, g.dep_lon, g.dep_alt_ft, 0.0,
+                         g.dep_heading, "GROUND", True, 0.5, 1.0))
+    roll_lat, roll_lon = _dest_pt(g.dep_lat, g.dep_lon, g.dep_heading,
+                                   1500.0 * 0.3048)
+    pts.append(PathPoint(roll_lat, roll_lon, g.dep_alt_ft, g.v_rotate,
+                         g.dep_heading, "GROUND", True, 0.5, 1.0))
+
+    # Climb+cruise: 5 points interpolated from takeoff end → join_point
+    # (where we meet the extended centerline at the 30° intercept).
+    climb_start_lat, climb_start_lon = roll_lat, roll_lon
+    for t in [0.1, 0.3, 0.5, 0.8, 1.0]:
+        lat = _interp(climb_start_lat, g.join_lat, t)
+        lon = _interp(climb_start_lon, g.join_lon, t)
+        alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
+        hdg = bearing_deg(lat, lon, g.join_lat, g.join_lon)
+        gear = t < 0.05
+        flap = 0.5 if t < 0.2 else 0.0
+        pts.append(PathPoint(lat, lon, alt, g.v_rotate * 1.3, hdg,
+                             "CLIMB" if t < 0.95 else "CRUISE", gear, flap, 0.95))
+
+    # Inbound: straight leg from join_point → decel_start along centerline
+    pts.append(PathPoint(g.decel_start_lat, g.decel_start_lon, g.cruise_alt_ft,
+                         g.v_approach * 1.6, g.rwy_heading, "CRUISE",
+                         False, 0.0, 0.0))
+
+    # Descent leg: 4 points from descent_start → approach_start
+    for t in [0.25, 0.50, 0.75, 1.0]:
+        lat = _interp(g.descent_start_lat, g.approach_start_lat, t)
+        lon = _interp(g.descent_start_lon, g.approach_start_lon, t)
+        alt = _interp(g.cruise_alt_ft, g.approach_start_alt_ft, t)
+        flap = 0.5 if t > 0.4 else 0.0
+        gear = t > 0.8
+        pts.append(PathPoint(lat, lon, alt, g.v_approach * 1.2, g.rwy_heading,
+                             "DESCENT", gear, flap, 0.40))
+
+    # Approach: 3 points from approach_start → flare_start
+    for t in [0.33, 0.66, 1.0]:
+        lat = _interp(g.approach_start_lat, g.flare_start_lat, t)
+        lon = _interp(g.approach_start_lon, g.flare_start_lon, t)
+        alt = _interp(g.approach_start_alt_ft, g.thr_alt_ft + _FLARE_ALT_AGL_FT, t)
+        pts.append(PathPoint(lat, lon, alt, g.v_approach, g.rwy_heading,
+                             "APPROACH", True, 1.0, None))
+
+    # Flare: 1 point at touchdown
+    pts.append(PathPoint(g.touchdown_lat, g.touchdown_lon,
+                         g.thr_alt_ft + 2.0, g.v_land, g.rwy_heading,
+                         "FLARE", True, 1.0, 0.0))
+
+    # Rollout: 1 point 2000 ft past touchdown
+    ro_lat, ro_lon = _dest_pt(g.touchdown_lat, g.touchdown_lon,
+                               g.rwy_heading, 2000.0 * 0.3048)
+    pts.append(PathPoint(ro_lat, ro_lon, g.thr_alt_ft, 0.0,
+                         g.rwy_heading, "ROLLOUT", True, 1.0, 0.0))
+
+    # Cumulative distances
+    pts[0].dist_from_start_nm = 0.0
+    for i in range(1, len(pts)):
+        d = haversine_m(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon) / 1852.0
+        pts[i].dist_from_start_nm = pts[i-1].dist_from_start_nm + d
+
+    return pts
+
+
+# ═══ Public entry point ════════════════════════════════════════════════
 
 def plan_path(
     *,
@@ -136,323 +838,90 @@ def plan_path(
     dest_lat: float,
     dest_lon: float,
     dest_alt_ft: float,
-    dest_rwy_heading: float | None = None,
-    dest_threshold_lat: float | None = None,
-    dest_threshold_lon: float | None = None,
-    dest_rwy_length_ft: float = 6000.0,
+    dest_rwy_heading: Optional[float] = None,
+    dest_threshold_lat: Optional[float] = None,
+    dest_threshold_lon: Optional[float] = None,
+    dest_rwy_length_ft: float = 6000.0,  # unused, kept for API compat
     cruise_alt_ft: float,
-    v_rotate: float = 90.0,
-    v_climb: float = 160.0,
-    v_cruise: float = 200.0,
-    v_approach: float = 83.0,
-    v_land: float = 77.0,
-    climb_fpm: float = 1600.0,
-    takeoff_roll_ft: float = 2000.0,
-) -> RibbonPath:
-    """Build the full ribbon FORWARD from departure to arrival.
+    v_stall: float = _VS_DEFAULT,
+    # Legacy kwargs — accepted and ignored for API compat
+    **_legacy,
+) -> Ribbon:
+    """Build a keyframe ribbon from `dep` to `dest`.
 
-    Key principles:
-      - Cruise is straight — no turns. Turns happen only in CLIMB.
-      - Short flights skip cruise entirely.
-      - Descent uses constant V/S — the plane decelerates and descends simultaneously.
-      - Landing segments are pinned to the actual runway threshold.
+    Only one speed knob: `v_stall`.  All other speeds (rotate/approach/
+    land, gear/flap-safe) are fixed ratios of Vs.  Cruise throttle is
+    altitude-scaled.  No v_rotate/v_climb/v_cruise/v_approach/v_land/
+    climb_fpm/takeoff_roll_ft configuration — ribbon decides everything.
     """
-    pts: list[PathPoint] = []
-    cumul_nm = 0.0
-
-    # Resolve destination runway
-    thr_lat = dest_threshold_lat if dest_threshold_lat is not None else dest_lat
-    thr_lon = dest_threshold_lon if dest_threshold_lon is not None else dest_lon
-    approach_hdg = dest_rwy_heading if dest_rwy_heading is not None else bearing_deg(
-        dep_lat, dep_lon, dest_lat, dest_lon,
+    _ = dest_rwy_length_ft  # unused
+    geometry = _solve_geometry(
+        dep_lat=dep_lat, dep_lon=dep_lon,
+        dep_alt_ft=dep_alt_ft, dep_heading=dep_heading,
+        dest_lat=dest_lat, dest_lon=dest_lon,
+        dest_alt_ft=dest_alt_ft,
+        dest_rwy_heading=dest_rwy_heading,
+        dest_threshold_lat=dest_threshold_lat,
+        dest_threshold_lon=dest_threshold_lon,
+        cruise_alt_ft=cruise_alt_ft,
+        v_stall=v_stall,
     )
-    back_hdg = (approach_hdg + 180.0) % 360.0
-
-    # ── Landing geometry, computed from touchdown point BACKWARD ────
-    # Everything downwind of the threshold lives on the extended runway
-    # centerline so climb → cruise → descent → approach → flare is ONE
-    # straight line from somewhere over the field back to the touchdown.
-    touchdown_dist_ft = 1000.0
-    td_lat, td_lon = _dest_pt(thr_lat, thr_lon, approach_hdg,
-                               touchdown_dist_ft * 0.3048)
-
-    approach_alt = dest_alt_ft + 600.0         # approach starts 600ft above rwy
-    flare_alt = dest_alt_ft + 30.0
-
-    approach_descent_ft = approach_alt - flare_alt
-    approach_dist_nm = approach_descent_ft / _GLIDE_FT_PER_NM
-    approach_nm = max(0.5, approach_dist_nm)
-
-    # Approach start: back along runway axis from touchdown by approach_dist_nm
-    approach_start_lat, approach_start_lon = _dest_pt(
-        td_lat, td_lon, back_hdg, approach_dist_nm * 1852.0,
-    )
-
-    # Descent length: glideslope + decel
-    alt_to_descend = cruise_alt_ft - approach_alt
-    descent_nm = alt_to_descend / _GLIDE_FT_PER_NM if alt_to_descend > 0 else 0.0
-    decel_nm = max(1.0, (v_cruise - v_approach) / 40.0)
-    total_descent_nm = descent_nm + decel_nm
-
-    # Descent start: further back along runway axis, at cruise altitude.
-    # This is the point cruise targets — when we arrive here the plane is
-    # already on the extended centerline, lined up with the runway.
-    descent_start_lat, descent_start_lon = _dest_pt(
-        approach_start_lat, approach_start_lon,
-        back_hdg, total_descent_nm * 1852.0,
-    )
-
-    total_dist_nm = haversine_m(dep_lat, dep_lon, thr_lat, thr_lon) / 1852.0
-
-    # How far does climb take?
-    time_per_step_s = _STEP_M / (v_climb * 0.5144)
-    alt_per_step = (climb_fpm / 60.0) * time_per_step_s
-    climb_steps = max(1, int((cruise_alt_ft - dep_alt_ft) / max(alt_per_step, 0.1)))
-    climb_nm = climb_steps * _STEP_NM
-
-    # Is there room for cruise?
-    dep_to_descent_start_nm = haversine_m(
-        dep_lat, dep_lon, descent_start_lat, descent_start_lon,
-    ) / 1852.0
-    cruise_available_nm = dep_to_descent_start_nm - climb_nm
-    has_cruise = cruise_available_nm > 0.5
-
-    # ── 1. GROUND (takeoff roll) ────────────────────────────────────
-    # Full throttle, half flaps for lift, gear down, hold heading
-    lat, lon = dep_lat, dep_lon
-    roll_nm = takeoff_roll_ft / 6076.0
-    n_roll = max(1, int(roll_nm / _STEP_NM))
-    for i in range(n_roll):
-        t = i / max(n_roll - 1, 1)
-        spd = _lerp(0.0, v_rotate, t)
-        pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=dep_alt_ft, speed_kts=spd,
-            heading_deg=dep_heading, phase="GROUND",
-            gear_down=True, flap_ratio=0.5, throttle=1.0,  # full power takeoff
-            dist_from_start_nm=cumul_nm,
-        ))
-        lat, lon = _dest_pt(lat, lon, dep_heading, _STEP_M)
-        cumul_nm += _STEP_NM
-
-    # ── 2. CLIMB — aim at descent_start on extended centerline ──────
-    alt = dep_alt_ft
-    hdg = dep_heading
-    turn_rate = 3.0
-
-    while alt < cruise_alt_ft:
-        agl = alt - dep_alt_ft
-        if agl > 600.0:
-            target_hdg = bearing_deg(lat, lon, descent_start_lat, descent_start_lon)
-            err = _wrap180(target_hdg - hdg)
-            advance = max(-turn_rate, min(turn_rate, err))
-            hdg = (hdg + advance) % 360.0
-
-        gear = agl < 50.0
-        flap = 0.5 if agl < 300.0 else 0.0
-
-        pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=alt, speed_kts=v_climb,
-            heading_deg=hdg, phase="CLIMB",
-            gear_down=gear, flap_ratio=flap, throttle=0.95,  # climb power
-            dist_from_start_nm=cumul_nm,
-        ))
-        lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
-        cumul_nm += _STEP_NM
-        alt = min(alt + alt_per_step, cruise_alt_ft)
-        if len(pts) > 5000:
-            break
-
-    # Complete the turn at cruise altitude, still aiming at descent_start
-    for _ in range(500):
-        target_hdg = bearing_deg(lat, lon, descent_start_lat, descent_start_lon)
-        if abs(_wrap180(target_hdg - hdg)) < 2.0:
-            break
-        err = _wrap180(target_hdg - hdg)
-        advance = max(-2.0, min(2.0, err))
-        hdg = (hdg + advance) % 360.0
-        pts.append(PathPoint(
-            lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=v_climb,
-            heading_deg=hdg, phase="CLIMB",
-            gear_down=False, flap_ratio=0.0, throttle=0.85,
-            dist_from_start_nm=cumul_nm,
-        ))
-        lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
-        cumul_nm += _STEP_NM
-        if len(pts) > 5000:
-            break
-
-    # ── 3. CRUISE — straight line to descent_start ──────────────────
-    # descent_start is on the extended runway centerline, so when cruise
-    # ends the plane is lined up with the runway. No heading blend needed.
-    if has_cruise:
-        dist_to_descent_start_nm = haversine_m(
-            lat, lon, descent_start_lat, descent_start_lon,
-        ) / 1852.0
-        n_cruise = max(1, int(dist_to_descent_start_nm / _STEP_NM))
-        for i in range(n_cruise):
-            hdg = bearing_deg(lat, lon, descent_start_lat, descent_start_lon)
-            t_accel = min(1.0, (i * _STEP_NM) / 2.0)
-            spd = _lerp(v_climb, v_cruise, t_accel)
-            pts.append(PathPoint(
-                lat=lat, lon=lon, alt_ft=cruise_alt_ft, speed_kts=spd,
-                heading_deg=hdg, phase="CRUISE",
-                gear_down=False, flap_ratio=0.0, throttle=None,  # PID manages
-                dist_from_start_nm=cumul_nm,
-            ))
-            lat, lon = _dest_pt(lat, lon, hdg, _STEP_M)
-            cumul_nm += _STEP_NM
-            if len(pts) > 20000:
-                break
-
-    # ══════════════════════════════════════════════════════════════════
-    # LANDING SEGMENTS — pinned to the extended runway centerline
-    #   DESCENT : descent_start   → approach_start   (cruise_alt → approach_alt)
-    #   APPROACH: approach_start  → flare_alt        (3° glideslope)
-    #   FLARE   : last 30ft       → touchdown point
-    #   ROLLOUT : touchdown point → brake to stop
-    # All four legs are colinear with the runway, so the plane just flies
-    # straight down one line. No curves, no blends.
-    # ══════════════════════════════════════════════════════════════════
-
-    n_approach = max(1, int(approach_dist_nm / _STEP_NM))
-
-    # ── 4. DESCENT — straight line on runway heading ────────────────
-    # Starts at descent_start, ends at approach_start. The plane steps
-    # forward from its actual current position (end of cruise) toward
-    # descent_start for the first few ticks if cruise didn't quite reach,
-    # then descends along the axis.
-    descent_start_alt = cruise_alt_ft if has_cruise else alt
-    descent_start_spd = v_cruise if has_cruise else v_climb
-
-    # Use the pre-computed descent_start as the anchor; step forward on
-    # runway heading from there. This guarantees descent aligns exactly
-    # with the approach axis.
-    dlat, dlon = descent_start_lat, descent_start_lon
-    n_descent = max(1, int(total_descent_nm / _STEP_NM))
-
-    for i in range(n_descent):
-        t = (i + 1) / n_descent
-        alt_here = _lerp(descent_start_alt, approach_alt, t)
-        # Speed: hold cruise for first 40%, decelerate in last 60%
-        if t < 0.4:
-            spd = descent_start_spd
-            flap = 0.0
-        else:
-            decel_t = (t - 0.4) / 0.6
-            spd = _lerp(descent_start_spd, v_approach, decel_t)
-            flap = 0.5
-        gear = spd < (v_approach + 30.0)
-
-        pts.append(PathPoint(
-            lat=dlat, lon=dlon, alt_ft=alt_here, speed_kts=spd,
-            heading_deg=approach_hdg, phase="DESCENT",
-            gear_down=gear, flap_ratio=flap, throttle=None,
-            dist_from_start_nm=cumul_nm,
-        ))
-        dlat, dlon = _dest_pt(dlat, dlon, approach_hdg, _STEP_M)
-        cumul_nm += _STEP_NM
-        if len(pts) > 25000:
-            break
-
-    # ── 5. APPROACH — straight 3° glideslope to flare point ──────────
-    # Every point is on the runway heading, descending toward td_lat/td_lon
-    alat, alon = approach_start_lat, approach_start_lon
-    for i in range(n_approach):
-        t = (i + 1) / n_approach
-        alt_here = _lerp(approach_alt, flare_alt, t)
-        # Speed: hold v_approach, decelerate slightly in last 20%
-        if t > 0.8:
-            spd = _lerp(v_approach, v_approach - 5.0, (t - 0.8) / 0.2)
-        else:
-            spd = v_approach
-        flap = 1.0 if t > 0.5 else 0.5
-
-        pts.append(PathPoint(
-            lat=alat, lon=alon, alt_ft=alt_here, speed_kts=spd,
-            heading_deg=approach_hdg, phase="APPROACH",
-            gear_down=True, flap_ratio=flap, throttle=None,
-            dist_from_start_nm=cumul_nm,
-        ))
-        alat, alon = _dest_pt(alat, alon, approach_hdg, _STEP_M)
-        cumul_nm += _STEP_NM
-
-    # ── 6. FLARE — last 30ft, reducing V/S for gentle touchdown ──────
-    # From flare_alt (30ft AGL) to dest_alt+2ft (wheels on ground)
-    # Speed: v_approach-5 → v_land
-    # The LAST flare point is AT the touchdown coordinates
-    flare_dist_nm = 0.2  # ~370m flare
-    n_flare = max(3, int(flare_dist_nm / _STEP_NM))
-    for i in range(n_flare):
-        t = (i + 1) / n_flare
-        alt_here = _lerp(flare_alt, dest_alt_ft + 2.0, t)
-        spd = _lerp(v_approach - 5.0, v_land, t)
-        pts.append(PathPoint(
-            lat=alat, lon=alon, alt_ft=alt_here, speed_kts=spd,
-            heading_deg=approach_hdg, phase="FLARE",
-            gear_down=True, flap_ratio=1.0, throttle=None,
-            dist_from_start_nm=cumul_nm,
-        ))
-        alat, alon = _dest_pt(alat, alon, approach_hdg, _STEP_M)
-        cumul_nm += _STEP_NM
-
-    # ── 7. ROLLOUT — on the ground at touchdown point, braking ───────
-    # Starts at touchdown coordinates, decelerates to 0
-    rollout_ft = 2000.0
-    n_rollout = max(3, int((rollout_ft / 6076.0) / _STEP_NM))
-    for i in range(n_rollout):
-        t = (i + 1) / n_rollout
-        spd = _lerp(v_land, 0.0, t)
-        pts.append(PathPoint(
-            lat=alat, lon=alon, alt_ft=dest_alt_ft, speed_kts=spd,
-            heading_deg=approach_hdg, phase="ROLLOUT",
-            gear_down=True, flap_ratio=1.0, throttle=None,
-            dist_from_start_nm=cumul_nm,
-        ))
-        alat, alon = _dest_pt(alat, alon, approach_hdg, _STEP_M)
-        cumul_nm += _STEP_NM
-
-    # Recompute cumulative distances from actual point-to-point positions
-    _recompute_distances(pts)
-
-    return RibbonPath(pts)
+    keyframes = _build_keyframes(geometry)
+    preview = _build_preview(geometry, keyframes)
+    return Ribbon(keyframes=keyframes, geometry=geometry, points=preview)
 
 
-def _recompute_distances(points: list[PathPoint]) -> None:
-    """Set dist_from_start_nm based on actual point-to-point distance."""
-    if not points:
-        return
-    points[0].dist_from_start_nm = 0.0
-    for i in range(1, len(points)):
-        d_m = haversine_m(points[i - 1].lat, points[i - 1].lon,
-                          points[i].lat, points[i].lon)
-        points[i].dist_from_start_nm = points[i - 1].dist_from_start_nm + d_m / 1852.0
+# ═══ Pretty-print ══════════════════════════════════════════════════════
 
+def format_ribbon(ribbon: Ribbon) -> str:
+    g = ribbon.geometry
+    lines = [
+        f"[RIBBON] {len(ribbon.keyframes)} keyframes · Vs={g.v_stall:.0f}kts",
+        f"  Speeds:  Vr={g.v_rotate:.0f}  Vcru={g.v_cruise:.0f}  "
+        f"Vapp={g.v_approach:.0f}  Vland={g.v_land:.0f}  "
+        f"gear≤{g.gear_safe_kts:.0f}  flap≤{g.flap_safe_kts:.0f}",
+        f"  Cruise:  {g.cruise_alt_ft:.0f}ft MSL  "
+        f"Rwy hdg {g.rwy_heading:.0f}°  Thr alt {g.thr_alt_ft:.0f}ft",
+    ]
+    for i, kf in enumerate(ribbon.keyframes, 1):
+        # Describe command
+        cmd_parts = []
+        if kf.throttle_mode == "explicit" and kf.throttle is not None:
+            cmd_parts.append(f"thr={kf.throttle:.2f}")
+        elif kf.throttle_mode == "alt_scaled":
+            cmd_parts.append("thr=alt_scaled")
+        elif kf.throttle_mode == "idle":
+            cmd_parts.append("thr=idle")
+        elif kf.throttle_mode == "speed_pid":
+            cmd_parts.append("thr=PID")
+        if kf.target_speed_kts is not None:
+            cmd_parts.append(f"spd={kf.target_speed_kts:.0f}")
+        if kf.alt_mode == "target" and kf.target_alt_ft is not None:
+            cmd_parts.append(f"alt={kf.target_alt_ft:.0f}")
+        elif kf.alt_mode == "glideslope":
+            cmd_parts.append("alt=glide")
+        elif kf.alt_mode == "hold":
+            cmd_parts.append("alt=hold")
+        if kf.heading_mode == "dep_runway":
+            cmd_parts.append("hdg=dep-rwy")
+        elif kf.heading_mode == "dest_runway":
+            cmd_parts.append("hdg=dest-rwy")
+        elif kf.heading_mode == "aim_at":
+            cmd_parts.append(f"hdg→({kf.aim_lat:.3f},{kf.aim_lon:.3f})")
+        elif kf.heading_mode == "fixed" and kf.target_heading_deg is not None:
+            cmd_parts.append(f"hdg={kf.target_heading_deg:.0f}")
+        if kf.gear_down is not None:
+            cmd_parts.append("gear↓" if kf.gear_down else "gear↑")
+        if kf.flap_ratio is not None:
+            cmd_parts.append(f"flap={kf.flap_ratio:.1f}")
+        if kf.brake_ratio is not None and kf.brake_ratio > 0:
+            cmd_parts.append(f"brake={kf.brake_ratio:.1f}")
+        cmd = " ".join(cmd_parts)
 
-# ─── Formatting ───────────────────────────────────────────────────────
-
-def format_ribbon(ribbon: RibbonPath) -> str:
-    """Pretty-print a ribbon summary for the log."""
-    if not ribbon.points:
-        return "[RIBBON] (empty)"
-
-    lines = [f"[RIBBON] {len(ribbon.points)} points, "
-             f"{ribbon.points[-1].dist_from_start_nm:.1f} nm total"]
-
-    prev_phase = ""
-    for i, p in enumerate(ribbon.points):
-        if p.phase != prev_phase:
-            lines.append(
-                f"  {p.phase:>10s}  @{p.dist_from_start_nm:6.1f}nm  "
-                f"alt={p.alt_ft:7.0f}ft  spd={p.speed_kts:5.0f}kts  "
-                f"hdg={p.heading_deg:5.1f}°  "
-                f"gear={'DN' if p.gear_down else 'UP'}  flap={p.flap_ratio:.1f}"
-            )
-            prev_phase = p.phase
-
-    p = ribbon.points[-1]
-    lines.append(
-        f"       END  @{p.dist_from_start_nm:6.1f}nm  "
-        f"({p.lat:.6f}, {p.lon:.6f})  "
-        f"alt={p.alt_ft:7.0f}ft  spd={p.speed_kts:5.0f}kts"
-    )
+        lines.append(
+            f"  {i:2d}. {kf.name:<14} [{kf.phase:>8}]  {cmd}"
+        )
+        lines.append(
+            f"        advance: {kf.trigger.describe()}"
+        )
     return "\n".join(lines)

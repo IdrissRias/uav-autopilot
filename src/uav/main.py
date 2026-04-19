@@ -12,10 +12,9 @@ from importlib import resources
 
 from uav.core.autopilot import Autopilot
 from uav.core.control.pid import PID
-from uav.core.control.fixedwing_controller import FixedWingController
-from uav.core.control.simple_fixedwing import derive_gains
-from uav.core.guidance.fixedwing_guidance import FixedWingGuidance
-from uav.core.reactive_director import ReactiveFlightDirector
+from uav.core.control.simple_fixedwing import SimpleFixedWingController, derive_gains
+from uav.core.guidance import PassthroughGuidance
+from uav.core.flight_engine import FlightEngine
 from uav.core.safety.limits import SafetyLimits, abort_actuators
 from uav.logging.recorder import Recorder
 from uav.sim.xplane_udp import XPlaneUDP
@@ -101,40 +100,6 @@ def main() -> None:
         default=True,
         help="Wait for 'fly' command from app before starting takeoff",
     )
-    parser.add_argument(
-        "--train",
-        action="store_true",
-        default=False,
-        help="Enter interactive training mode — you fly, the AI learns from you",
-    )
-    parser.add_argument(
-        "--train-skip-to",
-        type=str,
-        default=None,
-        help="Skip to a specific skill in training mode (takeoff/climb/turn/cruise/descend/land)",
-    )
-    parser.add_argument(
-        "--train-chain",
-        action="store_true",
-        default=False,
-        help="Skip training, run full AI chain flight with existing models",
-    )
-    parser.add_argument(
-        "--director",
-        choices=["pid", "ribbon", "rl", "blended"],
-        default="ribbon",
-        help="Flight director: ribbon (default, V2 path follower), pid (V1 reactive), rl (full RL), blended (PID+RL per phase)",
-    )
-    parser.add_argument(
-        "--rl-model",
-        default=None,
-        help="Path to .npz RL model weights (required for --director rl or blended)",
-    )
-    parser.add_argument(
-        "--rl-phases",
-        default="APPROACH,LAND",
-        help="Comma-separated phases for RL in blended mode (default: APPROACH,LAND)",
-    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -196,25 +161,6 @@ def main() -> None:
         freq_hz=int(loop_rate_hz),
     )
 
-    # ── Training mode: bypass autopilot, run interactive skill trainer ──
-    if args.train or args.train_chain:
-        from uav.rl.xplane_rl_adapter import XPlaneRLAdapter
-        from uav.rl.skills.training_mode import TrainingSession
-
-        # Use RL adapter (separate RREF indices, no conflict)
-        train_adapter = XPlaneRLAdapter(
-            xplane_ip=ports["xplane_ip"],
-            xplane_port=int(ports["xplane_port"]),
-            local_port=0,  # auto-pick port
-            freq_hz=int(loop_rate_hz),
-        )
-        time.sleep(0.5)
-
-        print("[PEREGRINE] Entering training mode...")
-        session = TrainingSession(adapter=train_adapter, loop_hz=loop_rate_hz)
-        session.run(skip_to=args.train_skip_to, chain_only=args.train_chain)
-        return
-
     # ── PID controllers from envelope (database) or YAML fallback ──
     envelope = airframe.get("_envelope")
     if envelope and hasattr(envelope, "pid_heading"):
@@ -226,8 +172,27 @@ def main() -> None:
         # kp=0.001: 100ft error → 0.10 pitch — firm, responsive
         # ki=0.00008: moderate integral to eliminate persistent offset
         # kd=0.006: STRONG damping — prevents overshoot, smooths convergence
-        altitude_pid = PID(0.001, 0.00008, 0.006)
-        airspeed_pid = PID(pid_s.get("kp", 0.015), pid_s.get("ki", 0.0), pid_s.get("kd", 0.004))
+        # integral_limit=50000 ft·s: lets integrator actually accumulate
+        # on sustained errors (default 1.0 saturated in one tick at 200ft
+        # alt error, leaving ki contribution effectively zero).
+        altitude_pid = PID(0.001, 0.00008, 0.006, integral_limit=50000.0)
+        # Airspeed PID: kp=0.05 so a ±10kt error swings throttle by ±0.5 —
+        # enough to drive throttle to idle (from 0.55 cruise base) with a
+        # modest -10kt error, and to full thrust with a +10kt error.
+        # Previous kp=0.025 was too soft: plane -15kt below target AND
+        # throttle stuck at 0.24 (flight 20260419_173924, DESCENT keyframes),
+        # because the PID settled at equilibrium rather than winning against
+        # the cruise-throttle feedforward. The user's architectural
+        # expectation: throttle tracks target speed, going up or down to
+        # whatever it takes — NOT pinned at idle during descent, NOT
+        # settling mid-range when hot.
+        # Integral floor (0.002) eliminates steady-state speed offset.
+        airspeed_pid = PID(
+            max(pid_s.get("kp", 0.05), 0.05),
+            max(pid_s.get("ki", 0.002), 0.002),
+            pid_s.get("kd", 0.004),
+            integral_limit=20.0,  # lets integrator wind up for sustained error
+        )
         print(f"[PEREGRINE] PID gains loaded from database")
     else:
         safety_cfg = cfg.get("safety", {})
@@ -242,9 +207,10 @@ def main() -> None:
             float(safety_cfg.get("altitude_kd", 0.005)),
         )
         airspeed_pid = PID(
-            float(safety_cfg.get("airspeed_kp", 0.015)),
-            float(safety_cfg.get("airspeed_ki", 0.0)),
+            max(float(safety_cfg.get("airspeed_kp", 0.05)), 0.05),
+            max(float(safety_cfg.get("airspeed_ki", 0.002)), 0.002),
             float(safety_cfg.get("airspeed_kd", 0.004)),
+            integral_limit=20.0,
         )
         print(f"[PEREGRINE] PID gains from YAML fallback")
 
@@ -257,25 +223,16 @@ def main() -> None:
         print("[PEREGRINE] Using default control gains (uncalibrated)")
 
     throttle_cfg = airframe["throttle"]
-    controller = FixedWingController(
+    controller = SimpleFixedWingController(
         heading_pid=heading_pid,
         altitude_pid=altitude_pid,
         airspeed_pid=airspeed_pid,
         cruise_throttle=throttle_cfg["cruise"],
-        pitch_rate_limit_per_s=float(cfg.get("safety", {}).get("pitch_rate_limit_per_s", 0.6)),
         gains=control_gains,
     )
 
     safety_cfg = cfg.get("safety", {})
-    safety = SafetyLimits(
-        throttle_min=float(safety_cfg.get("throttle_min", 0.0)),
-        throttle_max=float(safety_cfg.get("throttle_max", 1.0)),
-        max_roll=airframe["limits"]["max_roll_cmd"],
-        max_pitch=airframe["limits"]["max_pitch_cmd"],
-        max_yaw=airframe["limits"]["max_yaw_cmd"],
-        brake_min=float(safety_cfg.get("brake_min", 0.0)),
-        brake_max=float(safety_cfg.get("brake_max", 1.0)),
-    )
+    safety = SafetyLimits()  # hardware-only clamps; no config knobs
 
     ctx = {
         "controller": cfg.get("safety", {}),
@@ -287,31 +244,11 @@ def main() -> None:
         "nav": cfg.get("nav", {}),
         "destination": None,
     }
-    # ── Select flight director ──
-    if args.director == "rl":
-        if not args.rl_model:
-            parser.error("--rl-model is required when --director=rl")
-        from uav.rl.rl_director import RLFlightDirector
-        mode_manager = RLFlightDirector(ctx=ctx, model_path=args.rl_model)
-        print(f"[PEREGRINE] Director: RL ({args.rl_model})")
-    elif args.director == "blended":
-        if not args.rl_model:
-            parser.error("--rl-model is required when --director=blended")
-        from uav.rl.blended_director import BlendedFlightDirector
-        rl_phases = set(args.rl_phases.split(","))
-        mode_manager = BlendedFlightDirector(
-            ctx=ctx, rl_model_path=args.rl_model, rl_phases=rl_phases,
-        )
-        print(f"[PEREGRINE] Director: Blended (RL phases: {rl_phases})")
-    elif args.director == "ribbon":
-        from uav.core.flight_engine import FlightEngine
-        mode_manager = FlightEngine(ctx=ctx)
-        print("[PEREGRINE] Director: Ribbon (V2 path follower)")
-    else:
-        mode_manager = ReactiveFlightDirector(ctx=ctx)
-        print("[PEREGRINE] Director: PID")
+    # ── Only one flight director: the ribbon ──
+    mode_manager = FlightEngine(ctx=ctx)
+    print("[PEREGRINE] Director: Ribbon")
 
-    guidance = FixedWingGuidance()
+    guidance = PassthroughGuidance()
     recorder = Recorder()
 
     # ── Look up aircraft ID from Supabase (for heartbeat publishing) ──
@@ -343,12 +280,6 @@ def main() -> None:
         wait_for_fly_command=args.wait_for_fly,
         aircraft_id=aircraft_id,
     )
-
-    # Wire up safety envelope for V2 (always active, protects all directors)
-    from uav.core.safety_envelope import enforce_envelope
-    autopilot._safety_envelope = enforce_envelope
-    autopilot._v_stall = float(airframe.get("speeds_kts", {}).get("v_stall", 77.0))
-    autopilot._v_ne = float(airframe.get("speeds_kts", {}).get("v_never_exceed", 250.0))
 
     _autopilot_ref[0] = autopilot  # wire up broadcast command handler
 

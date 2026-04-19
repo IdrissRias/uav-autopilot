@@ -1,3 +1,21 @@
+"""
+Dumb-soldier controller.
+
+Commander–soldier model: the ribbon gives orders, this controller executes
+them without second-guessing. Only hardware truths are enforced (±1 on
+surfaces, [0,1] on throttle/brakes). No phase logic. No rate limiters. No
+hardcoded pitch curves. No stall/overspeed protection. No altitude-dependent
+roll scheduling. If the ribbon says "bank 90°," we bank 90°.
+
+Control laws:
+  heading → bank → aileron (cascaded)
+  altitude → pitch (single PID)
+  speed    → throttle (single PID; bypassed if throttle is ribbon-commanded)
+
+Optional passthrough clamps from Targets: roll_limit, pitch_limit. These are
+commander-issued orders. The soldier honors them because the ribbon asked, not
+because it has policy of its own.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,59 +43,40 @@ def _clamp(value: float, limit: float) -> float:
     return value
 
 
-# ── Default cascaded heading control constants ──────────────────
-# These are used when the aircraft is uncalibrated (calibration_confidence < 0.3).
-# After calibration, gains are derived from measured control sensitivity.
-MAX_BANK_DEG = 70.0        # Full authority — phase roll_limit controls actual max per phase
-BANK_PER_HDG_ERROR = 1.5   # deg bank per deg heading error (1.5:1 — 10° off = 15° bank)
-BANK_INNER_KP = 0.020      # aileron per deg of bank error (inner loop P gain)
-BANK_INNER_KD = 0.010      # aileron per deg/s of bank rate (stronger damping)
+# Cascaded heading-loop defaults. Used when calibration is absent; gains may
+# be overridden via derive_gains() from a learned envelope.
+BANK_PER_HDG_ERROR = 1.5   # degrees bank commanded per degree heading error
+BANK_INNER_KP = 0.020      # aileron per degree of bank error
+BANK_INNER_KD = 0.010      # aileron damping per deg/s of bank rate
 
 
 @dataclass
 class ControlGains:
-    """Derived control gains — either from calibration or defaults."""
     bank_per_hdg_error: float = BANK_PER_HDG_ERROR
     bank_inner_kp: float = BANK_INNER_KP
     bank_inner_kd: float = BANK_INNER_KD
-    max_bank_deg: float = MAX_BANK_DEG
 
 
 def derive_gains(envelope) -> ControlGains:
-    """Convert measured control sensitivity into PID gains.
+    """Convert measured roll sensitivity into inner-loop gains.
 
-    Args:
-        envelope: AircraftEnvelope with pitch_sensitivity, roll_sensitivity, etc.
-
-    Returns:
-        ControlGains with calibration-derived values, or defaults if uncalibrated.
+    With no calibration (confidence < 0.3) we return defaults.
     """
     cal_conf = getattr(envelope, 'calibration_confidence', 0.0)
     if cal_conf < 0.3:
-        return ControlGains()  # use defaults
+        return ControlGains()
 
     roll_sens = getattr(envelope, 'roll_sensitivity', 0.0)
-
     if roll_sens < 1.0:
-        return ControlGains()  # sensitivity too low / unreliable
+        return ControlGains()
 
-    # Inner loop: we want ~5 deg/s roll correction per 10° bank error.
-    # bank_inner_kp = desired_rate / (roll_sensitivity * typical_error)
-    # With roll_sens = 15 deg/s/unit → kp = 5 / (15 * 10) = 0.033
-    # With roll_sens = 30 deg/s/unit → kp = 5 / (30 * 10) = 0.017
-    # Clamp to reasonable range [0.005, 0.06]
-    kp = _clamp(5.0 / (roll_sens * 10.0), 0.06)
-    kp = max(kp, 0.005)
-
-    # Damping scales inversely with sensitivity too
-    kd = _clamp(2.0 / roll_sens, 0.02)
-    kd = max(kd, 0.002)
-
+    # kp targets ~5 deg/s correction per 10° bank error
+    kp = max(0.005, min(0.06, 5.0 / (roll_sens * 10.0)))
+    kd = max(0.002, min(0.02, 2.0 / roll_sens))
     return ControlGains(
-        bank_per_hdg_error=BANK_PER_HDG_ERROR,  # outer loop is aircraft-independent
+        bank_per_hdg_error=BANK_PER_HDG_ERROR,
         bank_inner_kp=kp,
         bank_inner_kd=kd,
-        max_bank_deg=MAX_BANK_DEG,
     )
 
 
@@ -88,204 +87,82 @@ class SimpleFixedWingController(Controller):
         altitude_pid: PID,
         airspeed_pid: PID,
         cruise_throttle: float,
-        pitch_rate_limit_per_s: float = 2.0,   # smooth pitch transitions
-        roll_rate_limit_per_s: float = 1.0,   # faster roll response for ribbon tracking
         gains: ControlGains | None = None,
     ) -> None:
-        self.heading_pid = heading_pid  # kept for API compat but no longer drives roll
+        # heading_pid kept for API compat — inner loop is cascaded, not a PID
+        self.heading_pid = heading_pid
         self.altitude_pid = altitude_pid
         self.airspeed_pid = airspeed_pid
         self.cruise_throttle = cruise_throttle
-        self.pitch_rate_limit_per_s = pitch_rate_limit_per_s
-        self.roll_rate_limit_per_s = roll_rate_limit_per_s
         self.gains = gains or ControlGains()
-        self._prev_pitch_cmd = 0.0
-        self._prev_roll_cmd = 0.0
-        self._prev_bank_deg = 0.0   # for bank rate damping
-        self._prev_hdg_deg = None    # for heading rate damping (yaw) — None = first tick
-        # Vertical speed PID — closed-loop descent control.
-        # Input: VS error (target_vs - actual_vs) in fpm
-        # Output: ABSOLUTE pitch command (not cumulative adjustment)
-        # Kp=0.00004: 500fpm error → 0.02 pitch (very gentle)
-        # Ki=0.000005: very slow integral — just eliminates steady-state offset
-        # Kd=0.00006: strong damping to prevent overshoot/oscillation
-        self.vs_pid = PID(kp=0.00003, ki=0.000003, kd=0.00008, integral_limit=0.06)
+        self._prev_bank_deg = 0.0
+        self._prev_hdg_deg: float | None = None
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
         alt_error = targets.altitude_ft - telemetry.altitude_ft
         spd_error = targets.airspeed_kts - telemetry.airspeed_kts
 
-        # ── CASCADED HEADING → BANK → AILERON ──────────────────────
-        # Outer loop: heading error → desired bank angle
-        # Linear proportional: 10° heading error → 15° bank, capped at max_bank_deg
+        # ── Heading → Bank → Aileron ─────────────────────────────────
         g = self.gains
-        target_bank_deg = _clamp(hdg_error * g.bank_per_hdg_error, g.max_bank_deg)
+        target_bank_deg = hdg_error * g.bank_per_hdg_error
 
-        # Apply roll_limit from targets (e.g. takeoff limits bank)
+        # Commander-issued roll clamp (optional). roll_limit is in [-1,+1]
+        # actuator units; we map 1.0 → 90° of commanded bank.
         if targets.roll_limit is not None:
-            # roll_limit is in ratio (-1..+1), convert to approximate degrees
-            # At limit 0.20 → ~20° bank max
-            max_bank_from_limit = abs(targets.roll_limit) * 100.0  # rough mapping
-            target_bank_deg = _clamp(target_bank_deg, min(g.max_bank_deg, max_bank_from_limit))
+            max_bank = abs(targets.roll_limit) * 90.0
+            target_bank_deg = _clamp(target_bank_deg, max_bank)
 
-        # Inner loop: bank error → aileron command
-        bank_error_deg = target_bank_deg - telemetry.roll_deg
-        bank_rate_deg_s = (telemetry.roll_deg - self._prev_bank_deg) / dt if dt > 0 else 0.0
+        bank_error = target_bank_deg - telemetry.roll_deg
+        bank_rate = (telemetry.roll_deg - self._prev_bank_deg) / dt if dt > 0 else 0.0
         self._prev_bank_deg = telemetry.roll_deg
 
-        roll_cmd = g.bank_inner_kp * bank_error_deg - g.bank_inner_kd * bank_rate_deg_s
+        roll_cmd = g.bank_inner_kp * bank_error - g.bank_inner_kd * bank_rate
+        roll_cmd = _clamp(roll_cmd, 1.0)  # hardware truth
 
-        # Clamp aileron output
-        roll_cmd = _clamp(roll_cmd, 1.0)
-
-        # ── ALTITUDE → PITCH  /  SPEED → THROTTLE ─────────────────
-        # Philosophy: PITCH controls altitude. THROTTLE controls speed.
-        # The PID has FULL authority over the elevator — no artificial
-        # pitch limits during normal flight. The safety layer (SafetyLimits)
-        # is the only hard stop (structural limit of the airframe).
-        #
-        # This is how a real pilot flies: push the nose where it needs
-        # to go to hold altitude, and set power for the desired speed.
-
-        # Reset altitude PID on phase transitions (e.g. CRUISE→APPROACH)
-        # to clear accumulated integral bias that would fight the new target.
-        if getattr(targets, 'reset_alt_pid', False):
-            self.altitude_pid.reset()
-
+        # ── Altitude → Pitch ─────────────────────────────────────────
         pitch_cmd = self.altitude_pid.update(alt_error, dt)
-        throttle_cmd = self.cruise_throttle
 
-        # FIXED RATE climb/descent with CLOSED-LOOP VS control.
-        # The VS PID compares actual vertical speed to target and adjusts
-        # pitch incrementally. No open-loop formula — pure feedback.
-        if targets.throttle is not None and targets.climb_rate_fpm is not None:
-            throttle_cmd = targets.throttle
-            rate_fpm = targets.climb_rate_fpm
-            import math as _m
-
-            if rate_fpm >= 0:
-                # CLIMB: fixed pitch, blend to level near target altitude
-                if alt_error > 200.0:
-                    pitch_cmd = 0.07
-                elif alt_error > 0:
-                    pitch_cmd = 0.07 * (alt_error / 200.0)
-                else:
-                    pitch_cmd = max(-0.15, alt_error * 0.0003)
-                self.vs_pid.reset()
-                if hasattr(self, '_descent_baseline'):
-                    del self._descent_baseline
-            else:
-                # DESCENT — closed-loop vertical speed control.
-                # The VS PID reads ACTUAL vertical speed from X-Plane
-                # and outputs a pitch correction to track the target VS.
-                #
-                # The PID output is an ABSOLUTE pitch offset from a
-                # neutral baseline — NOT cumulative. This prevents
-                # double-integration oscillation.
-                actual_vs = telemetry.vs_fpm if not _m.isnan(telemetry.vs_fpm) else 0.0
-                target_vs = rate_fpm  # negative (e.g. -600 fpm)
-
-                # VS error: negative = need more descent, positive = descending too fast
-                vs_error = target_vs - actual_vs
-
-                # PID outputs an ABSOLUTE pitch offset from neutral
-                pitch_offset = self.vs_pid.update(vs_error, dt)
-
-                # Baseline: whatever pitch was holding level flight
-                # (typically negative at high speed, e.g. -0.10)
-                baseline = getattr(self, '_descent_baseline', self._prev_pitch_cmd)
-                if not hasattr(self, '_descent_baseline'):
-                    self._descent_baseline = self._prev_pitch_cmd
-
-                pitch_cmd = baseline + pitch_offset
-
-                # Clamp: don't pitch beyond reasonable descent limits
-                pitch_cmd = max(-0.25, min(0.02, pitch_cmd))
-
-            self.altitude_pid.reset()
-            self.airspeed_pid.reset()
-        else:
-            if targets.throttle is not None:
-                throttle_cmd = targets.throttle
-            else:
-                throttle_cmd += self.airspeed_pid.update(spd_error, dt)
-
-        # Airspeed protection: if dangerously slow (near stall), pitch
-        # down to trade altitude for airspeed — survival takes priority.
-        if targets.pitch_protect_kts is not None and targets.pitch_protect_gain is not None:
-            if telemetry.airspeed_kts < targets.pitch_protect_kts:
-                delta = (targets.pitch_protect_kts - telemetry.airspeed_kts) * targets.pitch_protect_gain
-                pitch_cmd -= min(delta, 0.20)
-
-        # Enforce pitch_limit as an UPPER bound only (nose-up cap).
-        # The plane must always be free to push nose DOWN — never restrict that.
-        # This prevents PID integral windup from causing sharp pitch-ups on
-        # phase transitions (e.g. CRUISE→APPROACH where old integral fights descent).
+        # Commander-issued pitch clamp. Nose-up cap is always honored; nose-down
+        # cap is opt-in (only honored if pitch_down_limit is set, so phases
+        # that need full nose-down authority for stall recovery are unaffected).
+        # Descent keyframes set pitch_down_limit to prevent a glideslope-chase
+        # dive from converting altitude into speed past structural limits.
         if targets.pitch_limit is not None:
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
+        if targets.pitch_down_limit is not None:
+            pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
+        pitch_cmd = _clamp(pitch_cmd, 1.0)  # hardware truth
 
-        # Roll rate limit: smooth out corrections.
-        if dt > 0:
-            max_roll_delta = self.roll_rate_limit_per_s * dt
-            roll_delta = roll_cmd - self._prev_roll_cmd
-            if roll_delta > max_roll_delta:
-                roll_cmd = self._prev_roll_cmd + max_roll_delta
-            elif roll_delta < -max_roll_delta:
-                roll_cmd = self._prev_roll_cmd - max_roll_delta
-        self._prev_roll_cmd = roll_cmd
+        # ── Speed → Throttle ─────────────────────────────────────────
+        # If ribbon commanded throttle directly, honor it. Otherwise PID.
+        if targets.throttle is not None:
+            throttle_cmd = targets.throttle
+        else:
+            throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(spd_error, dt)
+        throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth
 
-        # Pitch rate limit to avoid oscillation/hunting.
-        if dt > 0:
-            max_delta = self.pitch_rate_limit_per_s * dt
-            delta = pitch_cmd - self._prev_pitch_cmd
-            if delta > max_delta:
-                pitch_cmd = self._prev_pitch_cmd + max_delta
-            elif delta < -max_delta:
-                pitch_cmd = self._prev_pitch_cmd - max_delta
-        self._prev_pitch_cmd = pitch_cmd
-
-        # ── YAW (takeoff/low-altitude only) ─────────────────────────
-        # Purely proportional + derivative. NO bang-bang, NO integral windup.
-        # The correction scales linearly with the error and tapers to zero
-        # as the plane converges on the target heading.
-        #
-        # Derivative term (heading rate damping) prevents overshoot:
-        # as the plane starts turning back toward target, the rate opposes
-        # the correction → smooth deceleration into the target heading.
+        # ── Yaw (ribbon-driven yaw-hold only; no standalone yaw PID) ─
         yaw_cmd = 0.0
         if targets.yaw_hold:
             yaw_kp = targets.yaw_kp if targets.yaw_kp is not None else 0.02
             yaw_limit = targets.yaw_limit if targets.yaw_limit is not None else 0.5
 
-            # Heading rate: how fast heading is changing (deg/s)
-            # First tick: no rate info yet, just use proportional.
-            if self._prev_hdg_deg is None:
+            if self._prev_hdg_deg is None or dt <= 0:
                 hdg_rate = 0.0
-            elif dt > 0:
-                hdg_rate = _wrap_deg(telemetry.heading_deg - self._prev_hdg_deg) / dt
-                # Cap rate to physical limits (~30°/s max for a small jet)
-                hdg_rate = max(-30.0, min(30.0, hdg_rate))
             else:
-                hdg_rate = 0.0
+                hdg_rate = _wrap_deg(telemetry.heading_deg - self._prev_hdg_deg) / dt
             self._prev_hdg_deg = telemetry.heading_deg
 
-            # PD controller: proportional to error, damped by heading rate.
-            # As error shrinks → proportional shrinks → correction tapers.
-            # As plane turns toward target → rate opposes → prevents overshoot.
-            yaw_kd = 0.008  # rudder per deg/s of heading rate
-            yaw_cmd = yaw_kp * hdg_error - yaw_kd * hdg_rate
-
-            yaw_cmd = _clamp(yaw_cmd, yaw_limit)
+            yaw_cmd = _clamp(yaw_kp * hdg_error - 0.008 * hdg_rate, yaw_limit)
         else:
             self._prev_hdg_deg = telemetry.heading_deg
 
-        brake_ratio = 0.0
-        if targets.brake_ratio is not None:
-            brake_ratio = targets.brake_ratio
-
+        brake_ratio = targets.brake_ratio if targets.brake_ratio is not None else 0.0
+        brake_ratio = max(0.0, min(1.0, brake_ratio))  # hardware truth
         gear_down = targets.gear_down if targets.gear_down is not None else True
         flap_ratio = targets.flap_ratio if targets.flap_ratio is not None else 0.0
+        flap_ratio = max(0.0, min(1.0, flap_ratio))  # hardware truth
 
         return Actuators(
             throttle=throttle_cmd,

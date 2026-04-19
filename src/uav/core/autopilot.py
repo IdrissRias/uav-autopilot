@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from uav.core.control.simple_fixedwing import SimpleFixedWingController
-from uav.core.guidance.simple_guidance import SimpleGuidance
+from uav.core.guidance.base import Guidance
 from uav.core.safety.limits import SafetyLimits, abort_actuators
 from uav.core.safety.failsafe import is_telemetry_stale
 from uav.logging.recorder import Recorder
@@ -44,7 +44,6 @@ class Autopilot:
         self._last_step = time.time()
         self._reset_last_ts = 0.0
         self._reset_cooldown_s = 5.0
-        self._monitor: dict = {}  # timers for phase-limit watchdog
         self._scorer: FlightScorer | None = None
         self._accuracy: AccuracyTracker = AccuracyTracker()
         self._landed = False        # True once we've scored the current flight
@@ -68,11 +67,6 @@ class Autopilot:
         self._snapshot_next: float = 0.0  # next telemetry snapshot time
         self._snapshot_tick: int = 0      # tick counter for snapshots
         self._end_flight_requested = False  # set by app "end_flight" command
-
-        # Safety envelope (V2): descent rate + stall + overspeed + bank
-        self._safety_envelope = None  # set externally if desired
-        self._v_stall = 77.0
-        self._v_ne = 250.0
 
     def handle_command(self, data: dict) -> None:
         """Handle a command from the app (via Supabase Broadcast).
@@ -119,12 +113,6 @@ class Autopilot:
                 airframe = self.mode_manager.ctx.get("airframe", {})
                 airframe["throttle"]["cruise"] = float(value)
                 print(f"[COMMAND] Cruise throttle → {value}")
-
-        elif action == "calibrate":
-            print("[COMMAND] CALIBRATE received — switching to calibration mode")
-            # Unlock the fly gate so the autopilot loop runs
-            self._fly_command_received = True
-            self._start_calibration()
 
     def _preview_ribbon(self, dest: dict) -> None:
         """Build a ribbon preview and broadcast waypoints without starting a flight."""
@@ -195,9 +183,8 @@ class Autopilot:
             except Exception as e:
                 print(f"[PREVIEW] Runway lookup failed: {e}")
 
-            # Cap v_approach
-            v_land = float(speeds.get("v_land", 77.0))
-            v_approach = min(float(speeds.get("v_approach", 83.0)), v_land + 15.0)
+            # Prefer v_land (landing reference) over v_stall; default 77.
+            v_stall = float(speeds.get("v_land", 77.0))
 
             ribbon = plan_path(
                 dep_lat=dep_lat, dep_lon=dep_lon,
@@ -208,13 +195,7 @@ class Autopilot:
                 dest_threshold_lat=dest_thr_lat,
                 dest_threshold_lon=dest_thr_lon,
                 cruise_alt_ft=cruise_alt,
-                v_rotate=float(speeds.get("v_rotate", 90.0)),
-                v_climb=float(speeds.get("v_climb", 160.0)),
-                v_cruise=float(speeds.get("v_cruise", 200.0)),
-                v_approach=v_approach,
-                v_land=v_land,
-                climb_fpm=float(rates.get("climb", 1600.0)),
-                takeoff_roll_ft=float(airframe.get("takeoff_roll_ft", 2000.0)),
+                v_stall=v_stall,
             )
             print(format_ribbon(ribbon))
 
@@ -254,62 +235,6 @@ class Autopilot:
         except Exception as e:
             print(f"[PREVIEW] Failed: {e}")
             import traceback; traceback.print_exc()
-
-    def _start_calibration(self) -> None:
-        """Switch to calibration mode — automated maneuvers to measure sensitivity."""
-        from uav.core.calibration_director import CalibrationDirector
-        from uav.learning.flight_observer import SensitivityTracker
-        from uav.learning.envelope_updater import update_envelope
-
-        # Ensure observer exists (calibration needs it for sensitivity tracking)
-        if not self._observer:
-            self._observer = FlightObserver(self._icao_type)
-            self._observer_finalized = False
-            print(f"[CALIBRATION] Created flight observer for {self._icao_type}")
-
-        tracker = self._observer._sensitivity
-
-        def _on_progress(step: int, total: int, label: str, confidence: float) -> None:
-            print(f"[CALIBRATION] Step {step}/{total}: {label} (confidence: {confidence:.0%})")
-            broadcast.publish_status({
-                "type": "calibration_progress",
-                "step": step,
-                "total": total,
-                "label": label,
-                "confidence": confidence,
-            })
-
-        def _on_complete(cal_data: dict) -> None:
-            print(f"[CALIBRATION] Complete — saving to database")
-            # Save via envelope updater (merges into learned envelope)
-            try:
-                update_envelope(self._icao_type, {"calibration": cal_data})
-                print(f"[CALIBRATION] Saved to database for {self._icao_type}")
-            except Exception as e:
-                print(f"[CALIBRATION] Save failed: {e}")
-
-            broadcast.publish_status({
-                "type": "calibration_complete",
-                "confidence": cal_data.get("confidence", 0),
-                "sensitivity": {
-                    "pitch": cal_data.get("pitch_sensitivity", 0),
-                    "roll": cal_data.get("roll_sensitivity", 0),
-                    "yaw": cal_data.get("yaw_sensitivity", 0),
-                    "throttle": cal_data.get("throttle_sensitivity", 0),
-                },
-            })
-
-        ctx = getattr(self.mode_manager, 'ctx', {})
-        self._calibration_director = CalibrationDirector(
-            ctx=ctx,
-            sensitivity_tracker=tracker,
-            on_progress=_on_progress,
-            on_complete=_on_complete,
-        )
-        # Swap the mode manager to calibration director
-        self._original_mode_manager = self.mode_manager
-        self.mode_manager = self._calibration_director
-        print("[CALIBRATION] Calibration director active")
 
     def _finalize_active_flight(self, telemetry, status: str = "aborted", reason: str = "") -> None:
         """Finalize the current in-progress flight (if any) and clear flight state."""
@@ -476,6 +401,24 @@ class Autopilot:
                 "eta_s": round(eta_s),
             }
 
+        # ── Ribbon adherence (L1 track follower output) ──
+        # cross_track_nm: how many nm the plane is OFF the ribbon line.
+        #   Positive = plane is to the right of track.
+        # along_track_nm: distance progressed along the full polyline.
+        # segment_idx / ribbon_length_nm: which segment, total length.
+        # This is the "religiously following the ribbon" meter. <0.3 nm
+        # sustained = good. Anything larger and we are flying parallel
+        # to the ribbon, not on it — same failure mode as today's bug.
+        track_state = ctx.get("track_state")
+        if track_state:
+            data["ribbon"] = {
+                "cross_track_nm": round(track_state.get("cross_track_nm", 0.0), 3),
+                "along_track_nm": round(track_state.get("along_track_nm", 0.0), 2),
+                "segment_idx": track_state.get("segment_idx", 0),
+                "segment_progress": round(track_state.get("segment_progress", 0.0), 3),
+                "ribbon_length_nm": round(track_state.get("ribbon_length_nm", 0.0), 2),
+            }
+
         broadcast.publish_telemetry(data)
 
     def _build_and_broadcast_plan(self, telemetry, ctx, dest, ground_msl_ft, initial_target, dist_nm) -> None:
@@ -488,17 +431,8 @@ class Autopilot:
                 dest_rwy = ctx.get("dest_runway")
                 rwy = self._runway_detection
 
-                # Sanity cap: v_approach must never exceed v_land + 15.
-                # Bad calibration data can produce absurd approach speeds
-                # (e.g. 147 kts on an SF50 when it should be ~80).
-                v_land_cap = float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0))
-                v_approach_raw = float(ctx["airframe"]["speeds_kts"].get("v_approach", 83.0))
-                v_approach_capped = min(v_approach_raw, v_land_cap + 15.0)
-                if v_approach_capped != v_approach_raw:
-                    print(f"[NAV] Capping v_approach {v_approach_raw:.0f} → {v_approach_capped:.0f} kts (v_land + 15)")
-                    # Write back to ctx so flight engine and controller also see capped value
-                    ctx["airframe"]["speeds_kts"]["v_approach"] = v_approach_capped
-
+                # Prefer v_land (landing reference) over v_stall; default 77.
+                v_stall = float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0))
                 ribbon = plan_path(
                     dep_lat=telemetry.lat_deg,
                     dep_lon=telemetry.lon_deg,
@@ -511,13 +445,7 @@ class Autopilot:
                     dest_threshold_lat=dest_rwy["threshold_lat"] if dest_rwy else None,
                     dest_threshold_lon=dest_rwy["threshold_lon"] if dest_rwy else None,
                     cruise_alt_ft=initial_target,
-                    v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
-                    v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 160.0)),
-                    v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
-                    v_approach=v_approach_capped,
-                    v_land=float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0)),
-                    climb_fpm=float(ctx["airframe"].get("rates_fpm", {}).get("climb", 1600.0)),
-                    takeoff_roll_ft=float(ctx["airframe"].get("takeoff_roll_ft", 2000.0)),
+                    v_stall=v_stall,
                 )
                 # Pre-build ribbon so FlightEngine doesn't rebuild it
                 self.mode_manager._ribbon = ribbon
@@ -676,16 +604,6 @@ class Autopilot:
 
     def stop(self) -> None:
         self._running = False
-
-    def _check_phase_limits(self, mode: str, telemetry) -> str | None:
-        """Return a failure reason string if the flight is in an unacceptable state, else None.
-
-        NOTE: Disabled for V2 ribbon autopilot.  The V1 watchdog was triggering
-        false resets during normal ribbon-following (altitude deviations during
-        descent, heading changes during turns).  The ribbon + safety envelope
-        provide their own protection now.
-        """
-        return None
 
     def _safe_write(self, act: Actuators) -> None:
         self.adapter.write_actuators(act)
@@ -959,21 +877,16 @@ class Autopilot:
             grace_until = getattr(self, "_reset_grace_until", 0.0)
             in_grace = now < grace_until
 
-            # Phase-limit watchdog: catch unacceptable altitude/heading conditions.
-            if not stale and not in_grace:
-                failure = self._check_phase_limits(self.mode_manager.name, telemetry)
-                if failure:
-                    print(f"MONITOR: reset → {failure}")
-                    self._monitor.clear()
-                    stale = True  # reuse the existing stale-reset path
-
             if stale or in_grace:
                 # Don't drive modes/controllers on stale data. Neutralize.
                 act = abort_actuators()
                 targets = None
 
-                # Try a reset (option 1) when stale, but rate-limit it.
-                if stale and (now - self._reset_last_ts >= self._reset_cooldown_s):
+                # Only reset if we've EVER had valid telemetry (timestamp>0).
+                # Cold-start with no RREF replies must NOT trigger a reset — that
+                # spams sim/operation/reset_flight at X-Plane and knocks it over.
+                had_telemetry = telemetry.timestamp > 0.0
+                if stale and had_telemetry and (now - self._reset_last_ts >= self._reset_cooldown_s):
                     self._reset_last_ts = now
                     ok = False
                     try:
@@ -989,6 +902,13 @@ class Autopilot:
                         # 3s grace window to allow telemetry to resume
                         self._reset_grace_until = time.time() + 3.0
                         print("RESET: sent reset flight command; waiting for telemetry...")
+                elif stale and not had_telemetry:
+                    # Throttled warning so we don't spam the log
+                    if (now - self._reset_last_ts) >= 5.0:
+                        self._reset_last_ts = now
+                        print("[TELEMETRY] No RREF data from X-Plane yet — "
+                              "check Settings → Network → Data Output is enabled "
+                              "and 'Send to IP 127.0.0.1 port 49005' is set.")
             else:
                 desired = self.mode_manager.step(telemetry, stale=False)
                 targets = self.guidance.compute(telemetry, desired)
@@ -1187,13 +1107,6 @@ class Autopilot:
                 broadcast.publish_status({"event": "flight_ended", "reason": "user_ended"})
                 print("[END FLIGHT] Flight ended — back to preflight")
 
-            # Safety envelope: descent rate, stall, overspeed, bank limits
-            if targets is not None and self._safety_envelope:
-                targets, act, _corr = self._safety_envelope(
-                    telemetry, targets, act,
-                    v_stall=self._v_stall, v_never_exceed=self._v_ne,
-                )
-
             act = self.safety.clamp(act)
             if act.flap_ratio > 0.01 and not getattr(self, '_flap_dbg', False):
                 print(f"[DEBUG-FLAP] flap_ratio={act.flap_ratio:.2f} phase={getattr(targets, 'flap_ratio', '?')}", flush=True)
@@ -1212,19 +1125,32 @@ class Autopilot:
                     pass
                 print("RESET: telemetry stable; re-armed.")
 
+            # Pull ribbon follower stats so flight CSV can be graded for
+            # "religious following" offline (cross_track_nm over time).
+            _track_state = None
+            _ctx_for_rec = getattr(self.mode_manager, "ctx", None)
+            if isinstance(_ctx_for_rec, dict):
+                _track_state = _ctx_for_rec.get("track_state")
+
             self.recorder.record(
                 mode=self.mode_manager.name,
                 telemetry=telemetry,
                 targets=targets,
                 actuators=act,
+                ribbon=_track_state,
             )
 
             if time.time() >= status_next:
                 status_next = time.time() + 1.0
                 age = time.time() - telemetry.timestamp if telemetry.timestamp else 999.0
                 acc_str = f"Acc={self._accuracy.instant_accuracy:.0f}%/{self._accuracy.flight_accuracy:.0f}%"
+                # Prefer the real keyframe name (e.g. CLIMB_GEAR_UP) over the
+                # mapped scoring phase so the log shows what the ribbon is
+                # actually doing.  Falls back to .name on older managers.
+                mode_label = getattr(self.mode_manager, "keyframe_name",
+                                     self.mode_manager.name)
                 print(
-                    f"Mode={self.mode_manager.name} "
+                    f"Mode={mode_label} "
                     f"Alt={telemetry.altitude_ft:.1f}ft "
                     f"AGL={telemetry.agl_m:.1f}m "
                     f"Hdg={telemetry.heading_deg:.1f}deg "

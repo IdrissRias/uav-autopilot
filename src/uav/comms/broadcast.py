@@ -248,24 +248,6 @@ def publish_preflight(data: Dict[str, Any]) -> None:
         pass
 
 
-def publish_calibration(data: Dict[str, Any]) -> None:
-    """Publish calibration progress or completion.
-
-    Used by CalibrationDirector to send step progress and final results
-    to the Flutter app.
-    """
-    if not _connected or not _telemetry_channel or not _loop:
-        return
-
-    try:
-        asyncio.run_coroutine_threadsafe(
-            _telemetry_channel.send_broadcast("calibration", data),
-            _loop,
-        )
-    except Exception:
-        pass
-
-
 # ── Heartbeat: writes to Supabase DB so the app knows the plane is online ──
 _supabase_client = None
 _heartbeat_lock = threading.Lock()
