@@ -56,6 +56,12 @@ class FlightScore:
     prev_best_total: Optional[float] = None
     notes: List[str] = field(default_factory=list)
 
+    # Outcome of the flight — drives the icon in Flight History and makes
+    # it obvious at a glance why a score is low. "completed" = touched down
+    # normally on LAND tick; "aborted" = user ended early or process killed;
+    # "crashed" = underground/stuck in ABORT phase detected by the engine.
+    outcome: str = "completed"
+
 
 # ── scorer ────────────────────────────────────────────────────────────────────
 
@@ -163,6 +169,88 @@ class FlightScorer:
             is_personal_best=is_pb,
             prev_best_total=round(prev_best, 1) if prev_best is not None else None,
             notes=notes,
+            outcome="completed",
+        )
+
+    def finalize_partial(
+        self,
+        current_lat: float,
+        current_lon: float,
+        current_speed_kts: float,
+        outcome: str,
+    ) -> FlightScore:
+        """Score a flight that didn't reach a proper touchdown.
+
+        Policy: every flight produces a score, including aborts and crashes.
+        We use whatever measurements are honest:
+          • accuracy  → distance from current position to destination
+                        (if user aborts at the destination, they still get credit;
+                         if they abort mid-cruise, the score reflects that)
+          • speed     → current airspeed (penalizes bailing at high speed)
+          • time      → 0 for partial flights (no personal-best comparison
+                        for something that didn't complete the route)
+          • stability → std-dev of cruise alt samples accumulated so far;
+                        0 if never reached cruise
+        Crashed flights get an extra -10 "crash penalty" note baked into
+        the total (but clamped at 0).
+        """
+        if outcome not in ("completed", "aborted", "crashed"):
+            outcome = "aborted"
+
+        duration_s = time.time() - self._start_ts
+        landing_dist_m = _haversine_m(current_lat, current_lon, self.dest_lat, self.dest_lon)
+
+        # Cruise alt stability — same as finalize()
+        if self._cruise_alt_samples:
+            mean = sum(self._cruise_alt_samples) / len(self._cruise_alt_samples)
+            variance = sum((x - mean) ** 2 for x in self._cruise_alt_samples) / len(self._cruise_alt_samples)
+            cruise_alt_std = math.sqrt(variance)
+        else:
+            # No cruise samples → 0 points. Don't use the 999 sentinel because
+            # that would give a meaningless but defined zero regardless; explicit is cleaner.
+            cruise_alt_std = 999.0
+
+        pts_acc = max(0.0, 40.0 * (1.0 - max(0.0, landing_dist_m - 50.0) / 450.0))
+        spd_over = max(0.0, current_speed_kts - (self.V_LAND_KTAS + 5.0))
+        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / max(1.0, 110.0 - self.V_LAND_KTAS - 5.0)))
+        # Partial flights don't earn time points — they never completed the route.
+        pts_time = 0.0
+        pts_stab = max(0.0, 10.0 * (1.0 - max(0.0, cruise_alt_std - 10.0) / 290.0))
+
+        total = pts_acc + pts_spd + pts_time + pts_stab
+        if outcome == "crashed":
+            total = max(0.0, total - 10.0)  # crash penalty
+
+        prev_best = self._load_best_total()
+        # Only "completed" flights can set a personal best.
+        is_pb = (outcome == "completed") and (prev_best is None or total > prev_best)
+
+        notes: List[str] = []
+        if outcome == "aborted":
+            notes.append("⏹️  Flight aborted — partial score")
+        elif outcome == "crashed":
+            notes.append("💥 Crashed — score reduced by 10 pts")
+        if landing_dist_m > 400:
+            notes.append(f"📍 Ended {landing_dist_m:.0f}m from destination")
+        if current_speed_kts > 90:
+            notes.append("🔴 Ended at high speed")
+
+        return FlightScore(
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            dest_icao=self.dest_icao,
+            duration_s=round(duration_s, 1),
+            landing_dist_m=round(landing_dist_m, 1),
+            landing_speed_kts=round(current_speed_kts, 1),
+            cruise_alt_std_ft=round(cruise_alt_std, 1),
+            pts_accuracy=round(pts_acc, 1),
+            pts_speed=round(pts_spd, 1),
+            pts_time=round(pts_time, 1),
+            pts_stability=round(pts_stab, 1),
+            total=round(total, 1),
+            is_personal_best=is_pb,
+            prev_best_total=round(prev_best, 1) if prev_best is not None else None,
+            notes=notes,
+            outcome=outcome,
         )
 
     def save(self, score: FlightScore) -> str:

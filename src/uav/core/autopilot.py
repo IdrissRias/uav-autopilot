@@ -68,6 +68,18 @@ class Autopilot:
         self._snapshot_tick: int = 0      # tick counter for snapshots
         self._end_flight_requested = False  # set by app "end_flight" command
 
+        # ── Crash detector ──
+        # Two signals, either triggers a "crashed" finalize:
+        #   1. AGL < -2 m for _crash_underground_ticks ticks in a row
+        #      (plane is underground — X-Plane sometimes does this on hard impacts).
+        #   2. Phase stuck at ABORT for _crash_abort_seconds (telemetry has
+        #      been stale that long — the sim likely crashed or froze).
+        # Tunables kept conservative so we don't false-trip on brief transients.
+        self._underground_ticks = 0
+        self._abort_start_ts: float | None = None
+        self._crash_underground_ticks = 20   # ~1s at 20Hz
+        self._crash_abort_seconds = 15.0
+
     def handle_command(self, data: dict) -> None:
         """Handle a command from the app (via Supabase Broadcast).
 
@@ -251,17 +263,51 @@ class Autopilot:
                 except Exception:
                     pass
 
-            # Partial scores if scorer is available
+            # Partial scores if scorer is available.
+            # Every flight must get a score — completed, aborted, crashed.
+            # finalize_partial handles the "never landed" case by scoring
+            # on whatever dimensions have data (distance-to-dest, cruise
+            # stability so far, duration). pts_accuracy will be 0 when
+            # the flight ends far from destination, which is honest.
             duration_s = None
-            if self._scorer and hasattr(self._scorer, "_start_time") and self._scorer._start_time:
-                duration_s = time.time() - self._scorer._start_time
+            score = None
+            if self._scorer and self._scorer._start_ts:
+                duration_s = time.time() - self._scorer._start_ts
+                if telemetry.has_position():
+                    try:
+                        score = self._scorer.finalize_partial(
+                            current_lat=telemetry.lat_deg,
+                            current_lon=telemetry.lon_deg,
+                            current_speed_kts=telemetry.airspeed_kts,
+                            outcome=status,
+                        )
+                        self._scorer.print_summary(score)
+                        self._scorer.save(score)
+                    except Exception as e:
+                        print(f"[PEREGRINE] Partial score failed: {e}")
 
-            local_db.finalize_flight(
-                self._flight_id,
-                status=status,
-                duration_s=duration_s,
-                phase_timeline=phase_tl if phase_tl else None,
-            )
+            # Build kwargs — include score_* only if we produced a score.
+            finalize_kwargs = {
+                "status": status,
+                "duration_s": duration_s,
+                "phase_timeline": phase_tl if phase_tl else None,
+                "abort_reason": reason if reason else None,
+            }
+            if score is not None:
+                finalize_kwargs.update({
+                    "score_total": score.total,
+                    "score_accuracy": score.pts_accuracy,
+                    "score_speed": score.pts_speed,
+                    "score_time": score.pts_time,
+                    "score_stability": score.pts_stability,
+                    "touchdown_speed_kts": score.landing_speed_kts,
+                    "touchdown_distance_ft": (score.landing_dist_m * 3.28084
+                                               if score.landing_dist_m else None),
+                    "cruise_alt_stddev_ft": score.cruise_alt_std_ft,
+                    "is_personal_best": 1 if score.is_personal_best else 0,
+                })
+
+            local_db.finalize_flight(self._flight_id, **finalize_kwargs)
 
             # Log end event
             local_db.log_event(
@@ -684,6 +730,49 @@ class Autopilot:
                     ctx = getattr(self.mode_manager, "ctx", None)
                     if ctx is not None and ctx.get("destination") is None:
                         dest = self._fly_destination
+
+                        # ── Reject same-spot flights ─────────────────────
+                        # The app can command the plane back to where it
+                        # already sits. Autopilot would happily spin a 180
+                        # and fly to itself. Gate on 0.1 nm (~608 ft / 185 m) —
+                        # permissive enough that legitimate short hops still
+                        # fly, strict enough to block the "fly to where I
+                        # already am" bug. Only enforced when we have a
+                        # position fix; a missing fix is not a reason to
+                        # refuse, the regular takeoff path catches that.
+                        if telemetry.has_position():
+                            from uav.nav.geo import haversine_m as _hv_gate
+                            _dist_nm_gate = _hv_gate(
+                                telemetry.lat_deg, telemetry.lon_deg,
+                                float(dest["lat"]), float(dest["lon"]),
+                            ) / 1852.0
+                            if _dist_nm_gate < 0.1:
+                                print(f"[COMMAND] Rejecting fly to "
+                                      f"{dest.get('icao','???')}: already "
+                                      f"there ({_dist_nm_gate:.3f} nm < 0.1 nm min)")
+                                broadcast.publish_status({
+                                    "event": "fly_rejected",
+                                    "reason": "too_close",
+                                    "icao": dest.get("icao", ""),
+                                    "distance_nm": round(_dist_nm_gate, 3),
+                                    "min_distance_nm": 0.1,
+                                    "message": (
+                                        f"Too close to "
+                                        f"{dest.get('icao', 'destination')} "
+                                        f"— must be more than 0.1 nm away to fly."
+                                    ),
+                                })
+                                # Drop the request so the next loop iteration
+                                # doesn't re-try the same command forever.
+                                self._fly_destination = None
+                                self._last_step = loop_start
+                                sleep_s = max(
+                                    0.0,
+                                    (1.0 / self.loop_rate_hz) - (time.time() - loop_start),
+                                )
+                                time.sleep(sleep_s)
+                                continue
+
                         ctx["destination"] = {
                             "icao": dest.get("icao", "???"),
                             "name": dest.get("name", ""),
@@ -928,6 +1017,57 @@ class Autopilot:
                 # Update accuracy tracker every tick
                 if targets is not None:
                     self._accuracy.update(phase, telemetry, targets, act.throttle)
+
+                # ── Crash detection ──────────────────────────────────
+                # Only arm the detector once we have an active flight
+                # record AND we're past GROUND — a plane sitting on the
+                # runway pre-takeoff shouldn't be scored as crashed.
+                if self._flight_id and phase not in ("GROUND", "LAND"):
+                    import math as _m
+                    # 1) Underground check: AGL < -2m sustained.
+                    agl = telemetry.agl_m
+                    if not _m.isnan(agl) and agl < -2.0:
+                        self._underground_ticks += 1
+                    else:
+                        self._underground_ticks = 0
+
+                    # 2) Stuck-ABORT check: phase="ABORT" for too long.
+                    if phase == "ABORT":
+                        if self._abort_start_ts is None:
+                            self._abort_start_ts = time.time()
+                    else:
+                        self._abort_start_ts = None
+
+                    crashed = False
+                    reason = ""
+                    if self._underground_ticks >= self._crash_underground_ticks:
+                        crashed = True
+                        reason = f"Underground for {self._underground_ticks} ticks (AGL {agl:.1f}m)"
+                    elif (self._abort_start_ts is not None
+                          and time.time() - self._abort_start_ts >= self._crash_abort_seconds):
+                        crashed = True
+                        reason = f"Stuck in ABORT for {time.time() - self._abort_start_ts:.0f}s"
+
+                    if crashed:
+                        print(f"[CRASH] {reason} — finalizing flight as crashed")
+                        # Reset counters so we don't double-fire.
+                        self._underground_ticks = 0
+                        self._abort_start_ts = None
+                        self._finalize_active_flight(
+                            telemetry, status="crashed", reason=reason,
+                        )
+                        broadcast.publish_status({
+                            "event": "flight_crashed",
+                            "reason": reason,
+                        })
+                        # Drop back to preflight state.
+                        self._fly_command_received = False
+                        self._fly_destination = None
+                        self._runway_detection = None
+                        self._preflight_broadcasted = False
+                        self._prev_phase = "GROUND"
+                        self._landed = False
+                        self._observer_finalized = False
 
                 # Broadcast phase changes + log to DB
                 if phase != self._prev_phase:

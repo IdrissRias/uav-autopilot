@@ -502,7 +502,8 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         # capped.  roll_limit kept shallow (0.25 ≈ ~15° bank) because
         # CLIMB_CLEAN begins at 300 AGL — a tight aim_at turn at
         # saturation (flight 20260419_145024 drove R to -1.0 at ~500 AGL
-        # and hit terrain).  Advance at cruise altitude.
+        # and hit terrain). Advance when we reach cruise altitude — next
+        # keyframe (TRANSITION) handles speed accel at cruise alt.
         Keyframe(
             name="CLIMB_CLEAN", phase="CLIMB",
             throttle_mode="explicit", throttle=0.95,
@@ -513,6 +514,45 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             roll_limit=0.25,
             pitch_limit=0.20,
             trigger=Trigger("alt_reached", value=g.cruise_alt_ft),
+        ),
+
+        # ── 4b. TRANSITION ───────────────────────────────────────────
+        # Bridge between CLIMB_CLEAN and CRUISE. Previously CRUISE entered
+        # directly from CLIMB_CLEAN — plane arrived at cruise alt at ~115
+        # kts while CRUISE instantly demanded v_cruise (154 kts). The
+        # 39-kt step error saturated the speed PID (throttle 1.0) AND the
+        # alt PID was still pitching up (alt -48 below target): both PIDs
+        # pumped energy in-phase → +1300 ft alt overshoot, then dive to
+        # 190 kts. Flight 20260419_184932 made this far worse: an earlier
+        # attempt put a compound "alt AND speed" trigger on CLIMB_CLEAN
+        # itself — CLIMB_CLEAN has no pitch_down_limit, so when plane
+        # overshot cruise alt the alt PID dove pitch to -0.44, throttle
+        # 0.95 held, speed ran away to 272 kts before the compound fired.
+        # Plane entered CRUISE massively over-energy and blew past the
+        # destination.
+        #
+        # Proper fix: an explicit TRANSITION keyframe that levels off at
+        # cruise alt with TIGHT pitch bounds (±0.08 ≈ ±4.6°) and speed-PID
+        # throttle targeting v_cruise. Plane can't dive (bounded) and
+        # can't climb (bounded); throttle modulates to build speed while
+        # level. Exits when speed within 5 kts of v_cruise, handing off to
+        # CRUISE with both PIDs near zero-error → no saturation, no phugoid.
+        # "Fix the ribbon, keep the follower dumb."
+        Keyframe(
+            name="TRANSITION", phase="CRUISE",
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_cruise,
+            alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+            heading_mode="aim_at",
+            aim_lat=g.join_lat, aim_lon=g.join_lon,
+            gear_down=False, flap_ratio=0.0,
+            roll_limit=0.25,
+            # Tight pitch bounds — we're level, accelerating. Neither PID
+            # is allowed to saturate large pitch commands during the
+            # speed build-up. Alt PID handles small alt drift; speed PID
+            # does the real work via throttle.
+            pitch_limit=0.08, pitch_down_limit=0.08,
+            trigger=Trigger("speed_gte", value=g.v_cruise - 5.0),
         ),
 
         # ── 5. CRUISE ────────────────────────────────────────────────
