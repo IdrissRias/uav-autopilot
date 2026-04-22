@@ -162,6 +162,39 @@ CREATE TABLE IF NOT EXISTS runways (
 
 CREATE INDEX IF NOT EXISTS idx_runways_airport ON runways(airport_id);
 
+-- User-defined runways / takeoff spots.
+-- Users draw these on the app map: two points (takeoff end + far end) + a
+-- width band. Ribbon geometry bolts its first/last segments exactly to the
+-- line between start and end, giving the L1 follower a real centerline to
+-- hug instead of drifting onto the grass.
+--
+-- Separate from the imported `runways` table because:
+--   • Drone strips in a field have no ICAO/airport parent
+--   • User may trust-weight their own drawings differently
+--   • Delete-all-my-runways shouldn't touch X-Plane reference data
+--
+-- Heading and length are DERIVED from start/end coordinates — never stored
+-- so they can't drift from the geometry.
+CREATE TABLE IF NOT EXISTS user_runways (
+    id              TEXT PRIMARY KEY DEFAULT '',
+    name            TEXT NOT NULL,                -- "My field strip" / "KUBE 27 (custom)"
+    icao            TEXT,                         -- optional link to airport (no FK — airport may not exist yet)
+    lat_start       REAL NOT NULL,                -- takeoff-end threshold
+    lon_start       REAL NOT NULL,
+    lat_end         REAL NOT NULL,                -- far end
+    lon_end         REAL NOT NULL,
+    width_m         REAL NOT NULL DEFAULT 20.0,   -- on-runway band ±width/2 from centerline
+    surface         TEXT DEFAULT 'unknown',       -- asphalt / grass / dirt / water / unknown
+    elevation_ft    REAL,                         -- optional; derived from X-Plane terrain if unset
+    notes           TEXT,                         -- free-form user notes
+    created_by      TEXT,                         -- user id, if known
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    synced_at       TEXT DEFAULT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_runways_icao ON user_runways(icao);
+
 -- Flights
 CREATE TABLE IF NOT EXISTS flights (
     id              TEXT PRIMARY KEY DEFAULT '',
@@ -453,6 +486,122 @@ def list_airports() -> List[Dict[str, Any]]:
     conn = get_connection()
     rows = conn.execute("SELECT * FROM airports ORDER BY icao_code").fetchall()
     return _rows_to_dicts(rows)
+
+
+# ── User Runways ─────────────────────────────────────────────
+# CRUD for user-drawn takeoff/landing strips. These are the authoritative
+# runway definition for the preflight check (is the plane on the runway?
+# room to roll?) and the ribbon geometry (first/last segment colinear with
+# the line between lat_start/lon_start → lat_end/lon_end).
+#
+# Heading and length are derived on read — stored data is start + end +
+# width only, so geometry stays internally consistent.
+
+def _derive_runway_geometry(runway: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach derived fields: heading_deg (start→end), length_m, length_ft.
+
+    Called by every read path so callers can rely on these fields without
+    us having to persist denormalized values that could drift from the
+    stored endpoints.
+    """
+    from uav.nav.geo import bearing_deg, haversine_m
+    lat1, lon1 = runway["lat_start"], runway["lon_start"]
+    lat2, lon2 = runway["lat_end"], runway["lon_end"]
+    runway["heading_deg"] = bearing_deg(lat1, lon1, lat2, lon2)
+    runway["length_m"] = haversine_m(lat1, lon1, lat2, lon2)
+    runway["length_ft"] = runway["length_m"] * 3.28084
+    return runway
+
+
+def create_user_runway(
+    name: str,
+    lat_start: float,
+    lon_start: float,
+    lat_end: float,
+    lon_end: float,
+    width_m: float = 20.0,
+    icao: Optional[str] = None,
+    surface: str = "unknown",
+    elevation_ft: Optional[float] = None,
+    notes: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Insert a new user-drawn runway, enqueue for Supabase sync, return the row."""
+    conn = get_connection()
+    runway_id = _generate_uuid()
+    now = _now_iso()
+    conn.execute(
+        """INSERT INTO user_runways
+           (id, name, icao, lat_start, lon_start, lat_end, lon_end,
+            width_m, surface, elevation_ft, notes, created_by,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (runway_id, name, icao, lat_start, lon_start, lat_end, lon_end,
+         width_m, surface, elevation_ft, notes, created_by, now, now),
+    )
+    conn.commit()
+    _enqueue_sync(conn, "user_runways", runway_id, "insert")
+    return get_user_runway(runway_id) or {"id": runway_id}
+
+
+def get_user_runway(runway_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch one user runway by id, with derived heading/length."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM user_runways WHERE id = ?", (runway_id,)
+    ).fetchone()
+    d = _row_to_dict(row)
+    return _derive_runway_geometry(d) if d else None
+
+
+def list_user_runways(icao: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List user runways, optionally filtered by ICAO.
+
+    Returns each row with derived heading_deg, length_m, length_ft.
+    """
+    conn = get_connection()
+    if icao:
+        rows = conn.execute(
+            "SELECT * FROM user_runways WHERE icao = ? ORDER BY name", (icao,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM user_runways ORDER BY created_at DESC"
+        ).fetchall()
+    return [_derive_runway_geometry(d) for d in _rows_to_dicts(rows) if d]
+
+
+def update_user_runway(runway_id: str, **fields) -> Optional[Dict[str, Any]]:
+    """Update allowed fields on a user runway. Unknown keys are ignored."""
+    allowed = {
+        "name", "icao", "lat_start", "lon_start", "lat_end", "lon_end",
+        "width_m", "surface", "elevation_ft", "notes",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return get_user_runway(runway_id)
+
+    updates["updated_at"] = _now_iso()
+    conn = get_connection()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [runway_id]
+    conn.execute(f"UPDATE user_runways SET {set_clause} WHERE id = ?", values)
+    conn.commit()
+    _enqueue_sync(conn, "user_runways", runway_id, "update")
+    return get_user_runway(runway_id)
+
+
+def delete_user_runway(runway_id: str) -> bool:
+    """Delete a user runway. Returns True if a row was removed.
+
+    Note: we don't enqueue a "delete" sync op because _push_one only
+    understands insert/update — remote rows linger. Fine for now; users
+    editing is the common case, deletion is rare. Can revisit if needed.
+    """
+    conn = get_connection()
+    cur = conn.execute("DELETE FROM user_runways WHERE id = ?", (runway_id,))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 # ── Flight Operations ────────────────────────────────────────
