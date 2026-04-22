@@ -36,7 +36,16 @@ class AircraftEnvelope:
     v_never_exceed: float = 0.0
 
     # Performance
+    #
+    # takeoff_roll_ft + landing_roll_ft are the numbers the preflight
+    # "room to roll" gate checks against on a user-drawn runway. They
+    # start as seeds from the POH/spec sheet and converge to real,
+    # measured values after every flight — flight_observer.py writes
+    # learned `takeoff_roll_ft` (from the accel curve) and
+    # `braking_distance_ft` (from the brake curve) into the envelope
+    # JSON; aircraft_loader promotes the learned versions here.
     takeoff_roll_ft: float = 0.0
+    landing_roll_ft: float = 0.0
     best_climb_fpm: float = 0.0
     idle_sink_fpm: float = 500.0
     service_ceiling: float = 0.0
@@ -127,6 +136,10 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
         v_never_exceed=_pick("v_never_exceed", "seed_v_never_exceed", 250.0),
 
         takeoff_roll_ft=_pick("takeoff_roll_ft", "seed_takeoff_roll_ft", 2000.0),
+        # Landing roll: flight_observer stores the measurement as
+        # `braking_distance_ft`; _pick falls back to the seed column
+        # (seed_landing_roll_ft) if no learned value is available yet.
+        landing_roll_ft=_pick("braking_distance_ft", "seed_landing_roll_ft", 1500.0),
         best_climb_fpm=_pick("best_climb_fpm", "seed_best_climb_fpm", 1000.0),
         service_ceiling=_pick("service_ceiling", "seed_service_ceiling", 15000.0),
 
@@ -150,6 +163,7 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
     print(f"  V_rotate={envelope.v_rotate} V_cruise={envelope.v_cruise} "
           f"V_approach={envelope.v_approach} V_land={envelope.v_land}")
     print(f"  Takeoff roll={envelope.takeoff_roll_ft}ft "
+          f"Landing roll={envelope.landing_roll_ft}ft "
           f"Best climb={envelope.best_climb_fpm}fpm "
           f"Ceiling={envelope.service_ceiling}ft")
     if envelope.calibration_confidence > 0:

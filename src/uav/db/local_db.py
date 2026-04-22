@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS aircraft (
     seed_v_never_exceed   REAL,
 
     seed_takeoff_roll_ft  REAL,
+    seed_landing_roll_ft  REAL,                   -- seed braking / rollout distance
     seed_best_climb_fpm   REAL,
     seed_service_ceiling  REAL,
 
@@ -183,7 +184,11 @@ CREATE TABLE IF NOT EXISTS user_runways (
     lon_start       REAL NOT NULL,
     lat_end         REAL NOT NULL,                -- far end
     lon_end         REAL NOT NULL,
-    width_m         REAL NOT NULL DEFAULT 20.0,   -- on-runway band ±width/2 from centerline
+    width_m         REAL NOT NULL DEFAULT 20.0,   -- on-runway band ±width/2 from centerline.
+                                                  -- Note: width is ONLY the preflight "is this my runway?"
+                                                  -- gate. The plane always targets the centerline during
+                                                  -- the roll — L1 follower + speed-scaled rudder authority
+                                                  -- self-centers even from an off-centerline start.
     surface         TEXT DEFAULT 'unknown',       -- asphalt / grass / dirt / water / unknown
     elevation_ft    REAL,                         -- optional; derived from X-Plane terrain if unset
     notes           TEXT,                         -- free-form user notes
@@ -341,11 +346,12 @@ def _seed_data(conn: sqlite3.Connection) -> None:
             seed_v_stall_clean, seed_v_stall_flap, seed_v_rotate,
             seed_v_best_climb, seed_v_cruise, seed_v_approach,
             seed_v_land, seed_v_never_exceed,
-            seed_takeoff_roll_ft, seed_best_climb_fpm, seed_service_ceiling,
+            seed_takeoff_roll_ft, seed_landing_roll_ft,
+            seed_best_climb_fpm, seed_service_ceiling,
             pid_gains, created_at, updated_at)
         VALUES (?, 'SF50', 'Cirrus Vision SF50', 'light_jet',
             86, 67, 90, 160, 305, 83, 77, 250,
-            2036, 1600, 31000, ?, ?, ?)
+            2036, 1628, 1600, 31000, ?, ?, ?)
     """, (sf50_id, json.dumps({
         "heading": {"kp": 0.0035, "ki": 0.0001, "kd": 0.0022},
         "altitude": {"kp": 0.0050, "ki": 0.0000, "kd": 0.0020},
