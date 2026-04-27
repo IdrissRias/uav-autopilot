@@ -121,8 +121,16 @@ def stop_autopilot():
     print(f"[DAEMON] Stopping autopilot (PID {_autopilot_proc.pid})")
     try:
         os.killpg(os.getpgid(_autopilot_proc.pid), signal.SIGTERM)
-        _autopilot_proc.wait(timeout=5)
+        # Bumped from 5s → 30s so the autopilot's signal handler has
+        # time to: (a) finalize the active flight in local SQLite and
+        # (b) push the pending Supabase sync queue. The previous 5s cap
+        # was killing the process mid-sync, leaving the flight as
+        # `in_progress` in Supabase forever (the local SQLite was
+        # correct but never made it across). With 30s, the network
+        # push reliably lands before SIGKILL is needed.
+        _autopilot_proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
+        print("[DAEMON] Autopilot did not exit within 30s — escalating to SIGKILL")
         os.killpg(os.getpgid(_autopilot_proc.pid), signal.SIGKILL)
         _autopilot_proc.wait(timeout=3)
     except Exception as e:

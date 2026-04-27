@@ -294,6 +294,23 @@ def main() -> None:
             autopilot._finalize_active_flight(telemetry, status="aborted", reason=f"Process killed ({sig_name})")
         except Exception as e:
             print(f"[PEREGRINE] Flight finalization on signal failed: {e}")
+        # Push the sync queue NOW, synchronously, before the process
+        # exits. Without this we relied on the `finally` block at the
+        # bottom of main() to flush — but if the daemon's SIGTERM
+        # timeout fires before that block runs, the flight stays as
+        # `in_progress` in Supabase forever even though the local
+        # SQLite is correct. Pushing here closes that race window.
+        try:
+            from uav.db.sync import push_pending, stop_background_sync
+            stop_background_sync()
+            push_result = push_pending()
+            if push_result.get("pushed", 0) > 0:
+                print(
+                    f"[PEREGRINE] Signal-handler sync: pushed "
+                    f"{push_result['pushed']} items"
+                )
+        except Exception as e:
+            print(f"[PEREGRINE] Signal-handler sync failed: {e}")
         adapter.write_actuators(abort_actuators())
         raise SystemExit(0)
 
