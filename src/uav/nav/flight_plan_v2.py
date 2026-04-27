@@ -321,14 +321,10 @@ def _compute_join_point(
 ) -> tuple[float, float]:
     """Point on the extended approach centerline where cruise meets final.
 
-    We want the aircraft to intercept the runway axis at a shallow angle
-    (30° — standard IFR vectored-approach).  The join is placed on the
-    centerline such that the bearing from dep to join differs from the
-    runway heading by ~30°; at the join, the turn-to-final is therefore
-    only ~30° instead of whatever arbitrary angle dep sits at.
-
-    Flat-earth approximation around the threshold; good enough for
-    placements up to ~200 nm.
+    The join is placed on the centerline such that the bearing from dep to
+    join differs from the runway heading by ~30° — standard IFR
+    vectored-approach intercept.  Flat-earth approximation around the
+    threshold; good enough for placements up to ~200 nm.
 
     Geometry:
         • t = along-track position from threshold, positive in back_hdg.
@@ -336,6 +332,14 @@ def _compute_join_point(
         • d_perp = |dep − F|.
         • Ideal join: t_J = t_F − d_perp / tan(30°).   [30° intercept]
         • Clamp: t_decel + 3 nm ≤ t_J ≤ t_decel + 80 nm.
+
+    Degeneracy: when t_J falls inside the decel buffer (because dep is
+    too close to or past the threshold), the clamp forces a position
+    that no longer honours 30°.  We log a clear warning with the actual
+    intercept angle so the failure mode is visible — the right
+    long-term fix is a full traffic pattern (downwind → base → final)
+    inserted as extra keyframes, not a single-segment join.  See
+    ribbon-pattern-fix follow-up ticket.
     """
     mean_lat_rad = math.radians((thr_lat + dep_lat) / 2.0)
     dep_e = (dep_lon - thr_lon) * 60.0 * math.cos(mean_lat_rad)
@@ -354,11 +358,33 @@ def _compute_join_point(
     d_perp = math.hypot(perp_e, perp_n)
 
     intercept_off = d_perp / math.tan(math.radians(_INTERCEPT_ANGLE_DEG))
-    t_join = t_dep - intercept_off
-    # Must be behind decel_start so there's a straight final leg from J→decel.
-    t_join = max(t_join, t_decel + _JOIN_MIN_OFFSET_NM)
-    # Cap so we don't route through the middle of nowhere.
-    t_join = min(t_join, t_decel + _JOIN_MAX_OFFSET_NM)
+    t_min = t_decel + _JOIN_MIN_OFFSET_NM
+    t_max = t_decel + _JOIN_MAX_OFFSET_NM
+
+    t_ideal = t_dep - intercept_off
+    t_join = max(t_ideal, t_min)
+    t_join = min(t_join, t_max)
+
+    # Surface degenerate geometry. The actual intercept angle = atan2(
+    # d_perp, t_join - t_dep) — when t_join was clamped up from a
+    # negative t_ideal, this can easily exceed 90° → the plane has to
+    # do a sharp elbow at the join. Log it loudly so future flights
+    # can be planned (or a proper traffic-pattern fix can be wired).
+    if t_join != t_ideal and d_perp > 0.5:
+        actual_angle = math.degrees(
+            math.atan2(d_perp, abs(t_join - t_dep))
+        )
+        # Single-leg turn at the join = 180° - intercept_angle (because
+        # cruise approaches from one side, inbound goes opposite).
+        turn_at_join = 180.0 - actual_angle
+        print(
+            f"[RIBBON] WARNING: 30° intercept geometrically impossible — "
+            f"ideal t={t_ideal:.1f}nm violates clamp [{t_min:.1f},{t_max:.1f}]nm. "
+            f"Clamped to t={t_join:.1f}nm; actual intercept ≈ {actual_angle:.0f}°, "
+            f"turn at join ≈ {turn_at_join:.0f}°. Departure too close to "
+            f"or past the runway threshold for a single-leg join. A proper "
+            f"traffic pattern (downwind/base/final) is the long-term fix."
+        )
 
     return _dest_pt(thr_lat, thr_lon, back_hdg, t_join * 1852.0)
 
