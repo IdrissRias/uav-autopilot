@@ -5,6 +5,9 @@ description = "UAV Autopilot Architecture (X-Plane 12 adapter)"
 requires-python = ">=3.9"
 dependencies = ["PyYAML>=6.0"]
 
+[project.optional-dependencies]
+rl = ["gymnasium>=0.29", "stable-baselines3>=2.0", "numpy>=1.24"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

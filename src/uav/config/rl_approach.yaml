@@ -1,0 +1,52 @@
+# RL Approach Training Configuration
+# Usage: python -m uav.rl.train (reads defaults from CLI args, this file is reference)
+
+rl:
+  algorithm: PPO
+  policy_arch: [64, 64]
+  total_timesteps: 500000
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  env:
+    phase: approach
+    sim_speed: 4
+    loop_hz: 10
+    episode_timeout_s: 120
+
+  reward:
+    # Dense (per-step) weights
+    glidepath_weight: 0.5
+    heading_weight: 0.3
+    speed_weight: 0.2
+    smoothness_weight: 0.1
+    alive_bonus: 0.01
+    # Sparse (terminal) rewards
+    touchdown_bonus: 10.0
+    centerline_bonus: 5.0
+    crash_penalty: -20.0
+
+  curriculum:
+    levels: 4
+    advance_threshold: 50.0
+    advance_episodes: 50
+    # Level 1: 3-4nm, aligned, 1200-1800ft AGL, 75-95kts
+    # Level 2: 4-6nm, slight offset, 1500-2500ft AGL, 80-120kts
+    # Level 3: 5-8nm, moderate offset, 2000-3500ft AGL, 80-160kts
+    # Level 4: 6-10nm, large offset, 2000-4000ft AGL, 80-180kts
+
+  observation:
+    # 10-dim normalised vector:
+    # [airspeed, alt_error, pitch, roll, heading_error,
+    #  agl, dist_to_rwy, bearing_error, glidepath_error, speed_error]
+    dim: 10
+
+  action:
+    # 6-dim continuous [-1, 1]:
+    # [heading_delta, altitude_delta, airspeed_target,
+    #  throttle, flap_ratio, gear_down]
+    dim: 6
