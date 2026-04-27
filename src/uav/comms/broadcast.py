@@ -318,32 +318,103 @@ def poll_fly_command(aircraft_id: str) -> Optional[Dict[str, Any]]:
 
     try:
         row = (client.table("aircraft")
-               .select("status, dest_icao")
+               .select("status, dest_icao, dest_user_runway_id")
                .eq("id", aircraft_id)
                .single()
                .execute())
         data = row.data
         status = data.get("status", "") if data else ""
         if status in ("fly_requested", "preview_requested"):
-            dest_icao = data.get("dest_icao", "")
+            dest_icao = data.get("dest_icao") or ""
+            dest_user_runway_id = data.get("dest_user_runway_id")
             # Clear the command so we don't re-trigger
             new_status = "flying" if status == "fly_requested" else "preflight"
             client.table("aircraft").update({"status": new_status}).eq("id", aircraft_id).execute()
-            # Look up destination coordinates from airports table
-            dest = {"icao": dest_icao, "name": "", "lat": 0.0, "lon": 0.0,
+            dest = {"icao": "", "name": "", "lat": 0.0, "lon": 0.0,
                     "_action": "fly" if status == "fly_requested" else "preview"}
-            try:
-                apt = (client.table("airports")
-                       .select("name, lat, lon")
-                       .eq("icao_code", dest_icao)
-                       .single()
-                       .execute())
-                if apt.data:
-                    dest["name"] = apt.data["name"]
-                    dest["lat"] = apt.data["lat"]
-                    dest["lon"] = apt.data["lon"]
-            except Exception:
-                pass
+
+            # Resolution rule (mig 006): user_runway wins over dest_icao.
+            # User runway → midpoint of (start, end) is the nominal
+            # destination point, AND we derive heading + threshold + length
+            # from the two endpoints so the ribbon planner can anchor the
+            # landing chain on the line the user actually drew (not on the
+            # bearing-from-departure fallback).
+            if dest_user_runway_id:
+                try:
+                    ur = (client.table("user_runways")
+                          .select("name, lat_start, lon_start, lat_end, lon_end, "
+                                  "width_m, elevation_ft, icao")
+                          .eq("id", dest_user_runway_id)
+                          .single()
+                          .execute())
+                    if ur.data:
+                        d = ur.data
+                        lat_s, lat_e = d.get("lat_start"), d.get("lat_end")
+                        lon_s, lon_e = d.get("lon_start"), d.get("lon_end")
+                        if lat_s is not None and lon_s is not None:
+                            # Midpoint if we have both ends, else just start.
+                            if lat_e is not None and lon_e is not None:
+                                dest["lat"] = (lat_s + lat_e) / 2
+                                dest["lon"] = (lon_s + lon_e) / 2
+                            else:
+                                dest["lat"] = lat_s
+                                dest["lon"] = lon_s
+                            dest["name"] = d.get("name") or "User Runway"
+                            # Show the runway's ICAO if user supplied one,
+                            # otherwise fall back to the runway name as the
+                            # display label.
+                            dest["icao"] = (d.get("icao") or d.get("name") or "USR").upper()
+
+                            # Pack the runway geometry so the ribbon planner
+                            # can anchor on the actual axis. heading is the
+                            # bearing from start → end (so the plane lands
+                            # IN the direction the user drew); threshold is
+                            # the start point.
+                            if lat_e is not None and lon_e is not None:
+                                try:
+                                    from uav.nav.geo import (
+                                        bearing_deg, haversine_m,
+                                    )
+                                    hdg = bearing_deg(lat_s, lon_s, lat_e, lon_e)
+                                    length_m = haversine_m(
+                                        lat_s, lon_s, lat_e, lon_e
+                                    )
+                                    dest["runway"] = {
+                                        "source": "user_runway",
+                                        "id": dest_user_runway_id,
+                                        "designator": d.get("name") or "USR",
+                                        "heading": hdg,
+                                        "threshold_lat": lat_s,
+                                        "threshold_lon": lon_s,
+                                        "end_lat": lat_e,
+                                        "end_lon": lon_e,
+                                        "length_ft": length_m * 3.28084,
+                                        "width_m": d.get("width_m"),
+                                        "elevation_ft": d.get("elevation_ft"),
+                                    }
+                                except Exception as ge:
+                                    log.debug(
+                                        f"User runway geometry derive failed: {ge}"
+                                    )
+                            return dest
+                except Exception as e:
+                    log.debug(f"User runway resolve failed: {e}")
+                # If user_runway resolution failed, fall through to icao.
+
+            if dest_icao:
+                dest["icao"] = dest_icao
+                try:
+                    apt = (client.table("airports")
+                           .select("name, lat, lon")
+                           .eq("icao_code", dest_icao)
+                           .single()
+                           .execute())
+                    if apt.data:
+                        dest["name"] = apt.data["name"]
+                        dest["lat"] = apt.data["lat"]
+                        dest["lon"] = apt.data["lon"]
+                except Exception:
+                    pass
             return dest
     except Exception as e:
         log.debug(f"Fly command poll failed: {e}")

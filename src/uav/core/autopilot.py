@@ -157,43 +157,55 @@ class Autopilot:
             cruise_alt_agl = max(1500.0, min(5000.0, 55.0 * dist_nm))
             cruise_alt = dep_alt + cruise_alt_agl
 
-            # Look up destination runway
+            # Look up destination runway. User-drawn runways are packed
+            # into dest["runway"] by broadcast.poll_fly_command; for those
+            # we skip the SQL lookup entirely. Otherwise (published-airport
+            # destination) we fall back to the local SQLite runways table.
             dest_rwy_heading = None
             dest_thr_lat = None
             dest_thr_lon = None
             dest_alt_ft = dep_alt  # fallback
-            try:
-                import sqlite3, os
-                db = sqlite3.connect(os.path.expanduser("~/.peregrine/peregrine.db"))
-                db.row_factory = sqlite3.Row
-                rwys = db.execute("""
-                    SELECT r.*, a.elevation_ft as airport_elevation_ft FROM runways r
-                    JOIN airports a ON r.airport_id = a.id
-                    WHERE a.icao_code = ?
-                    ORDER BY r.length_ft DESC
-                """, (dest.get("icao", ""),)).fetchall()
-                if rwys:
-                    from uav.nav.geo import bearing_deg as _bd
-                    approach_brg = _bd(dep_lat, dep_lon, dest_lat, dest_lon)
-                    best_rwy = None
-                    best_diff = 999.0
-                    for rwy in rwys:
-                        hdg1 = float(rwy["heading_deg"])
-                        hdg2 = (hdg1 + 180.0) % 360.0
-                        for hdg, tlat, tlon in [
-                            (hdg1, rwy["threshold_lat"], rwy["threshold_lon"]),
-                            (hdg2, rwy["end_lat"], rwy["end_lon"]),
-                        ]:
-                            diff = abs(((approach_brg - hdg + 180) % 360) - 180)
-                            if diff < best_diff:
-                                best_diff = diff
-                                best_rwy = (hdg, float(tlat), float(tlon))
-                                dest_alt_ft = float(rwy["airport_elevation_ft"]) if rwy["airport_elevation_ft"] else dep_alt
-                    if best_rwy:
-                        dest_rwy_heading, dest_thr_lat, dest_thr_lon = best_rwy
-                db.close()
-            except Exception as e:
-                print(f"[PREVIEW] Runway lookup failed: {e}")
+
+            packed_rwy = dest.get("runway")
+            if packed_rwy:
+                dest_rwy_heading = packed_rwy.get("heading")
+                dest_thr_lat = packed_rwy.get("threshold_lat")
+                dest_thr_lon = packed_rwy.get("threshold_lon")
+                if packed_rwy.get("elevation_ft") is not None:
+                    dest_alt_ft = float(packed_rwy["elevation_ft"])
+            else:
+                try:
+                    import sqlite3, os
+                    db = sqlite3.connect(os.path.expanduser("~/.peregrine/peregrine.db"))
+                    db.row_factory = sqlite3.Row
+                    rwys = db.execute("""
+                        SELECT r.*, a.elevation_ft as airport_elevation_ft FROM runways r
+                        JOIN airports a ON r.airport_id = a.id
+                        WHERE a.icao_code = ?
+                        ORDER BY r.length_ft DESC
+                    """, (dest.get("icao", ""),)).fetchall()
+                    if rwys:
+                        from uav.nav.geo import bearing_deg as _bd
+                        approach_brg = _bd(dep_lat, dep_lon, dest_lat, dest_lon)
+                        best_rwy = None
+                        best_diff = 999.0
+                        for rwy in rwys:
+                            hdg1 = float(rwy["heading_deg"])
+                            hdg2 = (hdg1 + 180.0) % 360.0
+                            for hdg, tlat, tlon in [
+                                (hdg1, rwy["threshold_lat"], rwy["threshold_lon"]),
+                                (hdg2, rwy["end_lat"], rwy["end_lon"]),
+                            ]:
+                                diff = abs(((approach_brg - hdg + 180) % 360) - 180)
+                                if diff < best_diff:
+                                    best_diff = diff
+                                    best_rwy = (hdg, float(tlat), float(tlon))
+                                    dest_alt_ft = float(rwy["airport_elevation_ft"]) if rwy["airport_elevation_ft"] else dep_alt
+                        if best_rwy:
+                            dest_rwy_heading, dest_thr_lat, dest_thr_lon = best_rwy
+                    db.close()
+                except Exception as e:
+                    print(f"[PREVIEW] Runway lookup failed: {e}")
 
             # Prefer v_land (landing reference) over v_stall; default 77.
             v_stall = float(speeds.get("v_land", 77.0))
@@ -474,7 +486,12 @@ class Autopilot:
         if isinstance(self.mode_manager, FlightEngine):
             try:
                 from uav.nav.flight_plan_v2 import plan_path, format_ribbon
-                dest_rwy = ctx.get("dest_runway")
+                # Prefer dest["runway"] (user-drawn runway, packed in
+                # broadcast.poll_fly_command) before ctx["dest_runway"]
+                # (published-airport SQL lookup). Either one provides
+                # heading + threshold so the planner can anchor the
+                # landing chain on the real runway axis.
+                dest_rwy = dest.get("runway") or ctx.get("dest_runway")
                 rwy = self._runway_detection
 
                 # Prefer v_land (landing reference) over v_stall; default 77.
@@ -527,7 +544,10 @@ class Autopilot:
             # ── V1 flight plan (legacy) ──
             try:
                 from uav.nav.flight_plan import build_flight_plan, format_plan
-                dest_rwy = ctx.get("dest_runway")
+                # Same precedence as the V2 path: user-drawn runway
+                # (packed by broadcast) wins over the published-airport
+                # SQL lookup.
+                dest_rwy = dest.get("runway") or ctx.get("dest_runway") or {}
                 rwy = self._runway_detection
                 plan = build_flight_plan(
                     dep_lat=telemetry.lat_deg,
@@ -536,10 +556,10 @@ class Autopilot:
                     dep_heading=rwy.runway_heading_deg if rwy and rwy.detected else telemetry.heading_deg,
                     dest_lat=float(dest["lat"]),
                     dest_lon=float(dest["lon"]),
-                    dest_alt_ft=float(ctx.get("dest_runway", {}).get("elevation_ft", ground_msl_ft) or ground_msl_ft),
-                    dest_rwy_heading=ctx.get("dest_runway", {}).get("heading"),
-                    dest_threshold_lat=ctx.get("dest_runway", {}).get("threshold_lat"),
-                    dest_threshold_lon=ctx.get("dest_runway", {}).get("threshold_lon"),
+                    dest_alt_ft=float(dest_rwy.get("elevation_ft", ground_msl_ft) or ground_msl_ft),
+                    dest_rwy_heading=dest_rwy.get("heading"),
+                    dest_threshold_lat=dest_rwy.get("threshold_lat"),
+                    dest_threshold_lon=dest_rwy.get("threshold_lon"),
                     v_rotate=float(ctx["airframe"]["speeds_kts"].get("v_rotate", 90.0)),
                     v_climb=float(ctx["airframe"]["speeds_kts"].get("v_climb", 130.0)),
                     v_cruise=float(ctx["airframe"]["speeds_kts"].get("v_cruise", 200.0)),
@@ -780,17 +800,34 @@ class Autopilot:
                             "lon": float(dest["lon"]),
                         }
                         print(f"[COMMAND] Flying to {ctx['destination']['icao']}")
-                        # Look up the best runway at the destination for approach alignment
+
+                        # If broadcast already packed runway geometry
+                        # (user-drawn runway path), use it directly and
+                        # skip the SQL airport lookup entirely.
+                        if dest.get("runway"):
+                            ctx["dest_runway"] = dest["runway"]
+                            print(
+                                f"[NAV] Landing runway (user-drawn): "
+                                f"{dest['runway'].get('designator', 'USR')} "
+                                f"hdg {dest['runway']['heading']:.0f}° "
+                                f"len {dest['runway'].get('length_ft', 0):.0f}ft"
+                            )
+
+                        # Look up the best runway at the destination for approach alignment.
+                        # Skipped when broadcast already supplied user-drawn-runway geometry.
                         try:
-                            import sqlite3, os as _os
-                            _db = sqlite3.connect(_os.path.expanduser("~/.peregrine/peregrine.db"))
-                            _db.row_factory = sqlite3.Row
-                            rwys = _db.execute("""
-                                SELECT r.*, a.elevation_ft as airport_elevation_ft FROM runways r
-                                JOIN airports a ON r.airport_id = a.id
-                                WHERE a.icao_code = ?
-                                ORDER BY r.length_ft DESC
-                            """, (dest.get("icao", ""),)).fetchall()
+                            if dest.get("runway"):
+                                rwys = []
+                            else:
+                                import sqlite3, os as _os
+                                _db = sqlite3.connect(_os.path.expanduser("~/.peregrine/peregrine.db"))
+                                _db.row_factory = sqlite3.Row
+                                rwys = _db.execute("""
+                                    SELECT r.*, a.elevation_ft as airport_elevation_ft FROM runways r
+                                    JOIN airports a ON r.airport_id = a.id
+                                    WHERE a.icao_code = ?
+                                    ORDER BY r.length_ft DESC
+                                """, (dest.get("icao", ""),)).fetchall()
                             if rwys:
                                 # Pick the longest runway, use the heading closest to our approach bearing
                                 from uav.nav.geo import bearing_deg as _bd2
@@ -826,7 +863,10 @@ class Autopilot:
                                 if best_rwy:
                                     ctx["dest_runway"] = best_rwy
                                     print(f"[NAV] Landing runway: {best_rwy['designator']} hdg {best_rwy['heading']:.0f}° (approach diff {best_diff:.0f}°)")
-                            _db.close()
+                            # Only close the SQLite handle if we actually opened it
+                            # (skipped when broadcast already supplied user runway).
+                            if not dest.get("runway"):
+                                _db.close()
                         except Exception as e:
                             print(f"[NAV] Runway lookup failed: {e}")
                         # Compute fixed cruise altitude based on distance
