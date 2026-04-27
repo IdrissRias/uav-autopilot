@@ -87,6 +87,23 @@ _INTERCEPT_ANGLE_DEG = 30.0  # shallow intercept onto extended centerline
 _JOIN_MIN_OFFSET_NM = 3.0    # join point always ≥ 3 nm behind decel_start
 _JOIN_MAX_OFFSET_NM = 80.0   # cap so we don't fly wildly off course
 
+# When the single-leg geometric join would force a turn ≥ this many
+# degrees at the JOIN point, the planner switches from a single-leg
+# (CRUISE → INBOUND) pattern to a two-leg pattern (CRUISE → BASE_LEG
+# → INBOUND), inserting a BASE_TURN waypoint perpendicular to the
+# centerline on the dep's side. This produces two ~90° turns (still
+# well within the SF50's measured roll-limit envelope at cruise
+# speed) instead of one 120°+ elbow that the controllers can't
+# track. 60° is the empirical edge — above it, prior flights have
+# saturated R to ±1.0 and pulled 2g+. See flights 20260419_135940
+# and 20260419_145024.
+_MAX_SINGLE_LEG_TURN_DEG = 60.0
+# Minimum perpendicular offset of the BASE_TURN point from the
+# centerline. The actual offset matches the dep's perpendicular
+# distance when that's larger, so the cruise leg from dep to
+# BASE_TURN is roughly along-axis (small turn at BASE_TURN).
+_PATTERN_OFFSET_MIN_NM = 2.0
+
 
 # ═══ Data model ═════════════════════════════════════════════════════════
 
@@ -242,6 +259,15 @@ class Geometry:
     v_land: float
     gear_safe_kts: float
     flap_safe_kts: float
+    # Optional BASE_TURN point — populated only when the single-leg
+    # cruise→join geometry would produce a turn > _MAX_SINGLE_LEG_TURN_DEG
+    # at JOIN. When present, an extra BASE_LEG keyframe is inserted
+    # between CRUISE and INBOUND: CRUISE aims at BASE_TURN, BASE_LEG
+    # aims at JOIN, INBOUND aims at decel_start (unchanged). The two
+    # ~90° turns this produces stay inside the SF50's roll-limit
+    # envelope; the alternative 120°+ single-leg turn does not.
+    base_turn_lat: Optional[float] = None
+    base_turn_lon: Optional[float] = None
 
 
 # Legacy PathPoint retained for the map-preview list (`.points`).
@@ -313,33 +339,36 @@ def _decel_len_nm(v_from_kts: float, v_to_kts: float) -> float:
 
 # ═══ Join-point (intercept) ═══════════════════════════════════════════
 
-def _compute_join_point(
+def _compute_join_geometry(
     dep_lat: float, dep_lon: float,
     thr_lat: float, thr_lon: float,
     back_hdg: float,
     decel_lat: float, decel_lon: float,
-) -> tuple[float, float]:
-    """Point on the extended approach centerline where cruise meets final.
+) -> tuple[float, float, Optional[float], Optional[float]]:
+    """Returns (join_lat, join_lon, base_turn_lat | None, base_turn_lon | None).
 
-    The join is placed on the centerline such that the bearing from dep to
-    join differs from the runway heading by ~30° — standard IFR
-    vectored-approach intercept.  Flat-earth approximation around the
-    threshold; good enough for placements up to ~200 nm.
+    Two regimes:
+      1. **Single-leg join** (preferred): when geometry allows a 30°
+         intercept onto the extended centerline at a JOIN point that
+         sits behind the decel buffer, return only (join_lat, join_lon,
+         None, None).  Cruise → INBOUND, one turn at the join.
+      2. **Two-leg pattern** (fallback): when the single-leg turn at
+         the join would exceed _MAX_SINGLE_LEG_TURN_DEG (60°), insert
+         a BASE_TURN waypoint perpendicular to the centerline on the
+         dep's side.  The plane flies CRUISE → BASE_TURN (≈ along
+         centerline direction) → BASE_LEG (perpendicular to runway,
+         crossing onto centerline) → INBOUND.  Two ~90° turns instead
+         of one >60° elbow.
+
+    Flat-earth nm projection around the threshold; good to ~200 nm.
 
     Geometry:
         • t = along-track position from threshold, positive in back_hdg.
         • F = foot of perpendicular from dep onto the centerline.
         • d_perp = |dep − F|.
-        • Ideal join: t_J = t_F − d_perp / tan(30°).   [30° intercept]
+        • Ideal close 30° intercept: t_J = t_F − d_perp / tan(30°).
         • Clamp: t_decel + 3 nm ≤ t_J ≤ t_decel + 80 nm.
-
-    Degeneracy: when t_J falls inside the decel buffer (because dep is
-    too close to or past the threshold), the clamp forces a position
-    that no longer honours 30°.  We log a clear warning with the actual
-    intercept angle so the failure mode is visible — the right
-    long-term fix is a full traffic pattern (downwind → base → final)
-    inserted as extra keyframes, not a single-segment join.  See
-    ribbon-pattern-fix follow-up ticket.
+        • If clamped t_J produces turn-at-join > 60°: switch to pattern.
     """
     mean_lat_rad = math.radians((thr_lat + dep_lat) / 2.0)
     dep_e = (dep_lon - thr_lon) * 60.0 * math.cos(mean_lat_rad)
@@ -365,28 +394,50 @@ def _compute_join_point(
     t_join = max(t_ideal, t_min)
     t_join = min(t_join, t_max)
 
-    # Surface degenerate geometry. The actual intercept angle = atan2(
-    # d_perp, t_join - t_dep) — when t_join was clamped up from a
-    # negative t_ideal, this can easily exceed 90° → the plane has to
-    # do a sharp elbow at the join. Log it loudly so future flights
-    # can be planned (or a proper traffic-pattern fix can be wired).
-    if t_join != t_ideal and d_perp > 0.5:
-        actual_angle = math.degrees(
-            math.atan2(d_perp, abs(t_join - t_dep))
-        )
-        # Single-leg turn at the join = 180° - intercept_angle (because
-        # cruise approaches from one side, inbound goes opposite).
-        turn_at_join = 180.0 - actual_angle
-        print(
-            f"[RIBBON] WARNING: 30° intercept geometrically impossible — "
-            f"ideal t={t_ideal:.1f}nm violates clamp [{t_min:.1f},{t_max:.1f}]nm. "
-            f"Clamped to t={t_join:.1f}nm; actual intercept ≈ {actual_angle:.0f}°, "
-            f"turn at join ≈ {turn_at_join:.0f}°. Departure too close to "
-            f"or past the runway threshold for a single-leg join. A proper "
-            f"traffic pattern (downwind/base/final) is the long-term fix."
-        )
+    # Compute join lat/lon.
+    join_lat, join_lon = _dest_pt(thr_lat, thr_lon, back_hdg, t_join * 1852.0)
 
-    return _dest_pt(thr_lat, thr_lon, back_hdg, t_join * 1852.0)
+    # Estimate the actual turn at the JOIN for a single-leg path.
+    # cruise heading = bearing(dep, join); inbound heading = bearing(
+    # join, decel) ≈ rwy_hdg (since join is behind decel).
+    cruise_hdg = bearing_deg(dep_lat, dep_lon, join_lat, join_lon)
+    inbound_hdg = bearing_deg(join_lat, join_lon, decel_lat, decel_lon)
+    turn_at_join = abs(((cruise_hdg - inbound_hdg + 180.0) % 360.0) - 180.0)
+
+    if turn_at_join <= _MAX_SINGLE_LEG_TURN_DEG:
+        return (join_lat, join_lon, None, None)
+
+    # Two-leg pattern. Place BASE_TURN perpendicular to the centerline
+    # on the dep's side, at along-track t_join (so BASE_LEG is purely
+    # perpendicular to the runway). Pattern offset matches dep's
+    # perpendicular distance when reasonable, so CRUISE from dep to
+    # BASE_TURN is roughly along-axis (small turn at BASE_TURN).
+    pattern_offset = max(_PATTERN_OFFSET_MIN_NM, min(d_perp, 5.0))
+
+    # Unit perpendicular vector from foot-of-perp toward dep (in e/n).
+    if d_perp > 1e-6:
+        perp_ue = perp_e / d_perp
+        perp_un = perp_n / d_perp
+    else:
+        # Dep is exactly on centerline — pick an arbitrary side
+        # (right-hand normal of back_hdg).
+        perp_ue, perp_un = -un, ue
+
+    # BASE_TURN point on dep's side of centerline at along-track t_join.
+    base_e = t_join * ue + pattern_offset * perp_ue
+    base_n = t_join * un + pattern_offset * perp_un
+    base_lat = thr_lat + base_n / 60.0
+    base_lon = thr_lon + base_e / (60.0 * math.cos(mean_lat_rad))
+
+    # Diagnostic log so the pattern path is visible in flight logs.
+    print(
+        f"[RIBBON] Single-leg turn at JOIN would be {turn_at_join:.0f}° "
+        f"(> {_MAX_SINGLE_LEG_TURN_DEG:.0f}°). Inserting BASE_TURN at "
+        f"perp offset {pattern_offset:.1f}nm; pattern is now "
+        f"CRUISE → BASE → INBOUND with two ~90° turns."
+    )
+
+    return (join_lat, join_lon, base_lat, base_lon)
 
 
 # ═══ Geometry solver ═══════════════════════════════════════════════════
@@ -449,8 +500,10 @@ def _solve_geometry(
     # Join point: where cruise meets the extended centerline at a 30° angle.
     # Cruise aims here, then a short INBOUND leg runs along the centerline to
     # decel_start.  Prevents the 90° elbow that used to happen when dep was
-    # off the runway axis.
-    join_lat, join_lon = _compute_join_point(
+    # off the runway axis.  When a single-leg geometry would force a turn
+    # > 60° at JOIN, base_lat/lon are populated and an extra BASE_LEG
+    # keyframe is inserted by _build_keyframes.
+    join_lat, join_lon, base_lat, base_lon = _compute_join_geometry(
         dep_lat, dep_lon, thr_lat, thr_lon,
         back_hdg, decel_lat, decel_lon,
     )
@@ -472,14 +525,31 @@ def _solve_geometry(
         v_stall=v_stall, v_rotate=v_rot, v_cruise=v_cru,
         v_approach=v_app, v_land=v_land,
         gear_safe_kts=gear_safe, flap_safe_kts=flap_safe,
+        base_turn_lat=base_lat, base_turn_lon=base_lon,
     )
 
 
 # ═══ Keyframe builder ══════════════════════════════════════════════════
 
 def _build_keyframes(g: Geometry) -> List[Keyframe]:
-    """Emit the ~12-row flight plan."""
-    return [
+    """Emit the ~12-row flight plan.
+
+    When `g.base_turn_lat` is populated (close-in departure that can't
+    do a clean single-leg join), CLIMB_CLEAN / TRANSITION / CRUISE all
+    aim at BASE_TURN instead of JOIN, and an extra BASE_LEG keyframe
+    is inserted between CRUISE and INBOUND. This produces a proper
+    two-turn pattern (≈90° at BASE_TURN, ≈90° at JOIN) instead of
+    the single 120°+ elbow that wrecks the controllers.
+    """
+    # First cruise-and-climb target: BASE_TURN if pattern is active,
+    # otherwise JOIN.
+    has_base = (
+        g.base_turn_lat is not None and g.base_turn_lon is not None
+    )
+    cruise_aim_lat = g.base_turn_lat if has_base else g.join_lat
+    cruise_aim_lon = g.base_turn_lon if has_base else g.join_lon
+
+    keyframes: List[Keyframe] = [
         # ── 1. TAKEOFF_ROLL ──────────────────────────────────────────
         # Full throttle, flaps 0.5 for lift, hold runway heading with yaw
         # coordination.  Advances when airspeed crosses V_rotate.
@@ -535,7 +605,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             throttle_mode="explicit", throttle=0.95,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
-            aim_lat=g.join_lat, aim_lon=g.join_lon,
+            aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
             roll_limit=0.25,
             pitch_limit=0.20,
@@ -570,7 +640,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             target_speed_kts=g.v_cruise,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
-            aim_lat=g.join_lat, aim_lon=g.join_lon,
+            aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
             roll_limit=0.25,
             # Tight pitch bounds — we're level, accelerating. Neither PID
@@ -591,13 +661,13 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             target_speed_kts=g.v_cruise,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
-            aim_lat=g.join_lat, aim_lon=g.join_lon,
+            aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
             # Bank ≤ ~31° during intercept turn (observed 60° in flight
             # 135940 caused 2g at cruise speed). Pitch ≤ ~14° nose-up cap.
             roll_limit=0.35, pitch_limit=0.15,
             trigger=Trigger("near_point", value=1.0,
-                           lat=g.join_lat, lon=g.join_lon),
+                           lat=cruise_aim_lat, lon=cruise_aim_lon),
         ),
 
         # ── 6. INBOUND ───────────────────────────────────────────────
@@ -814,6 +884,37 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         ),
     ]
 
+    # When pattern flying is active (close-in dep), insert BASE_LEG
+    # between CRUISE (which now ends at BASE_TURN) and INBOUND. The
+    # plane crosses perpendicular to the runway centerline at cruise
+    # speed and altitude; INBOUND immediately picks up the descent
+    # countdown.
+    if has_base:
+        # Find the CRUISE keyframe index so we can splice in after it.
+        cruise_idx = next(
+            (i for i, k in enumerate(keyframes) if k.name == "CRUISE"),
+            -1,
+        )
+        if cruise_idx >= 0:
+            base_leg = Keyframe(
+                name="BASE_LEG", phase="CRUISE",
+                throttle_mode="speed_pid",
+                target_speed_kts=g.v_cruise,
+                alt_mode="target", target_alt_ft=g.cruise_alt_ft,
+                heading_mode="aim_at",
+                aim_lat=g.join_lat, aim_lon=g.join_lon,
+                gear_down=False, flap_ratio=0.0,
+                # Same bank cap as CRUISE — this is the second of the
+                # two ~90° pattern turns; controllers handle it the
+                # same way they handle any other aim_at leg.
+                roll_limit=0.35, pitch_limit=0.15,
+                trigger=Trigger("near_point", value=0.5,
+                               lat=g.join_lat, lon=g.join_lon),
+            )
+            keyframes.insert(cruise_idx + 1, base_leg)
+
+    return keyframes
+
 
 # ═══ Map preview (sparse points for app display) ═══════════════════════
 
@@ -837,18 +938,39 @@ def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
     pts.append(PathPoint(roll_lat, roll_lon, g.dep_alt_ft, g.v_rotate,
                          g.dep_heading, "GROUND", True, 0.5, 1.0))
 
-    # Climb+cruise: 5 points interpolated from takeoff end → join_point
-    # (where we meet the extended centerline at the 30° intercept).
+    # Climb+cruise: 5 points interpolated from takeoff end → first cruise
+    # target (BASE_TURN if pattern flying is active, otherwise JOIN).
     climb_start_lat, climb_start_lon = roll_lat, roll_lon
+    has_base = (
+        g.base_turn_lat is not None and g.base_turn_lon is not None
+    )
+    cruise_target_lat = g.base_turn_lat if has_base else g.join_lat
+    cruise_target_lon = g.base_turn_lon if has_base else g.join_lon
     for t in [0.1, 0.3, 0.5, 0.8, 1.0]:
-        lat = _interp(climb_start_lat, g.join_lat, t)
-        lon = _interp(climb_start_lon, g.join_lon, t)
+        lat = _interp(climb_start_lat, cruise_target_lat, t)
+        lon = _interp(climb_start_lon, cruise_target_lon, t)
         alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
-        hdg = bearing_deg(lat, lon, g.join_lat, g.join_lon)
+        hdg = bearing_deg(lat, lon, cruise_target_lat, cruise_target_lon)
         gear = t < 0.05
         flap = 0.5 if t < 0.2 else 0.0
         pts.append(PathPoint(lat, lon, alt, g.v_rotate * 1.3, hdg,
                              "CLIMB" if t < 0.95 else "CRUISE", gear, flap, 0.95))
+
+    # When pattern flying: BASE_LEG from BASE_TURN perpendicular across
+    # to JOIN, then INBOUND straight along centerline to decel_start.
+    if has_base:
+        base_to_join_hdg = bearing_deg(
+            g.base_turn_lat, g.base_turn_lon, g.join_lat, g.join_lon
+        )
+        # Mid-base point so the polyline shows the cross-leg explicitly.
+        mid_lat = _interp(g.base_turn_lat, g.join_lat, 0.5)
+        mid_lon = _interp(g.base_turn_lon, g.join_lon, 0.5)
+        pts.append(PathPoint(mid_lat, mid_lon, g.cruise_alt_ft,
+                             g.v_approach * 1.6, base_to_join_hdg,
+                             "CRUISE", False, 0.0, 0.0))
+        pts.append(PathPoint(g.join_lat, g.join_lon, g.cruise_alt_ft,
+                             g.v_approach * 1.6, base_to_join_hdg,
+                             "CRUISE", False, 0.0, 0.0))
 
     # Inbound: straight leg from join_point → decel_start along centerline
     pts.append(PathPoint(g.decel_start_lat, g.decel_start_lon, g.cruise_alt_ft,
