@@ -45,7 +45,14 @@ _RATIO_V_APPROACH = 1.08
 _RATIO_V_LAND = 1.00
 _RATIO_GEAR_SAFE = 1.30
 _RATIO_FLAP_SAFE = 1.50
-_RATIO_V_CRUISE = 2.0        # cruise target speed — throttle PID holds this
+_RATIO_V_CRUISE = 1.5        # cruise target speed — was 2.0 which produced
+# v_cruise = 196 kts (when v_stall = 98), miles above the SF50's actual
+# observed cruise of ~133 kts. The mismatch drove the throttle PID to
+# 100% saturation during cruise/transition, which the alt PID couldn't
+# counteract via its capped pitch-down, so the plane climbed thousands
+# of feet over target. 1.5 × v_stall ≈ 147 kts — comfortably within
+# the airframe's clean-config range and close to the envelope's
+# observed value.
 
 _GLIDE_FT_PER_NM = 1000.0   # ~9.4° glideslope — doubled from 500 ft/nm to
 # halve the descent footprint per user request. The SF50 can dive at this
@@ -715,11 +722,16 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
             roll_limit=0.25,
-            # Tight pitch bounds — we're level, accelerating. Neither PID
-            # is allowed to saturate large pitch commands during the
-            # speed build-up. Alt PID handles small alt drift; speed PID
-            # does the real work via throttle.
-            pitch_limit=0.08, pitch_down_limit=0.08,
+            # Pitch_down widened from 0.08 → 0.40. The previous 0.08 cap
+            # meant when the plane was over-altitude (e.g. CLIMB
+            # overshoot, classic decoupled-PID failure where speed PID
+            # at 100% throttle out-pumps the alt PID's capped nose-down),
+            # the alt PID could only command 5° nose-down — not enough
+            # to bleed energy faster than the speed PID was adding it.
+            # Plane climbed forever. Observed: 8000 ft over target at
+            # 100% throttle. New 0.40 (~24° nose-down) lets the plane
+            # actually descend when it needs to.
+            pitch_limit=0.08, pitch_down_limit=0.40,
             trigger=Trigger("speed_gte", value=g.v_cruise - 5.0),
         ),
 
