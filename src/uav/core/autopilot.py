@@ -713,11 +713,14 @@ class Autopilot:
                 elif time.time() >= status_next:
                     print(f"[WAIT-FOR-FLY] No valid telemetry: alt={telemetry.altitude_ft} hdg={telemetry.heading_deg} pos={telemetry.lat_deg},{telemetry.lon_deg}")
 
-                # Heartbeat so the app knows we're alive
+                # Heartbeat so the app knows we're alive.
+                # Do NOT include `status` here — the app writes
+                # `status="fly_requested"` on FLY click, and a 5-sec
+                # heartbeat with `status="preflight"` would race-overwrite
+                # the click before the poll picks it up.
                 if self._aircraft_id and time.time() >= self._heartbeat_next:
                     self._heartbeat_next = time.time() + 5.0
                     hb = {
-                        "status": "preflight",
                         "last_lat": telemetry.lat_deg if telemetry.has_position() else 0.0,
                         "last_lon": telemetry.lon_deg if telemetry.has_position() else 0.0,
                         "last_heading": round(telemetry.heading_deg, 1),
@@ -928,11 +931,12 @@ class Autopilot:
                                          brake_ratio=1.0, gear_down=True)
                     self._safe_write(idle_act)
 
-                    # Still send heartbeat so app knows we're alive
+                    # Still send heartbeat so app knows we're alive.
+                    # `status` omitted — see other heartbeat site for
+                    # the race-condition rationale.
                     if self._aircraft_id and time.time() >= self._heartbeat_next:
                         self._heartbeat_next = time.time() + 5.0
                         hb = {
-                            "status": "preflight",
                             "last_lat": telemetry.lat_deg if telemetry.has_position() else 0.0,
                             "last_lon": telemetry.lon_deg if telemetry.has_position() else 0.0,
                             "last_heading": round(telemetry.heading_deg, 1),

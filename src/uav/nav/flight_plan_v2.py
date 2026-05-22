@@ -316,6 +316,74 @@ def _dest_pt(lat: float, lon: float, bearing: float, dist_m: float) -> tuple[flo
     return math.degrees(lat2), math.degrees(lon2)
 
 
+def _bezier_corner(
+    in_lat: float, in_lon: float,
+    vertex_lat: float, vertex_lon: float,
+    out_lat: float, out_lon: float,
+    n_steps: int = 20,
+) -> list:
+    """Quadratic Bézier arc through `n_steps` interior points from
+    (in_lat, in_lon) to (out_lat, out_lon), bending toward the corner
+    vertex (vertex_lat, vertex_lon).
+
+    The curve never actually reaches the vertex — that's the whole
+    point: the polyline visits a smooth arc instead of a sharp elbow,
+    which the L1 follower can chase without the plane banking
+    impossibly hard. Used to round corners at BASE_TURN, JOIN, and
+    the lift-off corner.
+
+    Returns interior points only (t = 1/(n+1) … n/(n+1)); the caller
+    already has the in and out endpoints.
+    """
+    pts = []
+    for i in range(1, n_steps + 1):
+        t = i / (n_steps + 1)
+        u = 1.0 - t
+        lat = u * u * in_lat + 2.0 * u * t * vertex_lat + t * t * out_lat
+        lon = u * u * in_lon + 2.0 * u * t * vertex_lon + t * t * out_lon
+        pts.append((lat, lon))
+    return pts
+
+
+def _course_reversal_arc(
+    start_lat: float, start_lon: float,
+    initial_brg_deg: float, target_brg_deg: float,
+    turn_radius_nm: float,
+    n_steps: int = 24,
+) -> list:
+    """Dubins-style true circular arc from `start` heading
+    `initial_brg_deg`, turning to end up heading `target_brg_deg`,
+    with the plane's actual turn radius. Picks left or right turn
+    automatically — whichever requires less rotation. Returns interior
+    arc points (start point not included).
+
+    Used for the lift-off corner when the departure heading and the
+    cruise direction differ by enough that a quadratic Bézier would
+    degenerate (>~120°). A real arc has constant curvature the plane
+    can fly at a fixed bank angle.
+    """
+    delta = ((target_brg_deg - initial_brg_deg + 540.0) % 360.0) - 180.0
+    if abs(delta) < 1e-3:
+        return []
+    turn_sign = 1.0 if delta > 0 else -1.0
+    total_turn_rad = math.radians(abs(delta))
+    perp_brg = (initial_brg_deg + 90.0 * turn_sign) % 360.0
+    centre_lat, centre_lon = _dest_pt(
+        start_lat, start_lon, perp_brg, turn_radius_nm * 1852.0,
+    )
+    # bearing from centre back to the start point
+    bearing_to_start = (perp_brg + 180.0) % 360.0
+    pts = []
+    for i in range(1, n_steps + 1):
+        t = i / n_steps
+        ang = (bearing_to_start
+               + turn_sign * math.degrees(total_turn_rad) * t) % 360.0
+        pt = _dest_pt(centre_lat, centre_lon, ang,
+                      turn_radius_nm * 1852.0)
+        pts.append(pt)
+    return pts
+
+
 def _interp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
@@ -938,47 +1006,168 @@ def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
     pts.append(PathPoint(roll_lat, roll_lon, g.dep_alt_ft, g.v_rotate,
                          g.dep_heading, "GROUND", True, 0.5, 1.0))
 
-    # Climb+cruise: 5 points interpolated from takeoff end → first cruise
-    # target (BASE_TURN if pattern flying is active, otherwise JOIN).
+    # Climb+cruise: targets BASE_TURN if pattern flying is active,
+    # otherwise JOIN. We use either a Dubins-style true circular arc
+    # (when the lift-off corner exceeds 90°, e.g. departure heading
+    # is ~opposite the cruise heading) or a Bézier-smoothed corner
+    # (gentler turns) before settling into a straight climb to
+    # cruise_target. This is the trio: Bellman (the whole geometry
+    # is backward-solved from the threshold), Bézier (small-angle
+    # corners), Dubins (large-angle turns at the plane's actual
+    # turn radius).
     climb_start_lat, climb_start_lon = roll_lat, roll_lon
     has_base = (
         g.base_turn_lat is not None and g.base_turn_lon is not None
     )
     cruise_target_lat = g.base_turn_lat if has_base else g.join_lat
     cruise_target_lon = g.base_turn_lon if has_base else g.join_lon
-    for t in [0.1, 0.3, 0.5, 0.8, 1.0]:
-        lat = _interp(climb_start_lat, cruise_target_lat, t)
-        lon = _interp(climb_start_lon, cruise_target_lon, t)
-        alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
-        hdg = bearing_deg(lat, lon, cruise_target_lat, cruise_target_lon)
-        gear = t < 0.05
-        flap = 0.5 if t < 0.2 else 0.0
-        pts.append(PathPoint(lat, lon, alt, g.v_rotate * 1.3, hdg,
-                             "CLIMB" if t < 0.95 else "CRUISE", gear, flap, 0.95))
+
+    # Heading from end-of-roll toward cruise_target. If this differs
+    # from dep_heading by > 120°, a quadratic Bézier degenerates
+    # (the curve loops back through the vertex). For those cases we
+    # fly a true circular arc at the SF50's turn radius at climb
+    # speed (~0.5 nm at 20° bank, 100 kts). Otherwise we use a Bézier
+    # corner with the vertex at the climb-start point.
+    target_brg = bearing_deg(climb_start_lat, climb_start_lon,
+                             cruise_target_lat, cruise_target_lon)
+    delta_brg = abs(((target_brg - g.dep_heading + 540.0) % 360.0) - 180.0)
+
+    if delta_brg > 120.0:
+        # ── Dubins lift-off arc ────────────────────────────────────
+        arc_pts = _course_reversal_arc(
+            climb_start_lat, climb_start_lon,
+            g.dep_heading, target_brg,
+            turn_radius_nm=0.5,
+            n_steps=16,
+        )
+        # Interpolate altitude linearly across the arc + the straight
+        # climb that follows. Total length ≈ arc + straight; we use
+        # the arc length as a fraction of total.
+        arc_pts_count = len(arc_pts)
+        for i, (alat, alon) in enumerate(arc_pts):
+            t = (i + 1) / (arc_pts_count + 8)  # 8 straight points after
+            alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
+            pts.append(PathPoint(alat, alon, alt, g.v_rotate * 1.3,
+                                 target_brg, "CLIMB", False, 0.5, 0.95))
+        # After the arc, plane is aligned with target_brg at some
+        # point near the original takeoff. Walk a straight climb from
+        # the last arc point to the cruise_target.
+        last_lat, last_lon = arc_pts[-1] if arc_pts else (climb_start_lat, climb_start_lon)
+        for i in range(1, 9):
+            t = i / 8.0
+            lat = _interp(last_lat, cruise_target_lat, t)
+            lon = _interp(last_lon, cruise_target_lon, t)
+            # Map back into the global progress for altitude
+            global_t = (arc_pts_count + i) / (arc_pts_count + 8)
+            alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, global_t)
+            hdg = bearing_deg(lat, lon, cruise_target_lat, cruise_target_lon)
+            gear = False
+            flap = 0.0
+            pts.append(PathPoint(lat, lon, alt, g.v_rotate * 1.3, hdg,
+                                 "CLIMB" if global_t < 0.95 else "CRUISE",
+                                 gear, flap, 0.95))
+    else:
+        # ── Bézier lift-off corner (small angle) ───────────────────
+        # Pull the curve away from the straight line slightly so the
+        # plane starts its turn after climbing a bit. Vertex = a point
+        # a third of the way along the straight line, biased toward
+        # the takeoff direction. For small deltas this is essentially
+        # the straight line; for moderate deltas it rounds the corner.
+        vertex_lat = _interp(climb_start_lat, cruise_target_lat, 0.33)
+        vertex_lon = _interp(climb_start_lon, cruise_target_lon, 0.33)
+        bezier_pts = _bezier_corner(
+            climb_start_lat, climb_start_lon,
+            vertex_lat, vertex_lon,
+            cruise_target_lat, cruise_target_lon,
+            n_steps=12,
+        )
+        for i, (blat, blon) in enumerate(bezier_pts):
+            t = (i + 1) / (len(bezier_pts) + 1)
+            alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
+            hdg = bearing_deg(blat, blon, cruise_target_lat, cruise_target_lon)
+            gear = t < 0.05
+            flap = 0.5 if t < 0.2 else 0.0
+            pts.append(PathPoint(blat, blon, alt, g.v_rotate * 1.3, hdg,
+                                 "CLIMB" if t < 0.95 else "CRUISE",
+                                 gear, flap, 0.95))
 
     # When pattern flying: BASE_LEG from BASE_TURN perpendicular across
     # to JOIN, then INBOUND straight along centerline to decel_start.
+    # We smooth the BASE_TURN corner (climb arrives heading toward
+    # BASE_TURN, then turns to base_to_join_hdg) with a Bézier whose
+    # vertex sits AT the BASE_TURN point — the path approaches it,
+    # bends around it, and leaves toward the join.
     if has_base:
         base_to_join_hdg = bearing_deg(
             g.base_turn_lat, g.base_turn_lon, g.join_lat, g.join_lon
         )
-        # Mid-base point so the polyline shows the cross-leg explicitly.
-        mid_lat = _interp(g.base_turn_lat, g.join_lat, 0.5)
-        mid_lon = _interp(g.base_turn_lon, g.join_lon, 0.5)
-        pts.append(PathPoint(mid_lat, mid_lon, g.cruise_alt_ft,
-                             g.v_approach * 1.6, base_to_join_hdg,
-                             "CRUISE", False, 0.0, 0.0))
+        # In-point: end of the climb (cruise_target = BASE_TURN here).
+        # Out-point: a fraction of the way toward JOIN.
+        out_lat = _interp(g.base_turn_lat, g.join_lat, 0.5)
+        out_lon = _interp(g.base_turn_lon, g.join_lon, 0.5)
+        # Approach point: a fraction back from BASE_TURN along the
+        # climb direction (we already arrived there, so use the
+        # previous point's bearing).
+        approach_t = 0.8
+        in_lat = _interp(climb_start_lat, g.base_turn_lat, approach_t)
+        in_lon = _interp(climb_start_lon, g.base_turn_lon, approach_t)
+        base_corner = _bezier_corner(
+            in_lat, in_lon,
+            g.base_turn_lat, g.base_turn_lon,  # vertex = the corner point
+            out_lat, out_lon,
+            n_steps=10,
+        )
+        for blat, blon in base_corner:
+            pts.append(PathPoint(blat, blon, g.cruise_alt_ft,
+                                 g.v_approach * 1.6, base_to_join_hdg,
+                                 "CRUISE", False, 0.0, 0.0))
+        # Then straight from out-point to JOIN.
         pts.append(PathPoint(g.join_lat, g.join_lon, g.cruise_alt_ft,
                              g.v_approach * 1.6, base_to_join_hdg,
                              "CRUISE", False, 0.0, 0.0))
+
+    # ── JOIN corner (Bézier) ──────────────────────────────────────
+    # Plane is heading along base_to_join_hdg arriving at JOIN, needs
+    # to turn to rwy_heading for INBOUND. Smooth this corner too.
+    if has_base:
+        join_in_brg = base_to_join_hdg
+    else:
+        # Without base-leg pattern, climb arrives directly at JOIN.
+        join_in_brg = bearing_deg(climb_start_lat, climb_start_lon,
+                                  g.join_lat, g.join_lon)
+    delta_join = abs(((g.rwy_heading - join_in_brg + 540.0) % 360.0) - 180.0)
+    if delta_join > 5.0:
+        # Bézier around JOIN: approach point sits a fraction back
+        # along the incoming heading; out point a fraction along the
+        # outgoing centerline.
+        approach_pt = _dest_pt(g.join_lat, g.join_lon,
+                               (join_in_brg + 180.0) % 360.0,
+                               0.4 * 1852.0)  # 0.4 nm back
+        out_pt = _dest_pt(g.join_lat, g.join_lon,
+                          g.rwy_heading, 0.4 * 1852.0)  # 0.4 nm forward
+        join_corner = _bezier_corner(
+            approach_pt[0], approach_pt[1],
+            g.join_lat, g.join_lon,
+            out_pt[0], out_pt[1],
+            n_steps=10,
+        )
+        for blat, blon in join_corner:
+            pts.append(PathPoint(blat, blon, g.cruise_alt_ft,
+                                 g.v_approach * 1.6, g.rwy_heading,
+                                 "CRUISE", False, 0.0, 0.0))
 
     # Inbound: straight leg from join_point → decel_start along centerline
     pts.append(PathPoint(g.decel_start_lat, g.decel_start_lon, g.cruise_alt_ft,
                          g.v_approach * 1.6, g.rwy_heading, "CRUISE",
                          False, 0.0, 0.0))
 
-    # Descent leg: 4 points from descent_start → approach_start
-    for t in [0.25, 0.50, 0.75, 1.0]:
+    # Descent leg: 16 points from descent_start → approach_start.
+    # Dense sampling (was 4) for future obstacle-avoidance work — the
+    # finer the polyline, the smaller the segment a re-router can
+    # tweak around a terrain bump. Altitude stays linearly interpolated
+    # (constant flight-path angle); only the sample count changed.
+    for i in range(1, 17):
+        t = i / 16.0
         lat = _interp(g.descent_start_lat, g.approach_start_lat, t)
         lon = _interp(g.descent_start_lon, g.approach_start_lon, t)
         alt = _interp(g.cruise_alt_ft, g.approach_start_alt_ft, t)
@@ -987,8 +1176,9 @@ def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
         pts.append(PathPoint(lat, lon, alt, g.v_approach * 1.2, g.rwy_heading,
                              "DESCENT", gear, flap, 0.40))
 
-    # Approach: 3 points from approach_start → flare_start
-    for t in [0.33, 0.66, 1.0]:
+    # Approach: 10 points from approach_start → flare_start (was 3).
+    for i in range(1, 11):
+        t = i / 10.0
         lat = _interp(g.approach_start_lat, g.flare_start_lat, t)
         lon = _interp(g.approach_start_lon, g.flare_start_lon, t)
         alt = _interp(g.approach_start_alt_ft, g.thr_alt_ft + _FLARE_ALT_AGL_FT, t)
