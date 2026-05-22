@@ -169,7 +169,25 @@ class Trigger:
             d_nm = haversine_m(
                 telemetry.lat_deg, telemetry.lon_deg, self.lat, self.lon,
             ) / 1852.0
-            return d_nm <= self.value
+            if d_nm <= self.value:
+                return True
+            # Also fire if we've crossed PAST the point. The L1 ribbon
+            # follower steers the polyline, not the raw aim point — it can
+            # sail wide of cruise_aim by more than the radius, leaving the
+            # trigger forever unfulfilled (flight 20260522_085103 flew 16 nm
+            # past cruise_aim in CRUISE before being killed). "Past" =
+            # bearing-to-point is >90° off plane heading. Capped at 5×radius
+            # so a stray heading swing during cross-track correction at long
+            # range can't false-fire.
+            if (not math.isnan(telemetry.heading_deg)
+                    and d_nm < max(5.0, self.value * 5.0)):
+                brg = bearing_deg(
+                    telemetry.lat_deg, telemetry.lon_deg, self.lat, self.lon,
+                )
+                ang = abs(((brg - telemetry.heading_deg + 180.0) % 360.0) - 180.0)
+                if ang > 90.0:
+                    return True
+            return False
         return False
 
     def describe(self) -> str:
