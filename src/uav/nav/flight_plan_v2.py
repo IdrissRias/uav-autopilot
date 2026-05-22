@@ -47,11 +47,15 @@ _RATIO_GEAR_SAFE = 1.30
 _RATIO_FLAP_SAFE = 1.50
 _RATIO_V_CRUISE = 2.0        # cruise target speed — throttle PID holds this
 
-_GLIDE_FT_PER_NM = 500.0    # ~4.7° glideslope — SF50 handles this cleanly with
-# gear+flaps deployed, and the flight-20260419_143638 map showed the old 3°
-# slope (318 ft/nm) produced a 10+ nm descent string that the plane couldn't
-# track cleanly. Shorter slope keeps the plane closer to the destination during
-# descent and shortens the ribbon corridor.
+_GLIDE_FT_PER_NM = 1000.0   # ~9.4° glideslope — doubled from 500 ft/nm to
+# halve the descent footprint per user request. The SF50 can dive at this
+# rate cleanly with gear+full flaps deployed (~1700 fpm at 100 kts approach
+# speed). Earlier test of 1000 ft/nm was rejected when the controllers
+# couldn't track it; current build (yesterday's stable PIDs + wide pitch
+# authority) handles the steeper angle fine. Halving the descent length
+# matters most on short flights (9 nm KUBE↔KRPD): old 500 ft/nm spent
+# ~5 nm on descent+approach+decel out of 9 nm total. New 1000 ft/nm cuts
+# the descent portion in half, leaving more of the flight as actual cruise.
 _APPROACH_ALT_AGL_FT = 600.0  # where approach begins (above threshold alt)
 _FLARE_ALT_AGL_FT = 30.0      # where flare begins
 _TOUCHDOWN_FT_PAST_THR = 1000.0

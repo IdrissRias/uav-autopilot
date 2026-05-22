@@ -253,11 +253,16 @@ class FlightEngine:
 
         # ── Altitude ─────────────────────────────────────────────────
         if kf.alt_mode == "glideslope" and t.has_position():
-            # Glideslope altitude: threshold_alt + 3° × distance_to_threshold.
+            # Glideslope altitude: threshold_alt + slope × distance_to_threshold.
+            # Slope MUST match the planner's _GLIDE_FT_PER_NM, otherwise the
+            # ribbon's descent waypoints and the engine's commanded alt
+            # disagree and the alt PID fights itself. Imported from the
+            # planner module so the single source of truth lives there.
+            #
             # Sign-aware: if plane has passed the threshold (we're on the
             # runway-heading side), clamp d_nm to 0 so we don't command a
-            # climb-back (bug that had us floating up past the airport).
-            # Capped at cruise_alt as an upper bound.
+            # climb-back. Capped at cruise_alt as an upper bound.
+            from uav.nav.flight_plan_v2 import _GLIDE_FT_PER_NM as _SLOPE_FT_PER_NM
             d_nm = haversine_m(t.lat_deg, t.lon_deg,
                                g.thr_lat, g.thr_lon) / 1852.0
             brng_from_thr = bearing_deg(g.thr_lat, g.thr_lon,
@@ -268,7 +273,7 @@ class FlightEngine:
             if ang_diff > 90.0:
                 # Plane is on the runway-departing side of threshold.
                 d_nm = 0.0
-            alt = g.thr_alt_ft + d_nm * 318.0
+            alt = g.thr_alt_ft + d_nm * _SLOPE_FT_PER_NM
             alt = min(alt, g.cruise_alt_ft)
             # During FLARE, clamp so we don't command negative AGL
             if kf.phase == "FLARE":
