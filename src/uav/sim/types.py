@@ -70,6 +70,13 @@ class Targets:
     yaw_hold: bool | None = None
     yaw_kp: float | None = None
     yaw_limit: float | None = None
+    # Throttle-for-altitude coupling. When True, the controller drives
+    # throttle off the alt error (alt-priority: power for altitude)
+    # and pitch off the speed error (attitude for airspeed). Default
+    # False = classic decoupled (alt→pitch, speed→throttle). Enabled
+    # on cruise/descent phases so the engine modulates to defend alt
+    # rather than chasing speed past the target.
+    throttle_for_alt: bool = False
 
 
 class Mode(str, Enum):

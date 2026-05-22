@@ -120,24 +120,54 @@ class SimpleFixedWingController(Controller):
         roll_cmd = g.bank_inner_kp * bank_error - g.bank_inner_kd * bank_rate
         roll_cmd = _clamp(roll_cmd, 1.0)  # hardware truth
 
-        # ── Altitude → Pitch ─────────────────────────────────────────
-        pitch_cmd = self.altitude_pid.update(alt_error, dt)
+        # ── Pitch + throttle: which loop drives what depends on the
+        # coupling mode.
+        #
+        #   Default (classic):    alt PID → pitch, speed PID → throttle
+        #   throttle_for_alt:     alt PID → throttle, speed PID → pitch
+        #                         (alt-priority "power for altitude"
+        #                          coupling — used in cruise/descent so
+        #                          the throttle defends alt instead of
+        #                          chasing speed past target alt).
+        #
+        # Both modes use the same PID instances but feed errors to
+        # different actuators. When swapping (throttle_for_alt=True),
+        # the speed PID's integral can be poisoned by climb-phase
+        # windup, so we use a PROPORTIONAL-ONLY response for the
+        # swapped paths (gains picked to match the original PID's
+        # full-strength response at typical errors).
+        if targets.throttle_for_alt:
+            # Speed → Pitch (P-only, sign-inverted)
+            #   spd_err > 0 (too slow) → pitch_cmd < 0 (nose-down → gain speed)
+            #   spd_err < 0 (too fast) → pitch_cmd > 0 (nose-up → bleed speed)
+            SPEED_TO_PITCH_KP = 0.015  # 10 kts → 0.15 pitch (~9°)
+            pitch_cmd = -spd_error * SPEED_TO_PITCH_KP
+        else:
+            pitch_cmd = self.altitude_pid.update(alt_error, dt)
 
         # Commander-issued pitch clamp. Nose-up cap is always honored; nose-down
-        # cap is opt-in (only honored if pitch_down_limit is set, so phases
-        # that need full nose-down authority for stall recovery are unaffected).
-        # Descent keyframes set pitch_down_limit to prevent a glideslope-chase
-        # dive from converting altitude into speed past structural limits.
+        # cap is opt-in.
         if targets.pitch_limit is not None:
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
         if targets.pitch_down_limit is not None:
             pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
         pitch_cmd = _clamp(pitch_cmd, 1.0)  # hardware truth
 
-        # ── Speed → Throttle ─────────────────────────────────────────
-        # If ribbon commanded throttle directly, honor it. Otherwise PID.
+        # ── Throttle ─────────────────────────────────────────────────
         if targets.throttle is not None:
+            # Explicit throttle from ribbon (e.g. CLIMB full, FLARE idle)
             throttle_cmd = targets.throttle
+        elif targets.throttle_for_alt:
+            # Alt → Throttle (P-only)
+            #   alt_err > 0 (below target) → throttle UP
+            #   alt_err < 0 (above target) → throttle DOWN
+            # Kp = 3 × the altitude_pid Kp (~0.003 per ft of alt error)
+            # so 100 ft below target = 0.3 throttle delta from baseline,
+            # 300 ft below = saturated to full. Within the throttle's
+            # 0–1 range this gives crisp recovery without integral
+            # windup carrying over from earlier phases.
+            ALT_TO_THROTTLE_KP = 0.003
+            throttle_cmd = self.cruise_throttle + alt_error * ALT_TO_THROTTLE_KP
         else:
             throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(spd_error, dt)
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth

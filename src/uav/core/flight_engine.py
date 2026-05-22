@@ -324,6 +324,7 @@ class FlightEngine:
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
+            throttle_for_alt=kf.throttle_for_alt,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────

@@ -231,6 +231,12 @@ class Keyframe:
     yaw_kp: Optional[float] = None
     yaw_limit: Optional[float] = None
 
+    # Throttle-for-altitude coupling. When True, the controller swaps:
+    # throttle ← alt PID (power for altitude), pitch ← speed PID
+    # (attitude for airspeed). Use on phases where alt is the priority
+    # and we don't want the speed PID pushing throttle past target alt.
+    throttle_for_alt: bool = False
+
     # Trigger that advances to the next keyframe
     trigger: Trigger = field(default_factory=lambda: Trigger("never"))
 
@@ -716,6 +722,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="TRANSITION", phase="CRUISE",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,  # alt priority — engine defends target alt
             target_speed_kts=g.v_cruise,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
@@ -742,6 +749,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="CRUISE", phase="CRUISE",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,  # alt priority
             target_speed_kts=g.v_cruise,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
@@ -760,6 +768,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="INBOUND", phase="CRUISE",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,
             target_speed_kts=g.v_cruise,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
@@ -812,6 +821,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="DESCENT", phase="DESCENT",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,  # throttle defends the glideslope alt
             target_speed_kts=g.flap_safe_kts,  # hold ~115 kts during clean descent
             alt_mode="glideslope",
             heading_mode="aim_at",
@@ -850,6 +860,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="DESCENT_FLAP", phase="DESCENT",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,
             target_speed_kts=g.gear_safe_kts,  # bleed from ~115 to ~100 kts
             alt_mode="glideslope",
             heading_mode="aim_at",
@@ -894,6 +905,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="DESCENT_GEAR", phase="DESCENT",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,
             target_speed_kts=g.v_approach,  # stabilise at ~83 kts before flare
             alt_mode="glideslope",
             heading_mode="aim_at",
@@ -916,6 +928,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="APPROACH", phase="APPROACH",
             throttle_mode="speed_pid",
+            throttle_for_alt=True,  # power for altitude on final approach
             target_speed_kts=g.v_approach,
             alt_mode="glideslope",
             heading_mode="aim_at",
@@ -1022,24 +1035,57 @@ def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
     pts.append(PathPoint(roll_lat, roll_lon, g.dep_alt_ft, g.v_rotate,
                          g.dep_heading, "GROUND", True, 0.5, 1.0))
 
-    # Climb+cruise: straight line from takeoff end → first cruise
-    # target (BASE_TURN if pattern flying is active, otherwise JOIN).
-    # Earlier attempt at adding Bézier corners and Dubins course-
-    # reversal arcs here produced an ugly loop near the destination
-    # when combined with the BASE_LEG insertion (the planner's own
-    # two-turn pattern already smooths the geometry). The helpers
-    # (_bezier_corner, _course_reversal_arc) are kept in the module
-    # for future use but no longer called from the path generation.
+    # Climb+cruise: Bézier-smoothed lift-off corner when the
+    # departure-to-cruise heading delta is non-trivial, otherwise a
+    # straight line. The earlier failure was stacking Bézier at the
+    # lift-off AND at BASE_TURN AND at JOIN — three corner arcs
+    # interacted with the BASE_LEG insertion to produce a visible
+    # loop. Now only the lift-off gets smoothed; the rest of the
+    # geometry trusts BASE_LEG / INBOUND straight legs.
     climb_start_lat, climb_start_lon = roll_lat, roll_lon
     has_base = (
         g.base_turn_lat is not None and g.base_turn_lon is not None
     )
     cruise_target_lat = g.base_turn_lat if has_base else g.join_lat
     cruise_target_lon = g.base_turn_lon if has_base else g.join_lon
-    for i in range(1, 13):
-        t = i / 12.0
-        lat = _interp(climb_start_lat, cruise_target_lat, t)
-        lon = _interp(climb_start_lon, cruise_target_lon, t)
+
+    # Lift-off heading vs the bearing toward cruise_target.
+    target_brg = bearing_deg(climb_start_lat, climb_start_lon,
+                             cruise_target_lat, cruise_target_lon)
+    delta_brg = abs(((target_brg - g.dep_heading + 540.0) % 360.0) - 180.0)
+
+    # If the corner is ≥ 15° we route through a Bézier whose vertex
+    # sits a short way ahead on the runway heading — the curve leaves
+    # the runway aligned with takeoff direction, bends, then settles
+    # onto the climb line toward cruise_target. This eliminates the
+    # sharp visual corner at lift-off and gives the L1 follower a
+    # smooth path to chase. For straight-on departures (< 15°) we
+    # skip the Bézier and just go straight; cheaper and visually
+    # identical when the angle is small.
+    climb_points: list[tuple[float, float]] = []
+    if delta_brg >= 15.0:
+        # Vertex: 1 nm ahead of dep on the takeoff heading. Far enough
+        # to let the plane align with runway heading initially, close
+        # enough that the bend stays gentle.
+        vertex_lat, vertex_lon = _dest_pt(
+            climb_start_lat, climb_start_lon, g.dep_heading, 1.0 * 1852.0
+        )
+        climb_points = _bezier_corner(
+            climb_start_lat, climb_start_lon,
+            vertex_lat, vertex_lon,
+            cruise_target_lat, cruise_target_lon,
+            n_steps=12,
+        )
+    else:
+        for i in range(1, 13):
+            t = i / 12.0
+            climb_points.append((
+                _interp(climb_start_lat, cruise_target_lat, t),
+                _interp(climb_start_lon, cruise_target_lon, t),
+            ))
+
+    for i, (lat, lon) in enumerate(climb_points):
+        t = (i + 1) / (len(climb_points) + 1)
         alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
         hdg = bearing_deg(lat, lon, cruise_target_lat, cruise_target_lon)
         gear = t < 0.05
