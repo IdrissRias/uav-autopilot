@@ -61,6 +61,16 @@ class Autopilot:
         self._preflight_broadcasted = False
         self._broadcast_tick = 0  # counter for throttling broadcast rate
         self._heartbeat_next = 0.0  # next heartbeat time
+        # Cached ribbon waypoints + periodic re-broadcast timer. The
+        # ribbon is published once at flight start via `flight_plan`
+        # broadcast. If the app's subscription wasn't ready at that
+        # moment (wedged channel, just-launched app, network blip),
+        # the ribbon never arrives and the live map shows the plane
+        # without its planned line. Re-broadcasting every 10 s gives
+        # late-arriving subscribers a chance to catch up. Keyed by
+        # flight_id so a stale ribbon doesn't bleed into a new flight.
+        self._ribbon_waypoints_cache: list | None = None
+        self._ribbon_rebroadcast_next: float = 0.0
         self._aircraft_id: str | None = aircraft_id
         # Flight DB record
         self._flight_id: str | None = None
@@ -519,24 +529,28 @@ class Autopilot:
                 # Broadcast ribbon waypoints to the app for map display
                 # Sample every ~10 points to keep the broadcast small
                 step = max(1, len(ribbon.points) // 50)
+                waypoints = [
+                    {
+                        "name": p.phase,
+                        "lat": round(p.lat, 6),
+                        "lon": round(p.lon, 6),
+                        "alt_ft": round(p.alt_ft, 0),
+                        "speed_kts": round(p.speed_kts, 1),
+                        "phase": p.phase,
+                        "heading": round(p.heading_deg, 1),
+                    }
+                    for i, p in enumerate(ribbon.points) if i % step == 0
+                ]
                 try:
                     broadcast.publish_status({
                         "event": "flight_plan",
-                        "waypoints": [
-                            {
-                                "name": p.phase,
-                                "lat": round(p.lat, 6),
-                                "lon": round(p.lon, 6),
-                                "alt_ft": round(p.alt_ft, 0),
-                                "speed_kts": round(p.speed_kts, 1),
-                                "phase": p.phase,
-                                "heading": round(p.heading_deg, 1),
-                            }
-                            for i, p in enumerate(ribbon.points) if i % step == 0
-                        ],
+                        "waypoints": waypoints,
                     })
                 except Exception:
                     pass
+                # Cache for periodic re-broadcast — see __init__ doc.
+                self._ribbon_waypoints_cache = waypoints
+                self._ribbon_rebroadcast_next = time.time() + 10.0
             except Exception as e:
                 print(f"[RIBBON] Flight plan generation failed: {e}")
                 import traceback; traceback.print_exc()
@@ -1256,6 +1270,23 @@ class Autopilot:
                 # ── Broadcast telemetry to app (~5Hz) ──
                 self._broadcast_telemetry(telemetry, targets, act, phase)
 
+                # ── Periodic ribbon re-broadcast (every 10 s) ──
+                # Survives wedged/late-joining app subscriptions. The
+                # ribbon is otherwise sent ONCE at flight start, so a
+                # missed broadcast = no ribbon on the map for the whole
+                # flight. Re-broadcasting keeps the line fresh and lets
+                # the app re-render if it lost the original.
+                if (self._ribbon_waypoints_cache
+                        and time.time() >= self._ribbon_rebroadcast_next):
+                    self._ribbon_rebroadcast_next = time.time() + 10.0
+                    try:
+                        broadcast.publish_status({
+                            "event": "flight_plan",
+                            "waypoints": self._ribbon_waypoints_cache,
+                        })
+                    except Exception:
+                        pass
+
             # ── Poll DB for end-flight request (reliable fallback) ─────
             if self._aircraft_id and not self._end_flight_requested:
                 if not hasattr(self, '_end_poll_next'):
@@ -1288,6 +1319,9 @@ class Autopilot:
                 self._prev_phase = "GROUND"
                 self._landed = False
                 self._observer_finalized = False
+                # Clear cached ribbon so the next flight's broadcast
+                # isn't preceded by a re-broadcast of the old one.
+                self._ribbon_waypoints_cache = None
                 broadcast.publish_status({"event": "flight_ended", "reason": "user_ended"})
                 print("[END FLIGHT] Flight ended — back to preflight")
 
