@@ -399,6 +399,26 @@ class FlightEngine:
                     flap = prev.flap_ratio  # too slow to clean up
             else:
                 flap = prev.flap_ratio  # hysteresis band: hold
+
+        # ── Flap SPEED protection (all phases, overrides everything) ─
+        # Flaps while fast is how the last crash happened: deployed at
+        # speed, the lift spike ballooned the plane away from the runway
+        # and the recovery dive hit the ground. The altitude logic above
+        # decides whether flaps are WANTED; this block decides whether
+        # they're SAFE. Above flap_safe no new flap deploys (including
+        # FLARE — a fast flare entry keeps its current setting); past
+        # ~8% over flap_safe anything still out gets pulled back in
+        # (retracting while fast has no stall risk — fast IS the
+        # protection). The gap between the two thresholds is hysteresis.
+        if not math.isnan(t.airspeed_kts):
+            prev_flap = (prev.flap_ratio
+                         if prev is not None and prev.flap_ratio is not None
+                         else 0.0)
+            if t.airspeed_kts > g.flap_safe_kts:
+                flap = min(flap, prev_flap)   # block any new deployment
+            if t.airspeed_kts > g.flap_safe_kts * 1.08:
+                flap = 0.0                    # structural: pull them in
+
         brake = kf.brake_ratio if kf.brake_ratio is not None else 0.0
         # Progressive braking: slamming parkbrake + full wheel brakes at
         # touchdown speed (~98 kts) is how tires blow. Ramp from 30% at

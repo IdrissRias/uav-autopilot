@@ -96,6 +96,41 @@ class TestFlapControl(unittest.TestCase):
         self.assertEqual(out.flap_ratio, 0.5,
                          "Between thresholds the current setting holds.")
 
+    def test_no_deploy_when_fast_even_below_slope(self):
+        # THE crash case: below the slope (altitude logic wants flaps)
+        # but going fast. Speed protection must win — flaps at speed
+        # balloon the plane and the recovery dive hits the ground.
+        cmd = self._cmd_alt()
+        flap_safe = self.ribbon.geometry.flap_safe_kts
+        out = self._resolve(cmd - 200.0, prev_flap=0.0, spd=flap_safe + 15.0)
+        self.assertEqual(out.flap_ratio, 0.0,
+                         "No flap deployment above flap_safe speed. Ever.")
+
+    def test_overspeed_forces_retraction(self):
+        cmd = self._cmd_alt()
+        flap_safe = self.ribbon.geometry.flap_safe_kts
+        out = self._resolve(cmd - 200.0, prev_flap=0.5,
+                            spd=flap_safe * 1.08 + 5.0)
+        self.assertEqual(out.flap_ratio, 0.0,
+                         "Hard overspeed pulls deployed flaps back in.")
+
+    def test_fast_flare_entry_does_not_slam_full_flaps(self):
+        # Slightly over flap_safe (inside the hysteresis band): the
+        # scheduled full flaps are blocked, current setting kept.
+        # Well past 1.08×flap_safe the hard retract takes over instead.
+        kf_flare = next(k for k in self.ribbon.keyframes
+                        if k.name == "FLARE")
+        flap_safe = self.ribbon.geometry.flap_safe_kts
+        spd = flap_safe + 5.0  # over the gate, under 1.08× hard limit
+        self.engine._prev_targets = Targets(
+            heading_deg=270.0, altitude_ft=1420.0,
+            airspeed_kts=spd, flap_ratio=0.5, gear_down=True,
+        )
+        t = _telem(1410.0, 47.40, -94.7705, spd=spd)
+        out = self.engine._resolve(kf_flare, t, self.ribbon)
+        self.assertEqual(out.flap_ratio, 0.5,
+                         "Fast flare entry keeps current flaps, no full slam.")
+
     def test_flare_exempt(self):
         kf_flare = next(k for k in self.ribbon.keyframes
                         if k.name == "FLARE")
