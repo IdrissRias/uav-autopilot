@@ -44,7 +44,11 @@ _RATIO_V_ROTATE = 1.17
 _RATIO_V_APPROACH = 1.08
 _RATIO_V_LAND = 1.00
 _RATIO_GEAR_SAFE = 1.30
-_RATIO_FLAP_SAFE = 1.50
+_RATIO_FLAP_SAFE = 1.35   # was 1.50, which collided exactly with
+# _RATIO_V_CRUISE (also 1.5): flap_safe == v_cruise meant DECELERATE's
+# speed_lte trigger fired instantly (no decel leg at all) and flaps were
+# scheduled at cruise speed. 1.35 × 98.4 ≈ 133 kts restores a ~15 kt
+# bleed segment and keeps flap deployment below the real Vfe.
 _RATIO_V_CRUISE = 1.5        # cruise target speed — was 2.0 which produced
 # v_cruise = 196 kts (when v_stall = 98), miles above the SF50's actual
 # observed cruise of ~133 kts. The mismatch drove the throttle PID to
@@ -63,6 +67,11 @@ _GLIDE_FT_PER_NM = 1000.0   # ~9.4° glideslope — doubled from 500 ft/nm to
 # matters most on short flights (9 nm KUBE↔KRPD): old 500 ft/nm spent
 # ~5 nm on descent+approach+decel out of 9 nm total. New 1000 ft/nm cuts
 # the descent portion in half, leaving more of the flight as actual cruise.
+_FINAL_FT_PER_NM = 450.0    # final-approach slope (~4.2°), APPROACH keyframe
+# only. The 1000 ft/nm descent slope is fine up high but produces ~1700 fpm
+# of sink at flare height — no flare law can arrest that in the ~1 s
+# available from 30 ft. The last 600 ft AGL fly a conventional stabilized
+# final instead so the flare starts from ~600 fpm.
 _APPROACH_ALT_AGL_FT = 600.0  # where approach begins (above threshold alt)
 _FLARE_ALT_AGL_FT = 30.0      # where flare begins
 _TOUCHDOWN_FT_PAST_THR = 1000.0
@@ -559,6 +568,7 @@ def _solve_geometry(
     dest_threshold_lon: Optional[float],
     cruise_alt_ft: float,
     v_stall: float,
+    v_cruise_kts: Optional[float] = None,
 ) -> Geometry:
     # Resolve runway
     thr_lat = dest_threshold_lat if dest_threshold_lat is not None else dest_lat
@@ -577,7 +587,7 @@ def _solve_geometry(
     # Approach start: 3° glideslope from 600ft AGL down to 30ft AGL
     approach_alt = dest_alt_ft + _APPROACH_ALT_AGL_FT
     approach_descent_ft = _APPROACH_ALT_AGL_FT - _FLARE_ALT_AGL_FT
-    approach_len_nm = max(0.5, approach_descent_ft / _GLIDE_FT_PER_NM)
+    approach_len_nm = max(0.5, approach_descent_ft / _FINAL_FT_PER_NM)
     app_lat, app_lon = _dest_pt(flare_lat, flare_lon, back_hdg, approach_len_nm * 1852.0)
 
     # Descent start: glideslope from cruise_alt down to approach_alt
@@ -587,7 +597,13 @@ def _solve_geometry(
 
     # Speeds (computed early so decel-leg sizing can use them)
     v_rot = _RATIO_V_ROTATE * v_stall
-    v_cru = _RATIO_V_CRUISE * v_stall
+    # Prefer the learned envelope's cruise speed over the ratio guess —
+    # the SF50's measured cruise is ~133 kts while 1.5 × v_land gives
+    # 147.6. Planning to a speed the jet doesn't actually fly means the
+    # speed PID saturates chasing it. Ratio remains the fallback when no
+    # envelope is available.
+    v_cru = (float(v_cruise_kts) if v_cruise_kts and v_cruise_kts > 0
+             else _RATIO_V_CRUISE * v_stall)
     v_app = _RATIO_V_APPROACH * v_stall
     v_land = _RATIO_V_LAND * v_stall
     gear_safe = _RATIO_GEAR_SAFE * v_stall
@@ -962,14 +978,21 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         ),
 
         # ── 12. FLARE ────────────────────────────────────────────────
-        # Throttle idle, bleed to V_land.  Advance when wheels on ground
-        # (agl < 3 ft) → ROLLOUT.
+        # Throttle idle, bleed to V_land.  Pitch is driven by a SINK-RATE
+        # target (engine emits vs_target_fpm scaled by AGL, controller
+        # tracks it) — not by the glideslope alt PID, which used to
+        # command nose-DOWN at 30 ft because the clamped target alt sat
+        # below the plane. pitch_down_limit 0.05 means the nose can
+        # barely drop below neutral this close to the ground; nose-up
+        # cap 0.25 keeps the flare from ballooning. Advance when wheels
+        # on ground (agl < 3 ft) → ROLLOUT.
         Keyframe(
             name="FLARE", phase="FLARE",
             throttle_mode="idle",
             target_speed_kts=g.v_land,
             alt_mode="glideslope",
             heading_mode="dest_runway",
+            pitch_limit=0.25, pitch_down_limit=0.05,
             gear_down=True, flap_ratio=1.0,
             trigger=Trigger("agl_lte", value=3.0),
         ),
@@ -1194,6 +1217,7 @@ def plan_path(
     dest_rwy_length_ft: float = 6000.0,  # unused, kept for API compat
     cruise_alt_ft: float,
     v_stall: float = _VS_DEFAULT,
+    v_cruise_kts: Optional[float] = None,  # learned envelope cruise; ratio fallback
     # Legacy kwargs — accepted and ignored for API compat
     **_legacy,
 ) -> Ribbon:
@@ -1215,6 +1239,7 @@ def plan_path(
         dest_threshold_lon=dest_threshold_lon,
         cruise_alt_ft=cruise_alt_ft,
         v_stall=v_stall,
+        v_cruise_kts=v_cruise_kts,
     )
     keyframes = _build_keyframes(geometry)
     preview = _build_preview(geometry, keyframes)

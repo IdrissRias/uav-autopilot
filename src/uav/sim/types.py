@@ -77,6 +77,15 @@ class Targets:
     # on cruise/descent phases so the engine modulates to defend alt
     # rather than chasing speed past the target.
     throttle_for_alt: bool = False
+    # Baseline throttle for the throttle_for_alt P-law. None = the
+    # controller's cruise_throttle. Descent phases set this near idle so
+    # an on-slope plane (alt_error ≈ 0) isn't carrying 55%+ power down
+    # a steep slope.
+    throttle_base: float | None = None
+    # Sink-rate command (ft/min, negative = descending). When set, pitch
+    # tracks this INSTEAD of altitude/speed — used by the flare, where
+    # what matters is arresting sink, not holding an altitude.
+    vs_target_fpm: float | None = None
 
 
 class Mode(str, Enum):

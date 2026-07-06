@@ -145,6 +145,8 @@ class FlightEngine:
                 dest_threshold_lon=thr_lon,
                 cruise_alt_ft=cruise_alt,
                 v_stall=v_stall,
+                v_cruise_kts=(float(speeds["v_cruise"])
+                              if speeds.get("v_cruise") else None),
             )
             self._idx = 0
             self._built = True
@@ -232,7 +234,24 @@ class FlightEngine:
         if kf.heading_mode == "dep_runway":
             hdg = g.dep_heading
         elif kf.heading_mode == "dest_runway":
+            # Runway heading + a small centerline correction. A pure
+            # heading hold let any residual cross-track at flare entry
+            # (or crosswind drift) carry the plane toward the runway
+            # edge — nothing measured lateral offset below 30 ft AGL.
             hdg = g.rwy_heading
+            if t.has_position():
+                d_nm = haversine_m(t.lat_deg, t.lon_deg,
+                                   g.thr_lat, g.thr_lon) / 1852.0
+                brg_thr_plane = bearing_deg(g.thr_lat, g.thr_lon,
+                                            t.lat_deg, t.lon_deg)
+                back_hdg = (g.rwy_heading + 180.0) % 360.0
+                diff = ((brg_thr_plane - back_hdg + 180.0) % 360.0) - 180.0
+                # Perpendicular offset from the extended centerline.
+                # diff > 0 → plane displaced left of the approach course
+                # (facing the runway) → steer right (positive correction).
+                cross_nm = d_nm * math.sin(math.radians(diff))
+                correction = max(-8.0, min(8.0, cross_nm * 40.0))
+                hdg = (g.rwy_heading + correction) % 360.0
         elif kf.heading_mode == "aim_at" and t.has_position() and self._follower is not None:
             track = self._follower.update(t)
             self._last_track = track
@@ -253,16 +272,22 @@ class FlightEngine:
 
         # ── Altitude ─────────────────────────────────────────────────
         if kf.alt_mode == "glideslope" and t.has_position():
-            # Glideslope altitude: threshold_alt + slope × distance_to_threshold.
-            # Slope MUST match the planner's _GLIDE_FT_PER_NM, otherwise the
-            # ribbon's descent waypoints and the engine's commanded alt
-            # disagree and the alt PID fights itself. Imported from the
-            # planner module so the single source of truth lives there.
+            # PIECEWISE glideslope, both slopes imported from the planner
+            # (single source of truth). The last _APPROACH_ALT_AGL_FT of
+            # descent flies the shallow _FINAL_FT_PER_NM slope so the
+            # flare starts from an arrestable sink rate (~600 fpm, not
+            # ~1700); everything above that flies the steep
+            # _GLIDE_FT_PER_NM descent slope.
             #
             # Sign-aware: if plane has passed the threshold (we're on the
             # runway-heading side), clamp d_nm to 0 so we don't command a
             # climb-back. Capped at cruise_alt as an upper bound.
-            from uav.nav.flight_plan_v2 import _GLIDE_FT_PER_NM as _SLOPE_FT_PER_NM
+            from uav.nav.flight_plan_v2 import (
+                _GLIDE_FT_PER_NM as _STEEP,
+                _FINAL_FT_PER_NM as _FINAL,
+                _APPROACH_ALT_AGL_FT as _APP_AGL,
+                _FLARE_ALT_AGL_FT as _FLARE_AGL,
+            )
             d_nm = haversine_m(t.lat_deg, t.lon_deg,
                                g.thr_lat, g.thr_lon) / 1852.0
             brng_from_thr = bearing_deg(g.thr_lat, g.thr_lon,
@@ -273,7 +298,12 @@ class FlightEngine:
             if ang_diff > 90.0:
                 # Plane is on the runway-departing side of threshold.
                 d_nm = 0.0
-            alt = g.thr_alt_ft + d_nm * _SLOPE_FT_PER_NM
+            final_len_nm = (_APP_AGL - _FLARE_AGL) / _FINAL
+            if d_nm <= final_len_nm:
+                alt = g.thr_alt_ft + d_nm * _FINAL
+            else:
+                alt = (g.thr_alt_ft + final_len_nm * _FINAL
+                       + (d_nm - final_len_nm) * _STEEP)
             alt = min(alt, g.cruise_alt_ft)
             # During FLARE, clamp so we don't command negative AGL
             if kf.phase == "FLARE":
@@ -303,12 +333,43 @@ class FlightEngine:
         else:
             throttle = prev.throttle if prev else None
 
+        # ── Flare sink-rate command ──────────────────────────────────
+        # During FLARE, pitch tracks a sink rate instead of an altitude.
+        # Target decays with AGL: -420 fpm entering at 30 ft, -220 at
+        # 10 ft, -120 at the pavement — an exponential-style arrest to
+        # a gentle touchdown regardless of what the approach delivered.
+        # (The old alt-PID flare commanded nose-DOWN at 30 ft because
+        # the clamped target alt sat below the plane.)
+        vs_target = None
+        if kf.phase == "FLARE":
+            agl_ft = ((t.agl_m * 3.28084)
+                      if not math.isnan(t.agl_m) else 30.0)
+            vs_target = -(120.0 + max(0.0, agl_ft) * 10.0)
+            vs_target = max(vs_target, -600.0)  # never command a dive
+
+        # ── Throttle baseline for throttle_for_alt ───────────────────
+        # On glideslope phases the alt→throttle P-law pivots around near
+        # idle: on-slope (alt_error ≈ 0) means gravity does the work, and
+        # thrust only comes in when we sink below the slope. The old
+        # baseline was cruise_throttle (~0.55), which flew the descent
+        # hot — 180+ ft above slope before throttle even hit zero.
+        throttle_base = 0.12 if (kf.throttle_for_alt
+                                 and kf.alt_mode == "glideslope") else None
+
         # ── Levers (None inherits) ───────────────────────────────────
         gear = (kf.gear_down if kf.gear_down is not None
                 else (prev.gear_down if prev and prev.gear_down is not None else True))
         flap = (kf.flap_ratio if kf.flap_ratio is not None
                 else (prev.flap_ratio if prev and prev.flap_ratio is not None else 0.0))
         brake = kf.brake_ratio if kf.brake_ratio is not None else 0.0
+        # Progressive braking: slamming parkbrake + full wheel brakes at
+        # touchdown speed (~98 kts) is how tires blow. Ramp from 30% at
+        # 80+ kts to 100% at 40 kts.
+        if brake > 0.0 and not math.isnan(t.airspeed_kts):
+            spd = t.airspeed_kts
+            if spd > 40.0:
+                scale = 0.3 + 0.7 * max(0.0, min(1.0, (80.0 - spd) / 40.0))
+                brake = brake * scale
 
         return Targets(
             heading_deg=hdg,
@@ -325,6 +386,8 @@ class FlightEngine:
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
             throttle_for_alt=kf.throttle_for_alt,
+            throttle_base=throttle_base,
+            vs_target_fpm=vs_target,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────

@@ -57,7 +57,9 @@ class TestDescentCascadeTriggers(unittest.TestCase):
     def test_flaps_do_deploy_when_slow_and_low(self):
         """Positive case: both conditions met → flaps come out."""
         kf = self.by_name["DESCENT"]
-        t = _telem(110.0, 2100.0, 47.0, -94.5)  # below Vfe, below 2000 AGL
+        # Just below the planned flap_safe speed, below 2000 AGL.
+        flap_safe = self.ribbon.geometry.flap_safe_kts
+        t = _telem(flap_safe - 2.0, 2100.0, 47.0, -94.5)
         self.assertTrue(
             kf.trigger.fired(t, agl_ft=1900.0),
             "DESCENT→DESCENT_FLAP should fire when spd<Vfe AND agl<2000ft."
@@ -123,10 +125,21 @@ class TestDecelZoneLength(unittest.TestCase):
 
         decel_nm = _nm(g.decel_start_lat, g.decel_start_lon,
                        g.descent_start_lat, g.descent_start_lon)
+        # The leg must cover the physics-computed bleed distance for the
+        # ACTUAL planned speeds. (The old hardcoded 3.0 nm assumed a
+        # Vcruise→Vfe gap of ~40 kts; with flap_safe decoupled from
+        # v_cruise the gap — and thus the needed leg — is smaller.)
+        from uav.nav.flight_plan_v2 import _decel_len_nm
+        needed_nm = _decel_len_nm(g.v_cruise, g.flap_safe_kts)
         self.assertGreaterEqual(
-            decel_nm, 3.0,
-            f"DECEL zone is only {decel_nm:.1f}nm — not enough room to "
-            f"bleed speed from Vcruise to Vfe at idle."
+            decel_nm, needed_nm - 0.1,
+            f"DECEL zone is only {decel_nm:.1f}nm but bleeding "
+            f"{g.v_cruise:.0f}→{g.flap_safe_kts:.0f} kts at idle needs "
+            f"{needed_nm:.1f}nm."
+        )
+        self.assertGreaterEqual(
+            decel_nm, 1.0,
+            "DECEL zone should never collapse below the 1 nm safety margin."
         )
 
 

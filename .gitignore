@@ -31,3 +31,6 @@ models/
 
 # Claude Code internal
 .claude/
+
+# Local MCP server config (machine-specific absolute paths)
+.mcp.json

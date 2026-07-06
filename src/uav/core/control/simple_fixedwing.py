@@ -18,6 +18,7 @@ because it has policy of its own.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from uav.core.control.base import Controller
@@ -136,14 +137,23 @@ class SimpleFixedWingController(Controller):
         # windup, so we use a PROPORTIONAL-ONLY response for the
         # swapped paths (gains picked to match the original PID's
         # full-strength response at typical errors).
-        if targets.throttle_for_alt:
+        if targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
+            # Sink-rate tracking (flare). The commander orders a vertical
+            # speed; pitch arrests the difference. P-only: 500 fpm of
+            # error → 0.15 pitch. Altitude is irrelevant in the flare —
+            # what breaks a landing is vertical speed at the pavement.
+            VS_TO_PITCH_KP = 0.0003
+            pitch_cmd = (targets.vs_target_fpm - telemetry.vs_fpm) * VS_TO_PITCH_KP
+        elif targets.throttle_for_alt:
             # Speed → Pitch (P-only, sign-inverted)
             #   spd_err > 0 (too slow) → pitch_cmd < 0 (nose-down → gain speed)
             #   spd_err < 0 (too fast) → pitch_cmd > 0 (nose-up → bleed speed)
             SPEED_TO_PITCH_KP = 0.015  # 10 kts → 0.15 pitch (~9°)
             pitch_cmd = -spd_error * SPEED_TO_PITCH_KP
         else:
-            pitch_cmd = self.altitude_pid.update(alt_error, dt)
+            pitch_cmd = self.altitude_pid.update(
+                alt_error, dt, measurement=telemetry.altitude_ft,
+            )
 
         # Commander-issued pitch clamp. Nose-up cap is always honored; nose-down
         # cap is opt-in.
@@ -167,9 +177,17 @@ class SimpleFixedWingController(Controller):
             # 0–1 range this gives crisp recovery without integral
             # windup carrying over from earlier phases.
             ALT_TO_THROTTLE_KP = 0.003
-            throttle_cmd = self.cruise_throttle + alt_error * ALT_TO_THROTTLE_KP
+            # Baseline: commander-supplied (near idle on glideslope
+            # phases, where gravity provides the energy) or the default
+            # cruise setting for level flight.
+            base = (targets.throttle_base
+                    if targets.throttle_base is not None
+                    else self.cruise_throttle)
+            throttle_cmd = base + alt_error * ALT_TO_THROTTLE_KP
         else:
-            throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(spd_error, dt)
+            throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(
+                spd_error, dt, measurement=telemetry.airspeed_kts,
+            )
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth
 
         # ── Yaw (ribbon-driven yaw-hold only; no standalone yaw PID) ─

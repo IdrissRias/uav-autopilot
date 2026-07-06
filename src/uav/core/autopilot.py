@@ -230,6 +230,8 @@ class Autopilot:
                 dest_threshold_lon=dest_thr_lon,
                 cruise_alt_ft=cruise_alt,
                 v_stall=v_stall,
+                v_cruise_kts=(float(speeds["v_cruise"])
+                              if speeds.get("v_cruise") else None),
             )
             print(format_ribbon(ribbon))
 
@@ -519,6 +521,9 @@ class Autopilot:
                     dest_threshold_lon=dest_rwy["threshold_lon"] if dest_rwy else None,
                     cruise_alt_ft=initial_target,
                     v_stall=v_stall,
+                    v_cruise_kts=(float(ctx["airframe"]["speeds_kts"]["v_cruise"])
+                                  if ctx["airframe"]["speeds_kts"].get("v_cruise")
+                                  else None),
                 )
                 # Pre-build ribbon so FlightEngine doesn't rebuild it
                 self.mode_manager._ribbon = ribbon
