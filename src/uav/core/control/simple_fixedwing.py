@@ -103,6 +103,9 @@ class SimpleFixedWingController(Controller):
         # less) than the baseline throttle. The leak (time constant ~50 s
         # at 20 Hz) self-limits windup; cleared whenever the mode is off.
         self._alt_thr_integral = 0.0
+        # Last commanded throttle, for the slew limiter ("the engine is
+        # not a switch"). Starts at idle.
+        self._prev_throttle = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -150,11 +153,20 @@ class SimpleFixedWingController(Controller):
             VS_TO_PITCH_KP = 0.0003
             pitch_cmd = (targets.vs_target_fpm - telemetry.vs_fpm) * VS_TO_PITCH_KP
         elif targets.throttle_for_alt:
-            # Speed → Pitch (P-only, sign-inverted)
+            # Speed → Pitch (sign-inverted) + vertical-speed damping.
             #   spd_err > 0 (too slow) → pitch_cmd < 0 (nose-down → gain speed)
             #   spd_err < 0 (too fast) → pitch_cmd > 0 (nose-up → bleed speed)
-            SPEED_TO_PITCH_KP = 0.015  # 10 kts → 0.15 pitch (~9°)
-            pitch_cmd = -spd_error * SPEED_TO_PITCH_KP
+            # The VS term is the phugoid killer: P-only speed→pitch plus
+            # P-only alt→throttle ring energy back and forth (flight
+            # 20260706_133421 swung ±300 ft / ±15 kts in cruise, out of
+            # phase — constant total energy sloshing). Damping the
+            # exchange RATE (climbing fast → ease the nose down) removes
+            # the oscillation without touching the setpoints.
+            SPEED_TO_PITCH_KP = 0.015   # 10 kts → 0.15 pitch (~9°)
+            VS_TO_PITCH_DAMP = 0.00008  # 1000 fpm → 0.08 pitch opposing
+            vs = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
+            pitch_cmd = (-spd_error * SPEED_TO_PITCH_KP
+                         - vs * VS_TO_PITCH_DAMP)
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
@@ -195,14 +207,29 @@ class SimpleFixedWingController(Controller):
             self._alt_thr_integral += alt_error * dt * ALT_TO_THROTTLE_KI
             self._alt_thr_integral *= 0.999  # leak — self-limiting
             self._alt_thr_integral = max(-0.15, min(0.15, self._alt_thr_integral))
+            # VS damping: climbing through the target → cut power EARLY,
+            # before the alt error flips sign. Rate feedback = the D term
+            # the P-only law was missing (see phugoid note above).
+            ALT_TO_THROTTLE_VS_DAMP = 0.00015  # 1000 fpm → 0.15 throttle
+            vs_thr = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
             throttle_cmd = (base + alt_error * ALT_TO_THROTTLE_KP
-                            + self._alt_thr_integral)
+                            + self._alt_thr_integral
+                            - vs_thr * ALT_TO_THROTTLE_VS_DAMP)
         else:
             self._alt_thr_integral = 0.0
             throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(
                 spd_error, dt, measurement=telemetry.airspeed_kts,
             )
+        # The engine is not a switch. Closed-loop throttle (both coupled
+        # and classic modes) slews at most 0.5/s — full sweep in 2 s.
+        # Explicit ribbon throttle (takeoff full power, flare idle) is
+        # exempt: those are commander orders, instant by design.
+        if targets.throttle is None and dt > 0:
+            max_step = 0.5 * dt
+            throttle_cmd = max(self._prev_throttle - max_step,
+                               min(self._prev_throttle + max_step, throttle_cmd))
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth
+        self._prev_throttle = throttle_cmd
 
         # ── Yaw (ribbon-driven yaw-hold only; no standalone yaw PID) ─
         yaw_cmd = 0.0
