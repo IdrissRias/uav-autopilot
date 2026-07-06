@@ -66,18 +66,45 @@ class TestFlapGating(unittest.TestCase):
             "Scheduled flaps should deploy once the plane is on the slope."
         )
 
-    def test_flaps_never_retract_once_out(self):
-        # Previous tick already had half flaps; plane is high. Gating
-        # must not pull deployed flaps back in.
+    def test_flaps_retract_when_high_and_fast(self):
+        # Flaps are alt control: well above the slope with speed in hand,
+        # clean up — their lift is what's keeping us high.
         cmd_alt = self._resolve_at(3000.0).altitude_ft
         self.engine._prev_targets = Targets(
             heading_deg=270.0, altitude_ft=cmd_alt, airspeed_kts=110.0,
             flap_ratio=0.5, gear_down=False,
         )
-        t = _telem(cmd_alt + 400.0, self.lat, self.lon)
+        t = _telem(cmd_alt + 400.0, self.lat, self.lon, spd=110.0)
+        out = self.engine._resolve(self.kf_flap, t, self.ribbon)
+        self.assertEqual(out.flap_ratio, 0.0,
+                         "High above slope + speed ≥ v_approach → retract.")
+
+    def test_flaps_do_not_retract_when_slow(self):
+        # Retracting flaps raises stall speed. Below v_approach the
+        # plane keeps its flaps even when high.
+        cmd_alt = self._resolve_at(3000.0).altitude_ft
+        self.engine._prev_targets = Targets(
+            heading_deg=270.0, altitude_ft=cmd_alt, airspeed_kts=100.0,
+            flap_ratio=0.5, gear_down=False,
+        )
+        v_app = self.ribbon.geometry.v_approach
+        t = _telem(cmd_alt + 400.0, self.lat, self.lon, spd=v_app - 5.0)
         out = self.engine._resolve(self.kf_flap, t, self.ribbon)
         self.assertEqual(out.flap_ratio, 0.5,
-                         "Deployed flaps must never retract mid-approach.")
+                         "Never retract flaps below v_approach — stall risk.")
+
+    def test_flaps_hold_in_hysteresis_band(self):
+        # Between the deploy (100 ft) and retract (200 ft) thresholds the
+        # current setting holds — no cycling on tracking noise.
+        cmd_alt = self._resolve_at(3000.0).altitude_ft
+        self.engine._prev_targets = Targets(
+            heading_deg=270.0, altitude_ft=cmd_alt, airspeed_kts=110.0,
+            flap_ratio=0.5, gear_down=False,
+        )
+        t = _telem(cmd_alt + 150.0, self.lat, self.lon, spd=110.0)
+        out = self.engine._resolve(self.kf_flap, t, self.ribbon)
+        self.assertEqual(out.flap_ratio, 0.5,
+                         "150 ft above slope is inside the hysteresis band.")
 
     def test_flare_exempt_from_gating(self):
         kf_flare = next(k for k in self.ribbon.keyframes
