@@ -32,16 +32,17 @@ from uav.nav.geo import bearing_deg, haversine_m
 from uav.sim.types import Telemetry, Targets
 from uav.core.guidance.track_follower import TrackFollower, TrackState
 
-# Flaps double as an altitude-control device on the glideslope (see
-# flap gating in _resolve). Two thresholds with a hysteresis gap so
-# the flaps don't cycle on tracking noise:
-#   above slope by > _FLAP_RETRACT_ABOVE_FT → retract (clean up, the
-#     extra lift is exactly what's keeping us high)
-#   within _FLAP_DEFER_ABOVE_FT of slope   → deploy the scheduled
-#     setting (also gates first deployment: never deploy while high)
-# In between: hold whatever is currently set.
-_FLAP_DEFER_ABOVE_FT = 100.0
-_FLAP_RETRACT_ABOVE_FT = 200.0
+# Flaps are an altitude-control device on the glideslope (see flap
+# logic in _resolve): they add lift, so they deploy only when the plane
+# has sunk BELOW the slope and needs pulling back up. On-slope or above,
+# the wing stays clean. Hysteresis gap so they don't cycle on noise:
+#   ≥ _FLAP_DEPLOY_BELOW_FT below slope → deploy the keyframe's
+#     scheduled setting
+#   ≤ _FLAP_CLEAN_BELOW_FT below slope (incl. any amount above it)
+#     → retract to clean (speed permitting)
+#   in between → hold current setting
+_FLAP_DEPLOY_BELOW_FT = 100.0
+_FLAP_CLEAN_BELOW_FT = 50.0
 
 
 class FlightEngine:
@@ -373,29 +374,31 @@ class FlightEngine:
         flap = (kf.flap_ratio if kf.flap_ratio is not None
                 else (prev.flap_ratio if prev and prev.flap_ratio is not None else 0.0))
         # ── Situational flap control ─────────────────────────────────
-        # Flaps are an altitude-control device on the glideslope, not a
-        # fixed schedule. Above the slope their lift is exactly what is
-        # keeping the plane high (pitch tracks speed in these phases and
-        # throttle is near idle — nothing else pulls it down):
-        #   > _FLAP_RETRACT_ABOVE_FT high → retract to clean, IF speed
-        #     is at/above v_approach (retracting raises stall speed;
-        #     never clean up slow).
-        #   within _FLAP_DEFER_ABOVE_FT of slope → deploy the keyframe's
-        #     scheduled setting (also gates first deployment).
+        # Flaps are LIFT. On the glideslope they deploy only when the
+        # plane has sunk below the slope and needs pulling back up:
+        #   ≥ _FLAP_DEPLOY_BELOW_FT below slope → deploy the keyframe's
+        #     scheduled setting (the schedule still caps how much flap
+        #     this phase may use, so Vfe protection is untouched).
+        #   ≤ _FLAP_CLEAN_BELOW_FT below slope, or anywhere above it
+        #     → retract to clean, IF speed is at/above v_approach
+        #     (retracting raises stall speed; never clean up slow).
         #   in between → hold current setting (hysteresis, no cycling).
-        # FLARE is exempt — its commanded alt is clamped near the
-        # pavement, which would read as "high" forever. Gear is NOT
-        # gated: gear is drag without lift, which helps when high.
+        # FLARE is exempt — it always gets its full flaps. Gear is NOT
+        # gated: gear is drag without lift, which always helps slow us.
         if (kf.alt_mode == "glideslope" and kf.phase != "FLARE"
                 and prev is not None and prev.flap_ratio is not None):
-            alt_above_ft = t.altitude_ft - alt
-            if (alt_above_ft > _FLAP_RETRACT_ABOVE_FT
-                    and prev.flap_ratio > 0.0
-                    and not math.isnan(t.airspeed_kts)
-                    and t.airspeed_kts >= g.v_approach):
-                flap = 0.0
-            elif alt_above_ft > _FLAP_DEFER_ABOVE_FT:
-                flap = prev.flap_ratio
+            alt_below_ft = alt - t.altitude_ft  # positive = below slope
+            if alt_below_ft >= _FLAP_DEPLOY_BELOW_FT:
+                pass  # keep the scheduled `flap` — we need the lift
+            elif alt_below_ft <= _FLAP_CLEAN_BELOW_FT:
+                if (prev.flap_ratio == 0.0
+                        or (not math.isnan(t.airspeed_kts)
+                            and t.airspeed_kts >= g.v_approach)):
+                    flap = 0.0
+                else:
+                    flap = prev.flap_ratio  # too slow to clean up
+            else:
+                flap = prev.flap_ratio  # hysteresis band: hold
         brake = kf.brake_ratio if kf.brake_ratio is not None else 0.0
         # Progressive braking: slamming parkbrake + full wheel brakes at
         # touchdown speed (~98 kts) is how tires blow. Ramp from 30% at
