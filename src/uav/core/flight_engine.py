@@ -334,10 +334,20 @@ class FlightEngine:
         # the surplus energy and the descent angle steepens until the
         # slope is recaptured from above. (The stall floor guards the
         # low end.)
+        pitch_up_cap = kf.pitch_limit
         if (kf.alt_mode == "glideslope" and kf.phase == "DESCENT"
                 and speed is not None and t.has_position()
                 and (t.altitude_ft - alt) > 100.0):
             speed = min(speed, g.v_approach)
+            # Bleed HARD. The keyframe's 0.15 nose-up cap strangled the
+            # bleed (flight overflew the airport still fast: pitch law
+            # asked +0.21, got clipped, surplus never drained). Verified
+            # manually: hard pitch-up bleeds fine. The cap opens while
+            # there is surplus speed to dump and reverts once speed is
+            # back at target.
+            if (not math.isnan(t.airspeed_kts)
+                    and t.airspeed_kts > speed + 5.0):
+                pitch_up_cap = 0.35
 
         # ── Throttle ─────────────────────────────────────────────────
         if kf.throttle_mode == "alt_scaled":
@@ -456,7 +466,7 @@ class FlightEngine:
             gear_down=gear,
             flap_ratio=flap,
             roll_limit=kf.roll_limit,
-            pitch_limit=kf.pitch_limit,
+            pitch_limit=pitch_up_cap,
             pitch_down_limit=kf.pitch_down_limit,
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
