@@ -111,13 +111,19 @@ _JOIN_MAX_OFFSET_NM = 80.0   # cap so we don't fly wildly off course
 # degrees at the JOIN point, the planner switches from a single-leg
 # (CRUISE → INBOUND) pattern to a two-leg pattern (CRUISE → BASE_LEG
 # → INBOUND), inserting a BASE_TURN waypoint perpendicular to the
-# centerline on the dep's side. This produces two ~90° turns (still
-# well within the SF50's measured roll-limit envelope at cruise
-# speed) instead of one 120°+ elbow that the controllers can't
-# track. 60° is the empirical edge — above it, prior flights have
-# saturated R to ±1.0 and pulled 2g+. See flights 20260419_135940
-# and 20260419_145024.
-_MAX_SINGLE_LEG_TURN_DEG = 60.0
+# centerline on the dep's side.
+#
+# History: this was 60° when JOIN was a sharp polyline elbow the
+# controllers had to absorb mid-flight — above 60° they saturated
+# roll and pulled 2g+ (flights 20260419_135940, 20260419_145024).
+# Since the Dubins rework the corner is a fillet arc at the plane's
+# real turn radius, flown at the same fixed bank as any other turn,
+# so a 90° join is as flyable as a 30° one. 100° keeps the pattern
+# only for arrivals from beyond-perpendicular (approaching from
+# behind the runway axis), where a base leg genuinely reads better
+# than a near-U-turn fillet. Kills the unnecessary dogleg on
+# moderately off-axis departures (seen on Amery→KUBE, ~61° join).
+_MAX_SINGLE_LEG_TURN_DEG = 100.0
 # Minimum perpendicular offset of the BASE_TURN point from the
 # centerline. The actual offset matches the dep's perpendicular
 # distance when that's larger, so the cruise leg from dep to
