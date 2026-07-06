@@ -360,72 +360,125 @@ def _dest_pt(lat: float, lon: float, bearing: float, dist_m: float) -> tuple[flo
     return math.degrees(lat2), math.degrees(lon2)
 
 
-def _bezier_corner(
-    in_lat: float, in_lon: float,
-    vertex_lat: float, vertex_lon: float,
-    out_lat: float, out_lon: float,
-    n_steps: int = 20,
-) -> list:
-    """Quadratic Bézier arc through `n_steps` interior points from
-    (in_lat, in_lon) to (out_lat, out_lon), bending toward the corner
-    vertex (vertex_lat, vertex_lon).
+def _turn_radius_nm(v_kts: float, bank_deg: float = 31.0) -> float:
+    """Minimum flyable turn radius at `v_kts` and the given bank angle.
 
-    The curve never actually reaches the vertex — that's the whole
-    point: the polyline visits a smooth arc instead of a sharp elbow,
-    which the L1 follower can chase without the plane banking
-    impossibly hard. Used to round corners at BASE_TURN, JOIN, and
-    the lift-off corner.
-
-    Returns interior points only (t = 1/(n+1) … n/(n+1)); the caller
-    already has the in and out endpoints.
+    R = V² / (g·tan(φ)). At 133 kts / 31° bank ≈ 0.43 nm. Every curve
+    the ribbon draws must be at least this gentle, otherwise the plane
+    physically cannot stay on the line and the follower reports phantom
+    cross-track error. 31° matches the CRUISE keyframe's roll_limit
+    (0.35 × 90°).
     """
-    pts = []
-    for i in range(1, n_steps + 1):
-        t = i / (n_steps + 1)
-        u = 1.0 - t
-        lat = u * u * in_lat + 2.0 * u * t * vertex_lat + t * t * out_lat
-        lon = u * u * in_lon + 2.0 * u * t * vertex_lon + t * t * out_lon
-        pts.append((lat, lon))
-    return pts
+    v_ms = max(30.0, v_kts) * 0.514444
+    r_m = (v_ms * v_ms) / (9.81 * math.tan(math.radians(bank_deg)))
+    return r_m / 1852.0
 
 
-def _course_reversal_arc(
-    start_lat: float, start_lon: float,
-    initial_brg_deg: float, target_brg_deg: float,
-    turn_radius_nm: float,
-    n_steps: int = 24,
-) -> list:
-    """Dubins-style true circular arc from `start` heading
-    `initial_brg_deg`, turning to end up heading `target_brg_deg`,
-    with the plane's actual turn radius. Picks left or right turn
-    automatically — whichever requires less rotation. Returns interior
-    arc points (start point not included).
+def _tangent_arc(
+    start_lat: float, start_lon: float, start_hdg: float,
+    tgt_lat: float, tgt_lon: float,
+    radius_nm: float,
+    step_deg: float = 10.0,
+    max_sweep_deg: float = 300.0,
+) -> tuple[list, float]:
+    """Departure arc: turn at fixed radius from `start_hdg` until the
+    arc's tangent points at the target, then stop. This is the user's
+    "half circle until it faces the destination" — a Dubins departure
+    arc whose sweep is whatever the geometry needs (0° for a straight-
+    out departure, ~180° for a course reversal).
 
-    Used for the lift-off corner when the departure heading and the
-    cruise direction differ by enough that a quadratic Bézier would
-    degenerate (>~120°). A real arc has constant curvature the plane
-    can fly at a fixed bank angle.
+    Returns (arc_points, exit_heading). Points exclude the start point.
+    Sweep is capped so a target sitting inside the turn circle (rare:
+    destination < 2R away and behind) can't produce an endless loop.
     """
-    delta = ((target_brg_deg - initial_brg_deg + 540.0) % 360.0) - 180.0
-    if abs(delta) < 1e-3:
-        return []
-    turn_sign = 1.0 if delta > 0 else -1.0
-    total_turn_rad = math.radians(abs(delta))
-    perp_brg = (initial_brg_deg + 90.0 * turn_sign) % 360.0
+    brg0 = bearing_deg(start_lat, start_lon, tgt_lat, tgt_lon)
+    delta0 = ((brg0 - start_hdg + 540.0) % 360.0) - 180.0
+    if abs(delta0) < 8.0:
+        return [], start_hdg  # already facing the target
+    sign = 1.0 if delta0 > 0 else -1.0
     centre_lat, centre_lon = _dest_pt(
-        start_lat, start_lon, perp_brg, turn_radius_nm * 1852.0,
+        start_lat, start_lon, (start_hdg + 90.0 * sign) % 360.0,
+        radius_nm * 1852.0,
     )
-    # bearing from centre back to the start point
-    bearing_to_start = (perp_brg + 180.0) % 360.0
+    ang_to_start = (start_hdg + 90.0 * sign + 180.0) % 360.0
+    pts: list = []
+    sweep = 0.0
+    hdg_here = start_hdg
+    while sweep < max_sweep_deg:
+        sweep += step_deg
+        ang = (ang_to_start + sign * sweep) % 360.0
+        p = _dest_pt(centre_lat, centre_lon, ang, radius_nm * 1852.0)
+        hdg_here = (ang + 90.0 * sign) % 360.0
+        pts.append(p)
+        brg_tgt = bearing_deg(p[0], p[1], tgt_lat, tgt_lon)
+        if abs(((brg_tgt - hdg_here + 540.0) % 360.0) - 180.0) <= step_deg * 0.75:
+            break
+    return pts, hdg_here
+
+
+def _fillet_arc(
+    prev_lat: float, prev_lon: float,
+    corner_lat: float, corner_lon: float,
+    next_lat: float, next_lon: float,
+    radius_nm: float,
+    step_deg: float = 10.0,
+) -> list:
+    """Replace a polyline corner with a constant-radius arc tangent to
+    both legs. Returns the arc points (entry → exit); empty list when
+    the corner is nearly straight. The corner point itself is NOT on the
+    returned path — the arc cuts inside it, which is exactly what a
+    plane flying through the corner at fixed bank does.
+
+    If either leg is too short for the ideal radius, the radius shrinks
+    to fit (the follower's roll limit then rounds the residual — better
+    than the arc overrunning into the next leg).
+    """
+    hdg_in = bearing_deg(prev_lat, prev_lon, corner_lat, corner_lon)
+    hdg_out = bearing_deg(corner_lat, corner_lon, next_lat, next_lon)
+    delta = ((hdg_out - hdg_in + 540.0) % 360.0) - 180.0
+    if abs(delta) < 5.0:
+        return []
+    sign = 1.0 if delta > 0 else -1.0
+
+    len_in = haversine_m(prev_lat, prev_lon, corner_lat, corner_lon) / 1852.0
+    len_out = haversine_m(corner_lat, corner_lon, next_lat, next_lon) / 1852.0
+    # Tangent offset from the corner along each leg: t = R·tan(Δ/2).
+    half = math.radians(abs(delta)) / 2.0
+    t_ideal = radius_nm * math.tan(half)
+    t_max = 0.45 * min(len_in, len_out)
+    r_eff = radius_nm if t_ideal <= t_max else t_max / math.tan(half)
+    t_off = r_eff * math.tan(half)
+
+    entry_lat, entry_lon = _dest_pt(
+        corner_lat, corner_lon, (hdg_in + 180.0) % 360.0, t_off * 1852.0,
+    )
+    centre_lat, centre_lon = _dest_pt(
+        entry_lat, entry_lon, (hdg_in + 90.0 * sign) % 360.0, r_eff * 1852.0,
+    )
+    ang_start = (hdg_in + 90.0 * sign + 180.0) % 360.0
+    n_steps = max(2, int(abs(delta) / step_deg))
     pts = []
-    for i in range(1, n_steps + 1):
-        t = i / n_steps
-        ang = (bearing_to_start
-               + turn_sign * math.degrees(total_turn_rad) * t) % 360.0
-        pt = _dest_pt(centre_lat, centre_lon, ang,
-                      turn_radius_nm * 1852.0)
-        pts.append(pt)
+    for i in range(n_steps + 1):
+        ang = (ang_start + sign * abs(delta) * (i / n_steps)) % 360.0
+        pts.append(_dest_pt(centre_lat, centre_lon, ang, r_eff * 1852.0))
     return pts
+
+
+def pick_cruise_alt_agl(dist_nm: float) -> float:
+    """Trip-length-optimal cruise altitude (AGL).
+
+    Altitude buys speed (TAS grows ~1.5% per 1000 ft at fixed IAS), but
+    the climb costs time (~0.005 s per ft at the SF50's measured 30 ft/s
+    climb with ~15% forward-speed deficit). Marginal break-even sits
+    near 12 nm: below it the climb never pays for itself, above it every
+    extra foot is profit until a cap binds. Caps: 5000 AGL (config
+    ceiling for these short hops) and the descent+climb footprint must
+    fit inside the route.
+
+    clamp(350 × (D − 8), 1500, 5000): ≤ ~12 nm stays at 1500 AGL,
+    ~22 nm reaches 5000, smooth ramp between.
+    """
+    return max(1500.0, min(5000.0, 350.0 * (dist_nm - 8.0)))
 
 
 def _interp(a: float, b: float, t: float) -> float:
@@ -1093,13 +1146,16 @@ def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
     pts.append(PathPoint(roll_lat, roll_lon, g.dep_alt_ft, g.v_rotate,
                          g.dep_heading, "GROUND", True, 0.5, 1.0))
 
-    # Climb+cruise: Bézier-smoothed lift-off corner when the
-    # departure-to-cruise heading delta is non-trivial, otherwise a
-    # straight line. The earlier failure was stacking Bézier at the
-    # lift-off AND at BASE_TURN AND at JOIN — three corner arcs
-    # interacted with the BASE_LEG insertion to produce a visible
-    # loop. Now only the lift-off gets smoothed; the rest of the
-    # geometry trusts BASE_LEG / INBOUND straight legs.
+    # ── Climb + cruise: Dubins-style geometry ────────────────────────
+    # The horizontal route is assembled from pieces the plane can
+    # physically fly at its bank limit:
+    #   1. straight climb-out on the runway heading (1 nm)
+    #   2. DEPARTURE ARC at the min turn radius, sweeping until the
+    #      tangent points at the first fix (BASE_TURN or JOIN)
+    #   3. straight legs between fixes
+    #   4. FILLET ARCS replacing the corners at BASE_TURN and JOIN
+    # No corner in the resulting polyline exceeds what R = V²/(g·tanφ)
+    # allows, so the follower can hold the line instead of cutting it.
     climb_start_lat, climb_start_lon = roll_lat, roll_lon
     has_base = (
         g.base_turn_lat is not None and g.base_turn_lon is not None
@@ -1107,71 +1163,87 @@ def _build_preview(g: Geometry, keyframes: List[Keyframe]) -> List[PathPoint]:
     cruise_target_lat = g.base_turn_lat if has_base else g.join_lat
     cruise_target_lon = g.base_turn_lon if has_base else g.join_lon
 
-    # Lift-off heading vs the bearing toward cruise_target.
-    target_brg = bearing_deg(climb_start_lat, climb_start_lon,
-                             cruise_target_lat, cruise_target_lon)
-    delta_brg = abs(((target_brg - g.dep_heading + 540.0) % 360.0) - 180.0)
+    turn_r_nm = _turn_radius_nm(g.v_cruise)
 
-    # If the corner is ≥ 15° we route through a Bézier whose vertex
-    # sits a short way ahead on the runway heading — the curve leaves
-    # the runway aligned with takeoff direction, bends, then settles
-    # onto the climb line toward cruise_target. This eliminates the
-    # sharp visual corner at lift-off and gives the L1 follower a
-    # smooth path to chase. For straight-on departures (< 15°) we
-    # skip the Bézier and just go straight; cheaper and visually
-    # identical when the angle is small.
-    climb_points: list[tuple[float, float]] = []
-    if delta_brg >= 15.0:
-        # Vertex: 1 nm ahead of dep on the takeoff heading. Far enough
-        # to let the plane align with runway heading initially, close
-        # enough that the bend stays gentle.
-        vertex_lat, vertex_lon = _dest_pt(
-            climb_start_lat, climb_start_lon, g.dep_heading, 1.0 * 1852.0
-        )
-        climb_points = _bezier_corner(
-            climb_start_lat, climb_start_lon,
-            vertex_lat, vertex_lon,
-            cruise_target_lat, cruise_target_lon,
-            n_steps=12,
-        )
-    else:
-        for i in range(1, 13):
-            t = i / 12.0
-            climb_points.append((
-                _interp(climb_start_lat, cruise_target_lat, t),
-                _interp(climb_start_lon, cruise_target_lon, t),
-            ))
+    # Straight initial climb-out: 1 nm dead ahead (liftoff, gear, and
+    # no banking below ~500 AGL).
+    arc_anchor_lat, arc_anchor_lon = _dest_pt(
+        climb_start_lat, climb_start_lon, g.dep_heading, 1.0 * 1852.0,
+    )
 
-    for i, (lat, lon) in enumerate(climb_points):
-        t = (i + 1) / (len(climb_points) + 1)
-        alt = _interp(g.dep_alt_ft, g.cruise_alt_ft, t)
-        hdg = bearing_deg(lat, lon, cruise_target_lat, cruise_target_lon)
-        gear = t < 0.05
-        flap = 0.5 if t < 0.2 else 0.0
-        pts.append(PathPoint(lat, lon, alt, g.v_rotate * 1.3, hdg,
-                             "CLIMB" if t < 0.95 else "CRUISE",
-                             gear, flap, 0.95))
+    # Departure arc → tangent at cruise_target.
+    dep_arc, _exit_hdg = _tangent_arc(
+        arc_anchor_lat, arc_anchor_lon, g.dep_heading,
+        cruise_target_lat, cruise_target_lon, turn_r_nm,
+    )
 
-    # When pattern flying: BASE_LEG from BASE_TURN perpendicular across
-    # to JOIN, then INBOUND straight along centerline to decel_start.
+    # Horizontal skeleton: (lat, lon) list from climb start to
+    # decel_start, arcs included, corners filleted.
+    route: list[tuple[float, float]] = [(climb_start_lat, climb_start_lon),
+                                        (arc_anchor_lat, arc_anchor_lon)]
+    route.extend(dep_arc)
+
     if has_base:
-        base_to_join_hdg = bearing_deg(
-            g.base_turn_lat, g.base_turn_lon, g.join_lat, g.join_lon
-        )
-        # Mid-base point so the polyline shows the cross-leg explicitly.
-        mid_lat = _interp(g.base_turn_lat, g.join_lat, 0.5)
-        mid_lon = _interp(g.base_turn_lon, g.join_lon, 0.5)
-        pts.append(PathPoint(mid_lat, mid_lon, g.cruise_alt_ft,
-                             g.v_approach * 1.6, base_to_join_hdg,
-                             "CRUISE", False, 0.0, 0.0))
-        pts.append(PathPoint(g.join_lat, g.join_lon, g.cruise_alt_ft,
-                             g.v_approach * 1.6, base_to_join_hdg,
-                             "CRUISE", False, 0.0, 0.0))
+        # Fillet at BASE_TURN (between arc exit and JOIN) and at JOIN
+        # (between BASE_TURN and decel_start). The fillets replace the
+        # corner points — the plane never visits the sharp vertex.
+        prev_lat, prev_lon = route[-1]
+        base_fillet = _fillet_arc(prev_lat, prev_lon,
+                                  g.base_turn_lat, g.base_turn_lon,
+                                  g.join_lat, g.join_lon, turn_r_nm)
+        route.extend(base_fillet if base_fillet
+                     else [(g.base_turn_lat, g.base_turn_lon)])
+        join_fillet = _fillet_arc(g.base_turn_lat, g.base_turn_lon,
+                                  g.join_lat, g.join_lon,
+                                  g.decel_start_lat, g.decel_start_lon,
+                                  turn_r_nm)
+        route.extend(join_fillet if join_fillet
+                     else [(g.join_lat, g.join_lon)])
+    else:
+        prev_lat, prev_lon = route[-1]
+        join_fillet = _fillet_arc(prev_lat, prev_lon,
+                                  g.join_lat, g.join_lon,
+                                  g.decel_start_lat, g.decel_start_lon,
+                                  turn_r_nm)
+        route.extend(join_fillet if join_fillet
+                     else [(g.join_lat, g.join_lon)])
 
-    # Inbound: straight leg from join_point → decel_start along centerline
-    pts.append(PathPoint(g.decel_start_lat, g.decel_start_lon, g.cruise_alt_ft,
-                         g.v_approach * 1.6, g.rwy_heading, "CRUISE",
-                         False, 0.0, 0.0))
+    route.append((g.decel_start_lat, g.decel_start_lon))
+
+    # Densify long straight gaps so the follower always has a segment
+    # nearby (arcs are already dense).
+    dense: list[tuple[float, float]] = [route[0]]
+    for a, b in zip(route, route[1:]):
+        gap_nm = haversine_m(a[0], a[1], b[0], b[1]) / 1852.0
+        n_mid = int(gap_nm / 1.5)
+        for i in range(1, n_mid + 1):
+            t = i / (n_mid + 1)
+            dense.append((_interp(a[0], b[0], t), _interp(a[1], b[1], t)))
+        dense.append(b)
+
+    # ── Vertical profile along the route ─────────────────────────────
+    # Climb at the measured gradient (climb rate over forward speed)
+    # until cruise alt, then level. The plane climbs THROUGH the
+    # departure arc — no "climb first, then turn" fiction.
+    v_climb_kts = g.v_rotate * 1.3
+    climb_grad_ft_per_nm = (_CLIMB_RATE_FPS / (v_climb_kts * 1.68781)) * 6076.12
+    cum_nm = 0.0
+    prev_pt = dense[0]
+    for idx, (lat, lon) in enumerate(dense[1:], start=1):
+        cum_nm += haversine_m(prev_pt[0], prev_pt[1], lat, lon) / 1852.0
+        prev_pt = (lat, lon)
+        alt = min(g.cruise_alt_ft,
+                  g.dep_alt_ft + cum_nm * climb_grad_ft_per_nm)
+        climbing = alt < g.cruise_alt_ft - 50.0
+        hdg = bearing_deg(dense[idx - 1][0], dense[idx - 1][1], lat, lon)
+        gear = cum_nm < 0.3
+        flap = 0.5 if cum_nm < 0.8 else 0.0
+        pts.append(PathPoint(
+            lat, lon, alt,
+            v_climb_kts if climbing else g.v_cruise,
+            hdg, "CLIMB" if climbing else "CRUISE",
+            gear, flap, 0.95 if climbing else 0.0,
+        ))
 
     # Descent leg: 16 points from descent_start → approach_start.
     # Dense sampling (was 4) for future obstacle-avoidance work — the

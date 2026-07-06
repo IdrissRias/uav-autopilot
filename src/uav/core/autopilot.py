@@ -14,6 +14,7 @@ from uav.sim.adapter_base import SimAdapter
 from uav.sim.types import Actuators, Telemetry
 from uav.comms import broadcast
 from uav.nav.runway_detect import detect_runway, RunwayDetection
+from uav.nav.flight_plan_v2 import pick_cruise_alt_agl
 from uav.db import local_db
 
 
@@ -164,7 +165,7 @@ class Autopilot:
 
             # Compute cruise altitude
             dist_nm = haversine_m(dep_lat, dep_lon, dest_lat, dest_lon) / 1852.0
-            cruise_alt_agl = max(1500.0, min(5000.0, 55.0 * dist_nm))
+            cruise_alt_agl = pick_cruise_alt_agl(dist_nm)
             cruise_alt = dep_alt + cruise_alt_agl
 
             # Look up destination runway. User-drawn runways are packed
@@ -901,7 +902,7 @@ class Autopilot:
                                     float(dest["lat"]), float(dest["lon"]),
                                 ) / 1852.0
                                 ground_msl_ft = telemetry.altitude_ft
-                                cruise_alt_agl = max(1500.0, min(5000.0, 55.0 * dist_nm))
+                                cruise_alt_agl = pick_cruise_alt_agl(dist_nm)
                                 initial_target = ground_msl_ft + cruise_alt_agl
                                 ctx["targets"]["target_alt_ft"] = initial_target
                                 ctx["takeoff_alt_ft"] = telemetry.altitude_ft
@@ -1009,7 +1010,7 @@ class Autopilot:
                             ctx["destination"]["lat"], ctx["destination"]["lon"],
                         ) / 1852.0
                         ground_msl_ft = telemetry.altitude_ft  # on the ground, alt ≈ ground MSL
-                        cruise_alt_agl = max(1500.0, min(5000.0, 55.0 * dist_nm))
+                        cruise_alt_agl = pick_cruise_alt_agl(dist_nm)
                         initial_target = ground_msl_ft + cruise_alt_agl
                         ctx["targets"]["target_alt_ft"] = initial_target
                         ctx["takeoff_alt_ft"] = telemetry.altitude_ft
