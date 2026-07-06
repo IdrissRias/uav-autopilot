@@ -98,6 +98,11 @@ class SimpleFixedWingController(Controller):
         self.gains = gains or ControlGains()
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
+        # Leaky integrator for the throttle_for_alt alt hold. P-only left
+        # a standing alt error whenever holding altitude needed more (or
+        # less) than the baseline throttle. The leak (time constant ~50 s
+        # at 20 Hz) self-limits windup; cleared whenever the mode is off.
+        self._alt_thr_integral = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -166,6 +171,7 @@ class SimpleFixedWingController(Controller):
         # ── Throttle ─────────────────────────────────────────────────
         if targets.throttle is not None:
             # Explicit throttle from ribbon (e.g. CLIMB full, FLARE idle)
+            self._alt_thr_integral = 0.0
             throttle_cmd = targets.throttle
         elif targets.throttle_for_alt:
             # Alt → Throttle (P-only)
@@ -177,14 +183,22 @@ class SimpleFixedWingController(Controller):
             # 0–1 range this gives crisp recovery without integral
             # windup carrying over from earlier phases.
             ALT_TO_THROTTLE_KP = 0.003
+            ALT_TO_THROTTLE_KI = 0.0001   # 100 ft error → +0.01 throttle/s
             # Baseline: commander-supplied (near idle on glideslope
             # phases, where gravity provides the energy) or the default
             # cruise setting for level flight.
             base = (targets.throttle_base
                     if targets.throttle_base is not None
                     else self.cruise_throttle)
-            throttle_cmd = base + alt_error * ALT_TO_THROTTLE_KP
+            # Leaky integral trims the standing error P-only leaves when
+            # level flight needs more/less than baseline throttle.
+            self._alt_thr_integral += alt_error * dt * ALT_TO_THROTTLE_KI
+            self._alt_thr_integral *= 0.999  # leak — self-limiting
+            self._alt_thr_integral = max(-0.15, min(0.15, self._alt_thr_integral))
+            throttle_cmd = (base + alt_error * ALT_TO_THROTTLE_KP
+                            + self._alt_thr_integral)
         else:
+            self._alt_thr_integral = 0.0
             throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(
                 spd_error, dt, measurement=telemetry.airspeed_kts,
             )

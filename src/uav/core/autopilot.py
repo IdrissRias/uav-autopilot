@@ -1152,8 +1152,12 @@ class Autopilot:
                                 event_type = "liftoff"
                                 message = f"Liftoff at {telemetry.airspeed_kts:.0f} kts"
                             elif phase == "LAND":
-                                event_type = "touchdown"
-                                message = f"Touchdown at {telemetry.airspeed_kts:.0f} kts"
+                                # LAND phase begins at FLARE entry (~30 ft
+                                # AGL) — the plane is still flying. The
+                                # real "touchdown" event is logged by the
+                                # wheels-down finalize block below.
+                                event_type = "flare_start"
+                                message = f"Flare at {telemetry.airspeed_kts:.0f} kts"
                             local_db.log_event(
                                 self._flight_id, event_type,
                                 message=message,
@@ -1196,13 +1200,35 @@ class Autopilot:
                     except Exception:
                         pass
 
-                # Finalize score + observer on first LAND tick with wheels on ground
+                # Finalize score + observer at ACTUAL touchdown: LAND
+                # phase AND wheels on the ground. LAND begins at FLARE
+                # entry (30 ft AGL) — finalizing there recorded the
+                # flare-entry speed (~106 kts) as "touchdown speed" and
+                # measured the landing position while still airborne.
+                import math as _m_land
+                _agl_land_ft = ((telemetry.agl_m * 3.28084)
+                                if not _m_land.isnan(telemetry.agl_m) else 999.0)
                 if (phase == "LAND"
-                        and self._prev_phase != "LAND"
+                        and _agl_land_ft < 10.0
                         and not self._landed
                         and self._scorer is not None
                         and telemetry.has_position()):
                     self._landed = True
+                    if self._flight_id:
+                        try:
+                            local_db.log_event(
+                                self._flight_id, "touchdown",
+                                message=f"Touchdown at {telemetry.airspeed_kts:.0f} kts",
+                                altitude_ft=telemetry.altitude_ft,
+                                agl_ft=_agl_land_ft,
+                                airspeed_kts=telemetry.airspeed_kts,
+                                heading_deg=telemetry.heading_deg,
+                                lat=telemetry.lat_deg,
+                                lon=telemetry.lon_deg,
+                                phase="LAND",
+                            )
+                        except Exception:
+                            pass
                     score = self._scorer.finalize(
                         landing_lat=telemetry.lat_deg,
                         landing_lon=telemetry.lon_deg,

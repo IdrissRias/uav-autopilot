@@ -839,7 +839,24 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             aim_lat=g.descent_start_lat, aim_lon=g.descent_start_lon,
             gear_down=False, flap_ratio=0.0,
             roll_limit=0.25, pitch_limit=0.15,
-            trigger=Trigger("speed_lte", value=g.flap_safe_kts),
+            # Speed is the normal release; the near_point fallback stops
+            # the plane overflying descent_start at cruise alt when the
+            # bleed is slower than planned (it then arrives at the
+            # threshold miles high). Releasing fast used to be dangerous
+            # (flight 20260419_145404: scheduled flaps + steep slope →
+            # overspeed into terrain) but is safe now: flaps are
+            # situational (clean wing while above/on slope) and pitch
+            # tracks speed on descent, so a fast release just descends
+            # clean and bleeds on the way down.
+            trigger=Trigger(
+                "any",
+                subs=(
+                    Trigger("speed_lte", value=g.flap_safe_kts),
+                    Trigger("near_point", value=0.3,
+                            lat=g.descent_start_lat,
+                            lon=g.descent_start_lon),
+                ),
+            ),
         ),
 
         # ── 8. DESCENT ───────────────────────────────────────────────
