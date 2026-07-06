@@ -167,6 +167,13 @@ class SimpleFixedWingController(Controller):
             vs = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
             pitch_cmd = (-spd_error * SPEED_TO_PITCH_KP
                          - vs * VS_TO_PITCH_DAMP)
+            # Never DIVE for speed while at/below the target altitude —
+            # buying KE with PE we don't have is the throttle's job.
+            # (TRANSITION entered 20 kts slow and 50 ft low; the pitch
+            # law dove −0.31, sank further, then zoomed +130 ft over.
+            # Nose-down for speed is legitimate only with alt to spare.)
+            if alt_error > -20.0:
+                pitch_cmd = max(pitch_cmd, -0.05)
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
@@ -206,7 +213,10 @@ class SimpleFixedWingController(Controller):
             # level flight needs more/less than baseline throttle.
             self._alt_thr_integral += alt_error * dt * ALT_TO_THROTTLE_KI
             self._alt_thr_integral *= 0.999  # leak — self-limiting
-            self._alt_thr_integral = max(-0.15, min(0.15, self._alt_thr_integral))
+            # Clamp ±0.30: ±0.15 couldn't span the gap between the
+            # baseline and this airframe's true level-flight thrust, so
+            # cruise parked ~90 ft off target (flight 20260706_135230).
+            self._alt_thr_integral = max(-0.30, min(0.30, self._alt_thr_integral))
             # VS damping: climbing through the target → cut power EARLY,
             # before the alt error flips sign. Rate feedback = the D term
             # the P-only law was missing (see phugoid note above).
@@ -228,6 +238,22 @@ class SimpleFixedWingController(Controller):
             max_step = 0.5 * dt
             throttle_cmd = max(self._prev_throttle - max_step,
                                min(self._prev_throttle + max_step, throttle_cmd))
+
+        # ── STALL FLOOR — overrides everything, including the slew ───
+        # Low and slow is the one corner of the energy matrix where
+        # throttle is the ONLY fix. Flight 20260706_135230: gear drag at
+        # idle above the slope bled 113 → 68 kts while the alt-priority
+        # law held throttle at zero — the coupling starved the plane to
+        # defend an altitude CEILING. Below the floor, power ramps in
+        # proportionally (floor-5 kts → half, floor-10 → full) no matter
+        # what the altitude error says. No slew: stall recovery is the
+        # one case where the engine IS a switch.
+        if (targets.stall_floor_kts is not None
+                and not math.isnan(telemetry.airspeed_kts)
+                and telemetry.airspeed_kts < targets.stall_floor_kts):
+            deficit_kts = targets.stall_floor_kts - telemetry.airspeed_kts
+            throttle_cmd = max(throttle_cmd, min(1.0, deficit_kts * 0.1))
+
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth
         self._prev_throttle = throttle_cmd
 

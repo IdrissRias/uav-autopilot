@@ -86,6 +86,13 @@ class Targets:
     # tracks this INSTEAD of altitude/speed — used by the flare, where
     # what matters is arresting sink, not holding an altitude.
     vs_target_fpm: float | None = None
+    # Stall floor (kts). Below this airspeed the controller FORCES
+    # throttle up regardless of the alt-priority coupling — the
+    # low-and-slow corner of the energy matrix, where power is the only
+    # fix. Flight 20260706_135230 mushed to 68 kts at idle because the
+    # plane was above the slope and the alt law refused power. None on
+    # phases where slow is by design (flare/rollout).
+    stall_floor_kts: float | None = None
 
 
 class Mode(str, Enum):

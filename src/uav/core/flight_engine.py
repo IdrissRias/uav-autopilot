@@ -327,6 +327,17 @@ class FlightEngine:
 
         # ── Speed target ─────────────────────────────────────────────
         speed = kf.target_speed_kts  # None = no speed regulation
+        # Above the slope, the descent speed target is a CEILING, not a
+        # setpoint. Chasing 133 kts nose-down while high spends altitude
+        # to buy speed the plane doesn't need; retargeting v_approach
+        # makes the pitch law trim nose-UP instead — induced drag eats
+        # the surplus energy and the descent angle steepens until the
+        # slope is recaptured from above. (The stall floor guards the
+        # low end.)
+        if (kf.alt_mode == "glideslope" and kf.phase == "DESCENT"
+                and speed is not None and t.has_position()
+                and (t.altitude_ft - alt) > 100.0):
+            speed = min(speed, g.v_approach)
 
         # ── Throttle ─────────────────────────────────────────────────
         if kf.throttle_mode == "alt_scaled":
@@ -429,6 +440,13 @@ class FlightEngine:
                 scale = 0.3 + 0.7 * max(0.0, min(1.0, (80.0 - spd) / 40.0))
                 brake = brake * scale
 
+        # Stall floor: in-flight phases get a hard "power below this
+        # speed" guarantee, whatever the alt-priority coupling wants.
+        # FLARE/ROLLOUT/GROUND are excluded — slow there is by design.
+        stall_floor = (g.v_land
+                       if kf.phase in ("CLIMB", "CRUISE", "DESCENT", "APPROACH")
+                       else None)
+
         return Targets(
             heading_deg=hdg,
             altitude_ft=alt,
@@ -446,6 +464,7 @@ class FlightEngine:
             throttle_for_alt=kf.throttle_for_alt,
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
+            stall_floor_kts=stall_floor,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────
