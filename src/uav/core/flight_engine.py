@@ -32,6 +32,13 @@ from uav.nav.geo import bearing_deg, haversine_m
 from uav.sim.types import Telemetry, Targets
 from uav.core.guidance.track_follower import TrackFollower, TrackState
 
+# How far above the commanded glideslope altitude the plane may be
+# before a scheduled flap increase is deferred (see flap gating in
+# _resolve). 100 ft ≈ 6 s of convergence at the final-approach sink
+# rate — tight enough to catch a real balloon, loose enough that
+# normal tracking noise doesn't hold the flaps hostage.
+_FLAP_DEFER_ABOVE_FT = 100.0
+
 
 class FlightEngine:
     def __init__(self, ctx: dict) -> None:
@@ -361,6 +368,23 @@ class FlightEngine:
                 else (prev.gear_down if prev and prev.gear_down is not None else True))
         flap = (kf.flap_ratio if kf.flap_ratio is not None
                 else (prev.flap_ratio if prev and prev.flap_ratio is not None else 0.0))
+        # ── Situational flap gating ──────────────────────────────────
+        # Flaps add lift the moment they deploy. If the plane is already
+        # ABOVE the glideslope, that lift balloons it further off the
+        # slope — pitch is tracking speed in these phases and throttle
+        # is already near idle, so nothing pulls the plane back down and
+        # it floats past the touchdown point. Defer any flap INCREASE
+        # until the plane is within _FLAP_DEFER_ABOVE_FT of the slope;
+        # the deferred setting deploys automatically once it converges.
+        # Flaps already out are never retracted (config stability), and
+        # FLARE is exempt — its commanded alt is clamped near the
+        # pavement, which would read as "high" forever. Gear is NOT
+        # gated: gear is drag without lift, which helps when high.
+        if (kf.alt_mode == "glideslope" and kf.phase != "FLARE"
+                and prev is not None and prev.flap_ratio is not None
+                and flap > prev.flap_ratio
+                and (t.altitude_ft - alt) > _FLAP_DEFER_ABOVE_FT):
+            flap = prev.flap_ratio
         brake = kf.brake_ratio if kf.brake_ratio is not None else 0.0
         # Progressive braking: slamming parkbrake + full wheel brakes at
         # touchdown speed (~98 kts) is how tires blow. Ramp from 30% at
