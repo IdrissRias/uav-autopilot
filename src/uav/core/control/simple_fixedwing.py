@@ -146,11 +146,14 @@ class SimpleFixedWingController(Controller):
         # swapped paths (gains picked to match the original PID's
         # full-strength response at typical errors).
         if targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
-            # Sink-rate tracking (flare). The commander orders a vertical
-            # speed; pitch arrests the difference. P-only: 500 fpm of
-            # error → 0.15 pitch. Altitude is irrelevant in the flare —
-            # what breaks a landing is vertical speed at the pavement.
-            VS_TO_PITCH_KP = 0.0003
+            # Sink-rate tracking (glideslope + flare). The commander
+            # orders a vertical speed; pitch drives the difference to
+            # zero WITH AUTHORITY: 500 fpm of error → 0.4 of stick.
+            # The old 0.0003 gain leaned into the descent instead of
+            # committing to it and the plane never reached the line.
+            # Altitude is irrelevant in the flare — what breaks a
+            # landing is vertical speed at the pavement.
+            VS_TO_PITCH_KP = 0.0008
             pitch_cmd = (targets.vs_target_fpm - telemetry.vs_fpm) * VS_TO_PITCH_KP
         elif targets.throttle_for_alt:
             # Speed → Pitch (sign-inverted) + vertical-speed damping.

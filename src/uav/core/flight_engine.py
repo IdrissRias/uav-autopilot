@@ -383,12 +383,14 @@ class FlightEngine:
                       else t.airspeed_kts)
             gs_nm_min = max(0.0, gs_kts) / 60.0
             required_fpm = -(local_slope * gs_nm_min)
-            # Convergence: 1.5 fpm extra per ft above the slope (200 ft
-            # high → -300 fpm steeper). Below the slope the sink eases
-            # toward -200 but never goes positive.
+            # Convergence: 1.5 fpm extra per ft above the slope. NO
+            # lower clamp — the target line is religion and the plane
+            # dives as hard as the line demands (the -2600 ceiling was
+            # why it converged too slowly to land on target). The only
+            # bound is the -200 upper edge: pitch never commands UP on
+            # the glideslope; below the line, power is the fix.
             off_slope_ft = t.altitude_ft - alt
-            vs_target = required_fpm - off_slope_ft * 1.5
-            vs_target = max(-2600.0, min(-200.0, vs_target))
+            vs_target = min(-200.0, required_fpm - off_slope_ft * 1.5)
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
         # Glideslope descents now fly CONFIGURED (gear + flaps out from
