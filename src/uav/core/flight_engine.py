@@ -50,6 +50,10 @@ class FlightEngine:
         # plane tracks the ribbon LINE, not individual aim points.
         self._follower: Optional[TrackFollower] = None
         self._last_track: Optional[TrackState] = None
+        # Landing commitment latch (see _resolve). Once armed the plane
+        # stops flying and starts landing: one-way, no exit until wheels.
+        self._land_committed = False
+        self._commit_vs_fpm: Optional[float] = None
 
     # ── Public interface ─────────────────────────────────────────────
 
@@ -75,6 +79,8 @@ class FlightEngine:
         self._prev_targets = None
         self._follower = None
         self._last_track = None
+        self._land_committed = False
+        self._commit_vs_fpm = None
         self.ctx.pop("mode_state", None)
         self.ctx.pop("destination", None)
         self.ctx.pop("_aim_passed_kf", None)
@@ -473,6 +479,59 @@ class FlightEngine:
                        if kf.phase in ("CLIMB", "CRUISE", "DESCENT", "APPROACH")
                        else None)
 
+        # ── LANDING COMMITMENT ───────────────────────────────────────
+        # Above the gate the plane negotiates; below it, it executes.
+        # Modeled on real autoland: flare latches at ~50 ft radio alt
+        # with auto-retard to idle, and the stabilized-approach doctrine
+        # gates entry — unstable at the gate means NO latch (airline
+        # rule would be a go-around; we keep flying the approach laws).
+        #
+        # Gate (all must hold): AGL ≤ 50 ft, within 0.6 nm of the
+        # threshold, heading within 15° of the runway, sink < 1000 fpm,
+        # speed ≤ v_land + 25.
+        #
+        # Once latched (one-way until wheels / flight reset):
+        #   • throttle locked idle (retard), stall floor off
+        #   • sink target follows the flare curve as a RATCHET — it only
+        #     ever gets shallower; an AGL blip can't re-steepen it, and
+        #     nothing ever commands up
+        #   • emergency arrest: actual sink past 1000 fpm near the
+        #     ground bypasses the ratchet for a full-authority arrest
+        #     (commit to landing, not to impact)
+        #   • bank capped ~9° (wing-strike protection near the ground)
+        roll_lim = kf.roll_limit
+        agl_ft_commit = ((t.agl_m * 3.28084)
+                         if not math.isnan(t.agl_m) else float("inf"))
+        if kf.phase in ("APPROACH", "FLARE") and t.has_position():
+            if not self._land_committed:
+                d_thr_nm = haversine_m(t.lat_deg, t.lon_deg,
+                                       g.thr_lat, g.thr_lon) / 1852.0
+                hdg_off = abs(((t.heading_deg - g.rwy_heading + 180.0)
+                               % 360.0) - 180.0)
+                sink_ok = (math.isnan(t.vs_fpm) or t.vs_fpm > -1000.0)
+                speed_ok = (math.isnan(t.airspeed_kts)
+                            or t.airspeed_kts <= g.v_land + 25.0)
+                if (agl_ft_commit <= 50.0 and d_thr_nm <= 0.6
+                        and hdg_off <= 15.0 and sink_ok and speed_ok):
+                    self._land_committed = True
+                    self._commit_vs_fpm = None
+                    print(f"[LANDING] COMMITTED — agl={agl_ft_commit:.0f}ft "
+                          f"spd={t.airspeed_kts:.0f}kts "
+                          f"sink={t.vs_fpm:.0f}fpm. One way down.")
+            if self._land_committed:
+                throttle = 0.0          # retard — and it stays there
+                throttle_base = None
+                stall_floor = None
+                roll_lim = 0.10         # ~9° bank cap near the ground
+                curve = max(-600.0, -(120.0 + max(0.0, agl_ft_commit) * 10.0))
+                if self._commit_vs_fpm is None:
+                    self._commit_vs_fpm = curve
+                else:  # ratchet: shallower only, never re-steepen
+                    self._commit_vs_fpm = max(self._commit_vs_fpm, curve)
+                vs_target = self._commit_vs_fpm
+                if (not math.isnan(t.vs_fpm) and t.vs_fpm < -1000.0):
+                    vs_target = -150.0  # emergency arrest, ratchet bypassed
+
         return Targets(
             heading_deg=hdg,
             altitude_ft=alt,
@@ -481,7 +540,7 @@ class FlightEngine:
             brake_ratio=brake,
             gear_down=gear,
             flap_ratio=flap,
-            roll_limit=kf.roll_limit,
+            roll_limit=roll_lim,
             pitch_limit=kf.pitch_limit,
             pitch_down_limit=kf.pitch_down_limit,
             yaw_hold=kf.yaw_hold,
