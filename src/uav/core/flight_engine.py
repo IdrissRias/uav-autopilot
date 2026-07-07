@@ -68,6 +68,7 @@ class FlightEngine:
         # lands parallel to the runway, beside it. Slow integral trims
         # the residual to zero. Degrees; clamped ±5.
         self._cl_int_deg = 0.0
+        self._td_ticks = 0
 
     # ── Public interface ─────────────────────────────────────────────
 
@@ -99,6 +100,7 @@ class FlightEngine:
         self._cmd_spd_smooth = None
         self._ramp_ts = None
         self._cl_int_deg = 0.0
+        self._td_ticks = 0
         self.ctx.pop("mode_state", None)
         self.ctx.pop("destination", None)
         self.ctx.pop("_aim_passed_kf", None)
@@ -224,6 +226,16 @@ class FlightEngine:
         while self._idx < len(r.keyframes) - 1:
             kf = r.keyframes[self._idx]
             if kf.trigger.fired(telemetry, agl_ft):
+                # Touchdown debounce: FLARE→ROLLOUT latched once on a
+                # single transient AGL=0 frame while 22 ft up (bounced
+                # landing, derotation active mid-air). The wheels-down
+                # advance needs 3 consecutive fired ticks.
+                if kf.name == "FLARE":
+                    self._td_ticks += 1
+                    if self._td_ticks < 3:
+                        break
+                else:
+                    self._td_ticks = 0
                 self._idx += 1
                 new_kf = r.keyframes[self._idx]
                 print(f"[RIBBON] advance → {new_kf.name} [{new_kf.phase}]  "
@@ -407,6 +419,7 @@ class FlightEngine:
         else:
             throttle = prev.throttle if prev else None
 
+        pitch_cap = kf.pitch_limit
         # ── Sink-rate commands (pitch flies the path) ────────────────
         # FLARE: target decays with AGL: -420 fpm entering at 30 ft,
         # -220 at 10 ft, -120 at the pavement — an exponential-style
@@ -432,7 +445,20 @@ class FlightEngine:
             # waiting to happen. A small negative VS demand on the ground
             # (vs ≈ 0) resolves to steady gentle FORWARD stick: the
             # nosewheel comes down and stays down.
-            vs_target = -100.0
+            #
+            # BOUNCE GUARD: flight 946a68cb latched ROLLOUT on a
+            # transient AGL=0 while still 22 ft up, then derotation
+            # pushed the nose DOWN through three bounce cycles — slam,
+            # bounce, slam. Airborne again (> 5 ft) means we are NOT
+            # rolling out, whatever the keyframe says: fly the flare
+            # arrest until genuinely down.
+            agl_ro_ft = ((t.agl_m * 3.28084)
+                         if not math.isnan(t.agl_m) else 0.0)
+            if agl_ro_ft > 5.0:
+                vs_target = -150.0
+                pitch_cap = 0.25   # give the arrest a real nose-up range
+            else:
+                vs_target = -100.0
         elif kf.alt_mode == "glideslope" and t.has_position():
             from uav.nav.flight_plan_v2 import (
                 _GLIDE_FT_PER_NM as _STEEP2,
@@ -643,7 +669,7 @@ class FlightEngine:
             gear_down=gear,
             flap_ratio=flap,
             roll_limit=roll_lim,
-            pitch_limit=kf.pitch_limit,
+            pitch_limit=pitch_cap,
             pitch_down_limit=kf.pitch_down_limit,
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,

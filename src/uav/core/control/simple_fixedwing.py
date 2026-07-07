@@ -318,10 +318,20 @@ class SimpleFixedWingController(Controller):
         # or below the target line (alt_error ≥ −50 ft). Above it, the
         # nose owns the recovery. No slew when it fires: stall recovery
         # is the one case where the engine IS a switch.
+        # The alt-gate (only power when at/below the line) holds EXCEPT
+        # on short final: below 600 ft AGL, slow gets power regardless
+        # of the slope. Flight 946a68cb flew final at 70 kts because it
+        # was above the line — at that speed with full flaps the
+        # elevator ran out of authority (stick pinned +0.25, nose still
+        # falling), the plane dove to -1300 fpm, the commit gate rightly
+        # refused, and it bounced. Near the ground, airspeed IS the
+        # flare; the doctrine yields to physics there.
+        low_final = (not math.isnan(telemetry.agl_m)
+                     and telemetry.agl_m * 3.28084 < 600.0)
         if (targets.stall_floor_kts is not None
                 and not math.isnan(telemetry.airspeed_kts)
                 and telemetry.airspeed_kts < targets.stall_floor_kts
-                and alt_error >= -50.0):
+                and (alt_error >= -50.0 or low_final)):
             deficit_kts = targets.stall_floor_kts - telemetry.airspeed_kts
             throttle_cmd = max(throttle_cmd, min(1.0, deficit_kts * 0.1))
 

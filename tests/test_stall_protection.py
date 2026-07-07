@@ -53,10 +53,25 @@ class TestStallFloor(unittest.TestCase):
                      stall_floor_kts=98.4)
         t = Telemetry(airspeed_kts=90.0, altitude_ft=2400.0, pitch_deg=5.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
-                      vs_fpm=-300.0, agl_m=350.0)
+                      vs_fpm=-300.0, agl_m=350.0)  # 1150 ft AGL: doctrine holds
         act = ctl.compute(t, tg, 0.05)
         self.assertLess(act.throttle, 0.2,
                         "400 ft above target: the nose owns the recovery.")
+
+    def test_short_final_slow_gets_power_even_when_high(self):
+        # Below 600 ft AGL, airspeed IS the flare: at 70 kts full flaps
+        # the elevator stalls out and no amount of nose-down fixes the
+        # arrival (flight 946a68cb bounced from exactly this).
+        ctl = _ctl()
+        tg = Targets(heading_deg=90.0, altitude_ft=1500.0, airspeed_kts=103.0,
+                     throttle=None, throttle_for_alt=True, throttle_base=0.30,
+                     stall_floor_kts=98.4)
+        t = Telemetry(airspeed_kts=72.0, altitude_ft=1750.0, pitch_deg=3.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=-800.0, agl_m=120.0)  # ~400 ft AGL, above slope
+        act = ctl.compute(t, tg, 0.05)
+        self.assertGreaterEqual(act.throttle, 0.9,
+                                "Short final + slow → power, slope or not.")
 
     def test_floor_overrides_explicit_idle(self):
         # DECELERATE commands idle explicitly; the floor still wins.
