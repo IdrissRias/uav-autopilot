@@ -366,6 +366,14 @@ class FlightEngine:
                       if not math.isnan(t.agl_m) else 30.0)
             vs_target = -(120.0 + max(0.0, agl_ft) * 10.0)
             vs_target = max(vs_target, -600.0)  # never command a dive
+        elif kf.phase == "ROLLOUT":
+            # DEROTATION. Without this, rollout fell back to the alt-hold
+            # PID whose wound-up integral yanked full nose-UP on the
+            # runway (P=+1.00 in every rollout log) — a tail strike
+            # waiting to happen. A small negative VS demand on the ground
+            # (vs ≈ 0) resolves to steady gentle FORWARD stick: the
+            # nosewheel comes down and stays down.
+            vs_target = -100.0
         elif kf.alt_mode == "glideslope" and t.has_position():
             from uav.nav.flight_plan_v2 import (
                 _GLIDE_FT_PER_NM as _STEEP2,

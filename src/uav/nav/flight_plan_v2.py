@@ -1080,6 +1080,10 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="dest_runway",
             gear_down=True, flap_ratio=1.0, brake_ratio=1.0,
             roll_limit=0.02,
+            # Nose-up capped at ~zero on the ground (tail-strike
+            # protection); the engine's derotation VS demand supplies
+            # the gentle forward stick.
+            pitch_limit=0.02,
             yaw_hold=True, yaw_kp=0.02, yaw_limit=0.35,
             trigger=Trigger("speed_lte", value=5.0),
         ),
@@ -1091,7 +1095,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="hold",
             heading_mode="dest_runway",
             gear_down=True, flap_ratio=1.0, brake_ratio=1.0,
-            roll_limit=0.02,
+            roll_limit=0.02, pitch_limit=0.02,
             trigger=Trigger("never"),
         ),
     ]
