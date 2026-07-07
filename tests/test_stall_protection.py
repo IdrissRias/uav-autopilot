@@ -161,3 +161,41 @@ class TestDescentSpeedCeiling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModeFlipAndBleed(unittest.TestCase):
+    def test_pid_reset_on_coupling_flip(self):
+        # Classic PIDs sit unused (integrals frozen) while coupled laws
+        # fly; re-entering classic mode with stale state produced the
+        # DECELERATE zoom and the BASE_LEG full-power climb.
+        ctl = _ctl()
+        coupled = Targets(heading_deg=90.0, altitude_ft=3000.0,
+                          airspeed_kts=120.0, throttle=None,
+                          throttle_for_alt=True)
+        classic = Targets(heading_deg=90.0, altitude_ft=3000.0,
+                          airspeed_kts=120.0, throttle=None,
+                          throttle_for_alt=False)
+        t = Telemetry(airspeed_kts=120.0, altitude_ft=3000.0, pitch_deg=0.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=0.0, agl_m=500.0)
+        ctl.compute(t, coupled, 0.05)
+        ctl.altitude_pid._integral = 1.0   # wound while unused
+        ctl.airspeed_pid._integral = 1.0
+        ctl.compute(t, classic, 0.05)      # flip → reset
+        self.assertEqual(ctl.altitude_pid._integral, 0.0)
+        self.assertEqual(ctl.airspeed_pid._integral, 0.0)
+
+    def test_bleed_never_climbs_anywhere(self):
+        # INBOUND traded 30 kts for +300 ft on the loop flight: pitching
+        # up to bleed overspeed while already climbing just re-banks the
+        # energy. Global rule now, not descent-only.
+        ctl = _ctl()
+        tg = Targets(heading_deg=90.0, altitude_ft=2741.0,
+                     airspeed_kts=129.6, throttle=None,
+                     throttle_for_alt=True)
+        t = Telemetry(airspeed_kts=165.0, altitude_ft=2741.0, pitch_deg=5.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=800.0, agl_m=460.0)
+        act = ctl.compute(t, tg, 0.05)
+        self.assertLessEqual(act.pitch, 0.04,
+                             "Overspeed + climbing → no more nose-up.")

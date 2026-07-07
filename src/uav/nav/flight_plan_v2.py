@@ -104,7 +104,8 @@ _CLIMB_RATE_FPS = 30.0               # conservative; measured 34
 _DECEL_SAFETY_MARGIN_NM = 1.0        # extra runway beyond calc'd bleed dist
 _DECEL_LEN_MAX_NM = 15.0             # cap for extreme-alt descents
 _INTERCEPT_ANGLE_DEG = 30.0  # shallow intercept onto extended centerline
-_JOIN_MIN_OFFSET_NM = 3.0    # join point always ≥ 3 nm behind decel_start
+_JOIN_MIN_OFFSET_NM = 3.0    # cap: join ≤ 3 nm behind decel_start (long trips)
+_JOIN_MIN_OFFSET_FLOOR_NM = 1.0  # floor for tiny loop flights
 _JOIN_MAX_OFFSET_NM = 80.0   # cap so we don't fly wildly off course
 
 # When the single-leg geometric join would force a turn ≥ this many
@@ -558,7 +559,13 @@ def _compute_join_geometry(
     d_perp = math.hypot(perp_e, perp_n)
 
     intercept_off = d_perp / math.tan(math.radians(_INTERCEPT_ANGLE_DEG))
-    t_min = t_decel + _JOIN_MIN_OFFSET_NM
+    # Join run-up scales with the trip: a 30 nm flight earns the full
+    # 3 nm alignment leg; a same-field loop only pays ~1 nm, which cuts
+    # the loop's total footprint (and test-cycle time) roughly in half.
+    dep_dist_nm = math.hypot(dep_e, dep_n)
+    join_offset = max(_JOIN_MIN_OFFSET_FLOOR_NM,
+                      min(_JOIN_MIN_OFFSET_NM, 0.15 * dep_dist_nm))
+    t_min = t_decel + join_offset
     t_max = t_decel + _JOIN_MAX_OFFSET_NM
 
     t_ideal = t_dep - intercept_off
@@ -1115,6 +1122,12 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             base_leg = Keyframe(
                 name="BASE_LEG", phase="CRUISE",
                 throttle_mode="speed_pid",
+                # The ONE cruise keyframe that never got the coupling:
+                # flight 96786124 climbed +1000 ft at full throttle on
+                # base (classic speed-PID slamming power for an 11-kt
+                # deficit while the wound alt PID pitched up), then
+                # dove to 179 kts at the join.
+                throttle_for_alt=True,
                 target_speed_kts=g.v_cruise,
                 alt_mode="target", target_alt_ft=g.cruise_alt_ft,
                 heading_mode="aim_at",

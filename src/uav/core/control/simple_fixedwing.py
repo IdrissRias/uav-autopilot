@@ -106,11 +106,29 @@ class SimpleFixedWingController(Controller):
         # Last commanded throttle, for the slew limiter ("the engine is
         # not a switch"). Starts at idle.
         self._prev_throttle = 0.0
+        # Coupling-mode tracker: the classic PIDs sit UNUSED while the
+        # coupled laws fly, their integrals frozen mid-thought. Re-entering
+        # classic mode with a stale integral produced full-stick surprises
+        # (DECELERATE's idle zoom, BASE_LEG's full-power climb). Reset on
+        # every flip.
+        self._prev_coupled: bool | None = None
+        # VS-law smoothing state (see the vs_target branch).
+        self._vs_target_smooth: float | None = None
+        self._prev_vs: float | None = None
+        self._vs_rate_filt = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
         alt_error = targets.altitude_ft - telemetry.altitude_ft
         spd_error = targets.airspeed_kts - telemetry.airspeed_kts
+
+        # Coupling-mode flip → wipe the stale integrals of whichever
+        # loops sat unused (they hold minutes-old wound-up state).
+        if (self._prev_coupled is not None
+                and targets.throttle_for_alt != self._prev_coupled):
+            self.altitude_pid.reset()
+            self.airspeed_pid.reset()
+        self._prev_coupled = targets.throttle_for_alt
 
         # ── Heading → Bank → Aileron ─────────────────────────────────
         g = self.gains
@@ -148,13 +166,35 @@ class SimpleFixedWingController(Controller):
         if targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
             # Sink-rate tracking (glideslope + flare). The commander
             # orders a vertical speed; pitch drives the difference to
-            # zero WITH AUTHORITY: 500 fpm of error → 0.4 of stick.
-            # The old 0.0003 gain leaned into the descent instead of
-            # committing to it and the plane never reached the line.
-            # Altitude is irrelevant in the flare — what breaks a
-            # landing is vertical speed at the pavement.
+            # zero WITH AUTHORITY (500 fpm error → 0.4 stick) — but
+            # damped, or it porpoises: the airframe's VS answers the
+            # elevator 1–2 s late, so an undamped P-law overshoots and
+            # reverses forever (flight 96786124's rough final). Two
+            # smoothers, neither a limiter:
+            #   • the TARGET is slewed (≤1500 fpm/s) so staircase jumps
+            #     at slope knees don't whip the stick
+            #   • a VS-RATE term opposes fast changes, easing off
+            #     before the overshoot instead of after
             VS_TO_PITCH_KP = 0.0008
-            pitch_cmd = (targets.vs_target_fpm - telemetry.vs_fpm) * VS_TO_PITCH_KP
+            VS_RATE_DAMP = 0.00015   # 1000 fpm/s of change → 0.15 opposing
+            vs_now_fpm = telemetry.vs_fpm
+            # Target slew
+            if self._vs_target_smooth is None:
+                self._vs_target_smooth = targets.vs_target_fpm
+            else:
+                max_step = 1500.0 * dt
+                self._vs_target_smooth = max(
+                    self._vs_target_smooth - max_step,
+                    min(self._vs_target_smooth + max_step,
+                        targets.vs_target_fpm))
+            # Filtered VS rate
+            if self._prev_vs is not None and dt > 0:
+                raw_rate = (vs_now_fpm - self._prev_vs) / dt
+                self._vs_rate_filt = (0.3 * raw_rate
+                                      + 0.7 * self._vs_rate_filt)
+            self._prev_vs = vs_now_fpm
+            pitch_cmd = ((self._vs_target_smooth - vs_now_fpm) * VS_TO_PITCH_KP
+                         - self._vs_rate_filt * VS_RATE_DAMP)
         elif targets.throttle_for_alt:
             # Speed → Pitch (sign-inverted) + vertical-speed damping.
             #   spd_err > 0 (too slow) → pitch_cmd < 0 (nose-down → gain speed)
@@ -177,10 +217,23 @@ class SimpleFixedWingController(Controller):
             # Nose-down for speed is legitimate only with alt to spare.)
             if alt_error > -20.0:
                 pitch_cmd = max(pitch_cmd, -0.05)
+            # …and never CLIMB to bleed speed. Pulling up converts the
+            # surplus into altitude that must be dumped again minutes
+            # later (INBOUND traded 30 kts for +300 ft on the loop
+            # flight). Bleeding happens level or descending, full stop.
+            if spd_error < -5.0 and vs > 100.0:
+                pitch_cmd = min(pitch_cmd, 0.04)
+            # Leaving VS-tracking mode: clear its smoothing state.
+            self._vs_target_smooth = None
+            self._prev_vs = None
+            self._vs_rate_filt = 0.0
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
             )
+            self._vs_target_smooth = None
+            self._prev_vs = None
+            self._vs_rate_filt = 0.0
 
         # Commander-issued pitch clamp. Nose-up cap is always honored; nose-down
         # cap is opt-in.

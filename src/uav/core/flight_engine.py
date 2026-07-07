@@ -242,7 +242,23 @@ class FlightEngine:
         #                 could not handle overshoot or drift.
         #   hold        → last tick's heading (inertial hold)
         if kf.heading_mode == "dep_runway":
+            # Runway heading + centerline correction, mirroring the
+            # landing side. A bare heading hold let any initial
+            # misalignment accumulate sideways until the plane mowed
+            # the grass (loop flight 96786124's takeoff roll). Anchor:
+            # the planned departure point along the departure heading.
+            # cross > 0 = drifted right of the centerline → steer left.
             hdg = g.dep_heading
+            if t.has_position():
+                d_nm = haversine_m(t.lat_deg, t.lon_deg,
+                                   g.dep_lat, g.dep_lon) / 1852.0
+                if d_nm > 0.002:  # <4 m from anchor: bearing is noise
+                    brg = bearing_deg(g.dep_lat, g.dep_lon,
+                                      t.lat_deg, t.lon_deg)
+                    diff = ((brg - g.dep_heading + 180.0) % 360.0) - 180.0
+                    cross_nm = d_nm * math.sin(math.radians(diff))
+                    hdg = (g.dep_heading
+                           - max(-6.0, min(6.0, cross_nm * 60.0))) % 360.0
         elif kf.heading_mode == "dest_runway":
             # Runway heading + a small centerline correction. A pure
             # heading hold let any residual cross-track at flare entry
@@ -260,7 +276,10 @@ class FlightEngine:
                 # diff > 0 → plane displaced left of the approach course
                 # (facing the runway) → steer right (positive correction).
                 cross_nm = d_nm * math.sin(math.radians(diff))
-                correction = max(-8.0, min(8.0, cross_nm * 40.0))
+                # Gain 60/cap 12° (was 40/8): flight 96786124 drifted
+                # onto the grass in the flare balloon — the correction
+                # was too polite to pull it back in the final seconds.
+                correction = max(-12.0, min(12.0, cross_nm * 60.0))
                 hdg = (g.rwy_heading + correction) % 360.0
         elif kf.heading_mode == "aim_at" and t.has_position() and self._follower is not None:
             track = self._follower.update(t)
