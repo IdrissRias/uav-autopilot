@@ -15,6 +15,7 @@ from uav.sim.types import Actuators, Telemetry
 from uav.comms import broadcast
 from uav.nav.runway_detect import detect_runway, RunwayDetection
 from uav.nav.flight_plan_v2 import pick_cruise_alt_agl
+from uav.nav.geo import bearing_deg as _bd_true
 from uav.db import local_db
 
 
@@ -201,7 +202,14 @@ class Autopilot:
                         best_rwy = None
                         best_diff = 999.0
                         for rwy in rwys:
-                            hdg1 = float(rwy["heading_deg"])
+                            # NEVER trust heading_deg: it's the designator rounded to
+                            # 10 deg (a stored "170" measured 180.0 from its own
+                            # coordinates). A 4-10 deg axis error walks the takeoff
+                            # roll off the pavement and lands the approach ADJACENT to
+                            # the runway. The endpoints are exact - derive from them.
+                            hdg1 = _bd_true(
+                                float(rwy["threshold_lat"]), float(rwy["threshold_lon"]),
+                                float(rwy["end_lat"]), float(rwy["end_lon"]))
                             hdg2 = (hdg1 + 180.0) % 360.0
                             for hdg, tlat, tlon in [
                                 (hdg1, rwy["threshold_lat"], rwy["threshold_lon"]),
@@ -943,7 +951,14 @@ class Autopilot:
                                     #   threshold = runway 09 threshold (west end) — land HERE on rwy 09
                                     #   end = opposite end (east end) — land HERE on rwy 27
                                     # So: hdg1 (090) pairs with threshold, hdg2 (270) pairs with end
-                                    hdg1 = float(rwy["heading_deg"])
+                                    # NEVER trust heading_deg: it's the designator rounded to
+                                    # 10 deg (a stored "170" measured 180.0 from its own
+                                    # coordinates). A 4-10 deg axis error walks the takeoff
+                                    # roll off the pavement and lands the approach ADJACENT to
+                                    # the runway. The endpoints are exact - derive from them.
+                                    hdg1 = _bd_true(
+                                        float(rwy["threshold_lat"]), float(rwy["threshold_lon"]),
+                                        float(rwy["end_lat"]), float(rwy["end_lon"]))
                                     hdg2 = (hdg1 + 180.0) % 360.0
                                     for hdg, tlat, tlon in [
                                         (hdg1, rwy["threshold_lat"], rwy["threshold_lon"]),
