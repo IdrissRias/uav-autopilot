@@ -3,9 +3,10 @@ the ONLY fix. Flight 20260706_135230 mushed 113 → 68 kts at idle
 because the plane was above the slope and the alt-priority law refused
 power. These tests pin the three guards that prevent it:
 
-  1. stall floor forces throttle when slow, overriding alt priority
+  1. stall floor forces throttle when LOW and slow (high-and-slow is
+     a pitch-down problem — altitude has authority)
   2. pitch never dives for speed while at/below target altitude
-  3. descent speed target becomes a ceiling (v_approach) above slope
+  3. above the slope the commanded sink rate steepens (VS convergence)
 """
 from __future__ import annotations
 
@@ -26,21 +27,36 @@ def _ctl():
 
 
 class TestStallFloor(unittest.TestCase):
-    def test_power_forced_when_slow_even_above_slope(self):
-        # The crash scenario: above slope (alt error negative), coupled
-        # mode, speed collapsing. Throttle must come in anyway.
+    def test_power_forced_when_low_and_slow(self):
+        # The one corner where throttle is the ONLY fix: at/below the
+        # target line with speed collapsing.
         ctl = _ctl()
-        tg = Targets(heading_deg=90.0, altitude_ft=2000.0, airspeed_kts=106.0,
+        tg = Targets(heading_deg=90.0, altitude_ft=2400.0, airspeed_kts=106.0,
                      throttle=None, throttle_for_alt=True, throttle_base=0.12,
                      stall_floor_kts=98.4)
-        t = Telemetry(airspeed_kts=88.0, altitude_ft=2400.0, pitch_deg=5.0,
+        t = Telemetry(airspeed_kts=88.0, altitude_ft=2380.0, pitch_deg=5.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
                       vs_fpm=200.0, agl_m=350.0)
         act = ctl.compute(t, tg, 0.05)
         self.assertGreaterEqual(
             act.throttle, 0.9,
-            "10+ kts below the stall floor → near-full power, no slew delay."
+            "10+ kts below the stall floor at/below target → full power."
         )
+
+    def test_no_power_when_slow_but_high(self):
+        # HIGH and slow is a split problem: pitch down, never power.
+        # Flight e9398f14 surged 0.77 throttle at 160 AGL above the
+        # slope — energy INTO a plane trying to land.
+        ctl = _ctl()
+        tg = Targets(heading_deg=90.0, altitude_ft=2000.0, airspeed_kts=106.0,
+                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
+                     stall_floor_kts=98.4)
+        t = Telemetry(airspeed_kts=90.0, altitude_ft=2400.0, pitch_deg=5.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=-300.0, agl_m=350.0)
+        act = ctl.compute(t, tg, 0.05)
+        self.assertLess(act.throttle, 0.2,
+                        "400 ft above target: the nose owns the recovery.")
 
     def test_floor_overrides_explicit_idle(self):
         # DECELERATE commands idle explicitly; the floor still wins.
@@ -94,36 +110,6 @@ class TestNoDiveForSpeed(unittest.TestCase):
                         "With altitude to spare, diving for speed is fine.")
 
 
-class TestBleedMode(unittest.TestCase):
-    def test_holds_drag_attitude_at_target_speed(self):
-        # The P-law relaxes to zero at target speed → best-glide, no
-        # drag, slope never captured. Bleed mode holds the nose up.
-        ctl = _ctl()
-        tg = Targets(heading_deg=90.0, altitude_ft=4000.0, airspeed_kts=106.0,
-                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
-                     bleed_mode=True)
-        t = Telemetry(airspeed_kts=112.0, altitude_ft=4400.0, pitch_deg=2.0,
-                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
-                      vs_fpm=-850.0, agl_m=900.0)
-        act = ctl.compute(t, tg, 0.05)
-        self.assertGreaterEqual(act.pitch, 0.12,
-                                "Bleeding: hold a real nose-up drag attitude.")
-
-    def test_bleed_never_climbs(self):
-        # Pulling into a zoom re-banks the energy as altitude (the
-        # 20-kt zoom-stall). Climbing → pitch capped near level.
-        ctl = _ctl()
-        tg = Targets(heading_deg=90.0, altitude_ft=4000.0, airspeed_kts=106.0,
-                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
-                     bleed_mode=True)
-        t = Telemetry(airspeed_kts=170.0, altitude_ft=4400.0, pitch_deg=10.0,
-                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
-                      vs_fpm=1500.0, agl_m=900.0)
-        act = ctl.compute(t, tg, 0.05)
-        self.assertLessEqual(act.pitch, 0.04,
-                             "Climbing while bleeding is forbidden.")
-
-
 class TestDescentSpeedCeiling(unittest.TestCase):
     def setUp(self):
         self.ribbon = plan_path(
@@ -148,18 +134,14 @@ class TestDescentSpeedCeiling(unittest.TestCase):
                       vs_fpm=-800.0, agl_m=(alt_ft - 1380.0) / 3.28084)
         return self.engine._resolve(self.kf, t, self.ribbon)
 
-    def test_speed_target_drops_when_above_slope(self):
+    def test_vs_target_steepens_when_above_slope(self):
+        # Altitude has authority: above the slope the commanded sink
+        # rate deepens (convergence term), pitch-down as needed.
         on_slope = self._resolve(3000.0).altitude_ft
-        out = self._resolve(on_slope + 300.0)
-        self.assertAlmostEqual(
-            out.airspeed_kts, self.ribbon.geometry.v_approach, delta=0.1,
-        )
-
-    def test_scheduled_speed_when_on_slope(self):
-        on_slope = self._resolve(3000.0).altitude_ft
-        out = self._resolve(on_slope)
-        self.assertAlmostEqual(out.airspeed_kts, self.kf.target_speed_kts,
-                               delta=0.1)
+        vs_on = self._resolve(on_slope).vs_target_fpm
+        vs_high = self._resolve(on_slope + 300.0).vs_target_fpm
+        self.assertLess(vs_high, vs_on,
+                        "300 ft high → steeper commanded sink.")
 
     def test_stall_floor_set_in_flight_phases(self):
         on_slope = self._resolve(3000.0).altitude_ft
@@ -175,11 +157,6 @@ class TestDescentSpeedCeiling(unittest.TestCase):
         out = self._resolve(on_slope + 300.0)  # above slope, 120 kts
         self.assertTrue(out.gear_down,
                         "Gear must lead the descent (drag ladder).")
-
-    def test_bleed_mode_flag_set_above_slope(self):
-        on_slope = self._resolve(3000.0).altitude_ft
-        self.assertTrue(self._resolve(on_slope + 300.0).bleed_mode)
-        self.assertFalse(self._resolve(on_slope).bleed_mode)
 
 
 if __name__ == "__main__":

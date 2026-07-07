@@ -318,28 +318,12 @@ class FlightEngine:
             alt = prev.altitude_ft if prev and prev.altitude_ft is not None else t.altitude_ft
 
         # ── Speed target ─────────────────────────────────────────────
+        # Altitude has authority over speed on the glideslope: the VS
+        # law flies the path with pitch, config provides the drag, and
+        # speed is EMERGENT (bounded by the stall floor below and flap
+        # overspeed protection above). No pitch-up bleed, no speed
+        # retargeting — superseded by configure-early + pitch-down.
         speed = kf.target_speed_kts  # None = no speed regulation
-        # Above the slope, the descent speed target is a CEILING, not a
-        # setpoint. Chasing 133 kts nose-down while high spends altitude
-        # to buy speed the plane doesn't need; retargeting v_approach
-        # makes the pitch law trim nose-UP instead — induced drag eats
-        # the surplus energy and the descent angle steepens until the
-        # slope is recaptured from above. (The stall floor guards the
-        # low end.)
-        pitch_up_cap = kf.pitch_limit
-        bleed_mode = False
-        if (kf.alt_mode == "glideslope" and kf.phase == "DESCENT"
-                and speed is not None and t.has_position()
-                and (t.altitude_ft - alt) > 100.0):
-            speed = min(speed, g.v_approach)
-            # Bleed mode: hold a nose-up drag attitude (the controller
-            # enforces it, plus a never-climb cap — see bleed_mode in
-            # types.py). The keyframe's 0.15 nose-up cap strangled the
-            # bleed, so it opens to 0.35 while there's surplus to dump.
-            bleed_mode = True
-            if (not math.isnan(t.airspeed_kts)
-                    and t.airspeed_kts > speed + 5.0):
-                pitch_up_cap = 0.35
 
         # ── Throttle ─────────────────────────────────────────────────
         if kf.throttle_mode == "alt_scaled":
@@ -498,7 +482,7 @@ class FlightEngine:
             gear_down=gear,
             flap_ratio=flap,
             roll_limit=kf.roll_limit,
-            pitch_limit=pitch_up_cap,
+            pitch_limit=kf.pitch_limit,
             pitch_down_limit=kf.pitch_down_limit,
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
@@ -507,7 +491,6 @@ class FlightEngine:
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
-            bleed_mode=bleed_mode,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────

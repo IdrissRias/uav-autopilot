@@ -71,7 +71,11 @@ class FlightScorer:
     finalize() on touchdown, then save() to persist the score.
     """
 
-    V_LAND_KTAS = 65.0   # reference landing speed for scoring
+    # Fallback only — the real reference comes from the learned envelope
+    # via v_land_kts. The old hardcoded 65 judged the SF50 (v_land 98.4)
+    # as "way too fast" on every landing it ever made, including an
+    # 88-kt touchdown 10 kts UNDER its own book number.
+    V_LAND_KTAS = 65.0
 
     def __init__(
         self,
@@ -80,12 +84,15 @@ class FlightScorer:
         dest_lon: float,
         cruise_target_ft: float,
         log_dir: str = "logs",
+        v_land_kts: float | None = None,
     ) -> None:
         self.dest_icao = dest_icao
         self.dest_lat = dest_lat
         self.dest_lon = dest_lon
         self.cruise_target_ft = cruise_target_ft
         self.log_dir = log_dir
+        if v_land_kts and v_land_kts > 0:
+            self.V_LAND_KTAS = float(v_land_kts)
 
         self._start_ts = time.time()
         self._cruise_alt_samples: List[float] = []  # deviation from target each tick
@@ -117,9 +124,9 @@ class FlightScorer:
         # Accuracy: 40 pts linear 50m → 500m
         pts_acc = max(0.0, 40.0 * (1.0 - max(0.0, landing_dist_m - 50.0) / 450.0))
 
-        # Speed: 30 pts — full points at v_land+5kts, 0 at 110kts
+        # Speed: 30 pts — full points at v_land+5kts, 0 at v_land+35kts
         spd_over = max(0.0, landing_speed_kts - (self.V_LAND_KTAS + 5.0))
-        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / max(1.0, 110.0 - self.V_LAND_KTAS - 5.0)))
+        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / 30.0))
 
         # Time: 20 pts vs personal best for this route
         prev_best_time = self._load_best_time()
@@ -145,9 +152,9 @@ class FlightScorer:
             notes.append("✅ Very accurate landing")
         elif landing_dist_m > 400:
             notes.append("⚠️  Missed by a lot — approach heading needs work")
-        if landing_speed_kts > 90:
+        if landing_speed_kts > self.V_LAND_KTAS + 15.0:
             notes.append("🔴 Way too fast on touchdown — speed bleed needs improvement")
-        elif landing_speed_kts > 75:
+        elif landing_speed_kts > self.V_LAND_KTAS + 5.0:
             notes.append("🟡 A bit fast on touchdown")
         else:
             notes.append("✅ Good landing speed")
@@ -212,7 +219,7 @@ class FlightScorer:
 
         pts_acc = max(0.0, 40.0 * (1.0 - max(0.0, landing_dist_m - 50.0) / 450.0))
         spd_over = max(0.0, current_speed_kts - (self.V_LAND_KTAS + 5.0))
-        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / max(1.0, 110.0 - self.V_LAND_KTAS - 5.0)))
+        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / 30.0))
         # Partial flights don't earn time points — they never completed the route.
         pts_time = 0.0
         pts_stab = max(0.0, 10.0 * (1.0 - max(0.0, cruise_alt_std - 10.0) / 290.0))

@@ -620,6 +620,9 @@ class Autopilot:
             dest_lon=float(dest_info["lon"]),
             cruise_target_ft=ctx["targets"]["target_alt_ft"],
             log_dir="logs",
+            # Judge landings against THIS airframe's envelope, not the
+            # old hardcoded 65-kt reference (SF50 lands at ~98).
+            v_land_kts=float(ctx["airframe"]["speeds_kts"].get("v_land", 0) or 0) or None,
         )
         self._landed = False
 

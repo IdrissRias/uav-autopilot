@@ -93,13 +93,6 @@ class Targets:
     # plane was above the slope and the alt law refused power. None on
     # phases where slow is by design (flare/rollout).
     stall_floor_kts: float | None = None
-    # Bleed mode: the plane is above the glideslope dumping surplus
-    # energy. Pitch HOLDS a nose-up drag attitude (induced drag is the
-    # brake) instead of relaxing to zero when speed reaches target, and
-    # is capped so the bleed never turns into a climb — pulling into a
-    # zoom just re-borrows the energy (flight 914edfc6: 189 kt dive
-    # recovery pulled through level into a zoom that stalled at 20 kts).
-    bleed_mode: bool = False
 
 
 class Mode(str, Enum):

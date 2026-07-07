@@ -174,21 +174,6 @@ class SimpleFixedWingController(Controller):
             # Nose-down for speed is legitimate only with alt to spare.)
             if alt_error > -20.0:
                 pitch_cmd = max(pitch_cmd, -0.05)
-            # ── Bleed mode (above the glideslope) ─────────────────────
-            # The drag that slows the plane IS the pitch-up: induced
-            # drag at high AoA. A P-law relaxes to zero the moment speed
-            # touches target, dropping the plane back to best-glide
-            # (minimum drag, shallowest descent) — flight 914edfc6 mushed
-            # at +0.03 pitch, no drag, never reached the slope. Hold a
-            # real drag attitude while there's surplus to dump…
-            if targets.bleed_mode:
-                if spd_error < -2.0:  # still faster than the bleed target
-                    pitch_cmd = max(pitch_cmd, 0.12)
-                # …but NEVER climb while bleeding: a positive VS means
-                # the pull stopped feeding drag and started re-banking
-                # energy as altitude (the 20-kt zoom-stall).
-                if vs > 100.0:
-                    pitch_cmd = min(pitch_cmd, 0.04)
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
@@ -265,18 +250,22 @@ class SimpleFixedWingController(Controller):
             throttle_cmd = max(self._prev_throttle - max_step,
                                min(self._prev_throttle + max_step, throttle_cmd))
 
-        # ── STALL FLOOR — overrides everything, including the slew ───
+        # ── STALL FLOOR — LOW and slow only ──────────────────────────
         # Low and slow is the one corner of the energy matrix where
-        # throttle is the ONLY fix. Flight 20260706_135230: gear drag at
-        # idle above the slope bled 113 → 68 kts while the alt-priority
-        # law held throttle at zero — the coupling starved the plane to
-        # defend an altitude CEILING. Below the floor, power ramps in
-        # proportionally (floor-5 kts → half, floor-10 → full) no matter
-        # what the altitude error says. No slew: stall recovery is the
-        # one case where the engine IS a switch.
+        # throttle is the ONLY fix (flight 20260706_135230 mushed to
+        # 68 kts at idle). But HIGH and slow is a SPLIT problem, not a
+        # total-energy problem: the fix is pitch DOWN (trade the spare
+        # altitude for the missing speed — free), never power. Flight
+        # e9398f14 surged to 0.77 throttle at 160 AGL while ABOVE the
+        # slope because this floor was altitude-blind — pumping energy
+        # into a plane trying to land. Gate: only force power when at
+        # or below the target line (alt_error ≥ −50 ft). Above it, the
+        # nose owns the recovery. No slew when it fires: stall recovery
+        # is the one case where the engine IS a switch.
         if (targets.stall_floor_kts is not None
                 and not math.isnan(telemetry.airspeed_kts)
-                and telemetry.airspeed_kts < targets.stall_floor_kts):
+                and telemetry.airspeed_kts < targets.stall_floor_kts
+                and alt_error >= -50.0):
             deficit_kts = targets.stall_floor_kts - telemetry.airspeed_kts
             throttle_cmd = max(throttle_cmd, min(1.0, deficit_kts * 0.1))
 
