@@ -174,6 +174,21 @@ class SimpleFixedWingController(Controller):
             # Nose-down for speed is legitimate only with alt to spare.)
             if alt_error > -20.0:
                 pitch_cmd = max(pitch_cmd, -0.05)
+            # ── Bleed mode (above the glideslope) ─────────────────────
+            # The drag that slows the plane IS the pitch-up: induced
+            # drag at high AoA. A P-law relaxes to zero the moment speed
+            # touches target, dropping the plane back to best-glide
+            # (minimum drag, shallowest descent) — flight 914edfc6 mushed
+            # at +0.03 pitch, no drag, never reached the slope. Hold a
+            # real drag attitude while there's surplus to dump…
+            if targets.bleed_mode:
+                if spd_error < -2.0:  # still faster than the bleed target
+                    pitch_cmd = max(pitch_cmd, 0.12)
+                # …but NEVER climb while bleeding: a positive VS means
+                # the pull stopped feeding drag and started re-banking
+                # energy as altitude (the 20-kt zoom-stall).
+                if vs > 100.0:
+                    pitch_cmd = min(pitch_cmd, 0.04)
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
@@ -222,7 +237,13 @@ class SimpleFixedWingController(Controller):
             # the P-only law was missing (see phugoid note above).
             ALT_TO_THROTTLE_VS_DAMP = 0.00015  # 1000 fpm → 0.15 throttle
             vs_thr = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
-            throttle_cmd = (base + alt_error * ALT_TO_THROTTLE_KP
+            # The P contribution is TAPERED (±0.25 up / −0.35 down):
+            # 140 ft below target used to command +0.42 → a ~97% power
+            # lunge for a trim-sized correction, then a hard chop at the
+            # crest ("rough transition"). Big deficits still get full
+            # power via the stall floor and the integrator.
+            p_term = max(-0.35, min(0.25, alt_error * ALT_TO_THROTTLE_KP))
+            throttle_cmd = (base + p_term
                             + self._alt_thr_integral
                             - vs_thr * ALT_TO_THROTTLE_VS_DAMP)
         else:

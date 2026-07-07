@@ -94,6 +94,36 @@ class TestNoDiveForSpeed(unittest.TestCase):
                         "With altitude to spare, diving for speed is fine.")
 
 
+class TestBleedMode(unittest.TestCase):
+    def test_holds_drag_attitude_at_target_speed(self):
+        # The P-law relaxes to zero at target speed → best-glide, no
+        # drag, slope never captured. Bleed mode holds the nose up.
+        ctl = _ctl()
+        tg = Targets(heading_deg=90.0, altitude_ft=4000.0, airspeed_kts=106.0,
+                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
+                     bleed_mode=True)
+        t = Telemetry(airspeed_kts=112.0, altitude_ft=4400.0, pitch_deg=2.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=-850.0, agl_m=900.0)
+        act = ctl.compute(t, tg, 0.05)
+        self.assertGreaterEqual(act.pitch, 0.12,
+                                "Bleeding: hold a real nose-up drag attitude.")
+
+    def test_bleed_never_climbs(self):
+        # Pulling into a zoom re-banks the energy as altitude (the
+        # 20-kt zoom-stall). Climbing → pitch capped near level.
+        ctl = _ctl()
+        tg = Targets(heading_deg=90.0, altitude_ft=4000.0, airspeed_kts=106.0,
+                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
+                     bleed_mode=True)
+        t = Telemetry(airspeed_kts=170.0, altitude_ft=4400.0, pitch_deg=10.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=1500.0, agl_m=900.0)
+        act = ctl.compute(t, tg, 0.05)
+        self.assertLessEqual(act.pitch, 0.04,
+                             "Climbing while bleeding is forbidden.")
+
+
 class TestDescentSpeedCeiling(unittest.TestCase):
     def setUp(self):
         self.ribbon = plan_path(
@@ -136,6 +166,20 @@ class TestDescentSpeedCeiling(unittest.TestCase):
         out = self._resolve(on_slope)
         self.assertAlmostEqual(out.stall_floor_kts,
                                self.ribbon.geometry.v_land, delta=0.1)
+
+    def test_gear_leads_the_descent(self):
+        # Clean mush (~850 fpm) cannot fly the 1000 ft/nm slope: gear
+        # (drag without lift) deploys as soon as the descent begins and
+        # speed permits, so the slope is actually capturable.
+        on_slope = self._resolve(3000.0).altitude_ft
+        out = self._resolve(on_slope + 300.0)  # above slope, 120 kts
+        self.assertTrue(out.gear_down,
+                        "Gear must lead the descent (drag ladder).")
+
+    def test_bleed_mode_flag_set_above_slope(self):
+        on_slope = self._resolve(3000.0).altitude_ft
+        self.assertTrue(self._resolve(on_slope + 300.0).bleed_mode)
+        self.assertFalse(self._resolve(on_slope).bleed_mode)
 
 
 if __name__ == "__main__":

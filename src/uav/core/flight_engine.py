@@ -335,16 +335,16 @@ class FlightEngine:
         # slope is recaptured from above. (The stall floor guards the
         # low end.)
         pitch_up_cap = kf.pitch_limit
+        bleed_mode = False
         if (kf.alt_mode == "glideslope" and kf.phase == "DESCENT"
                 and speed is not None and t.has_position()
                 and (t.altitude_ft - alt) > 100.0):
             speed = min(speed, g.v_approach)
-            # Bleed HARD. The keyframe's 0.15 nose-up cap strangled the
-            # bleed (flight overflew the airport still fast: pitch law
-            # asked +0.21, got clipped, surplus never drained). Verified
-            # manually: hard pitch-up bleeds fine. The cap opens while
-            # there is surplus speed to dump and reverts once speed is
-            # back at target.
+            # Bleed mode: hold a nose-up drag attitude (the controller
+            # enforces it, plus a never-climb cap — see bleed_mode in
+            # types.py). The keyframe's 0.15 nose-up cap strangled the
+            # bleed, so it opens to 0.35 while there's surplus to dump.
+            bleed_mode = True
             if (not math.isnan(t.airspeed_kts)
                     and t.airspeed_kts > speed + 5.0):
                 pitch_up_cap = 0.35
@@ -392,6 +392,20 @@ class FlightEngine:
         # ── Levers (None inherits) ───────────────────────────────────
         gear = (kf.gear_down if kf.gear_down is not None
                 else (prev.gear_down if prev and prev.gear_down is not None else True))
+        # ── Drag ladder: gear leads the descent ──────────────────────
+        # The 1000 ft/nm slope needs ~1700 fpm of sink at descent speed;
+        # a clean airframe mushing at idle gives ~850 (measured, flight
+        # 914edfc6) — it can NEVER capture the slope, which also locks
+        # out the flaps (they deploy only below the slope). Gear is drag
+        # without lift: no balloon, and it moves the "slow and draggy"
+        # regime away from the clean wing-drop that spiralled that same
+        # flight. Deploy as soon as the descent begins and speed allows;
+        # never retracted once out on the way down.
+        if (kf.alt_mode == "glideslope"
+                and kf.phase in ("DESCENT", "APPROACH")
+                and not math.isnan(t.airspeed_kts)
+                and t.airspeed_kts <= g.gear_safe_kts):
+            gear = True
         flap = (kf.flap_ratio if kf.flap_ratio is not None
                 else (prev.flap_ratio if prev and prev.flap_ratio is not None else 0.0))
         # ── Situational flap control ─────────────────────────────────
@@ -475,6 +489,7 @@ class FlightEngine:
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
+            bleed_mode=bleed_mode,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────

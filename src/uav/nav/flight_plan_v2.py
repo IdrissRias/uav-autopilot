@@ -898,24 +898,20 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             aim_lat=g.descent_start_lat, aim_lon=g.descent_start_lon,
             gear_down=False, flap_ratio=0.0,
             roll_limit=0.25, pitch_limit=0.15,
-            # Speed is the normal release; the near_point fallback stops
-            # the plane overflying descent_start at cruise alt when the
-            # bleed is slower than planned (it then arrives at the
-            # threshold miles high). Releasing fast used to be dangerous
-            # (flight 20260419_145404: scheduled flaps + steep slope →
-            # overspeed into terrain) but is safe now: flaps are
-            # situational (clean wing while above/on slope) and pitch
-            # tracks speed on descent, so a fast release just descends
-            # clean and bleeds on the way down.
-            trigger=Trigger(
-                "any",
-                subs=(
-                    Trigger("speed_lte", value=g.flap_safe_kts),
-                    Trigger("near_point", value=0.3,
+            # POSITION-ONLY release: the descent begins where the
+            # geometry says it begins. The old speed_lte condition
+            # became degenerate once learned v_cruise (132.7) dropped
+            # below flap_safe (132.8) — it fired the instant DECELERATE
+            # began, starting DESCENT a mile early on the clamped-level
+            # segment, where the plane seesawed 230 ft down / 140 up
+            # burning 86% throttle (flight 914edfc6). DECELERATE's job
+            # is bleeding speed BEFORE descent_start; if speed is
+            # already fine, this leg is simply level cruise until the
+            # descent point arrives. If speed is still high there, the
+            # bleed/flap/stall protections own it on the way down.
+            trigger=Trigger("near_point", value=0.3,
                             lat=g.descent_start_lat,
                             lon=g.descent_start_lon),
-                ),
-            ),
         ),
 
         # ── 8. DESCENT ───────────────────────────────────────────────
@@ -1075,7 +1071,11 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
 
         # ── 13. ROLLOUT ──────────────────────────────────────────────
         # Full brakes, wings level (tight roll limit), heading hold on
-        # dest runway.  Advance when decelerated to taxi speed.
+        # dest runway. yaw_hold gives RUDDER ground steering — without
+        # it the only heading authority on the ground was roll, which
+        # does nothing on wheels: flight 914edfc6 veered 84°→101° during
+        # rollout and departed the runway. Advance when decelerated to
+        # taxi speed.
         Keyframe(
             name="ROLLOUT", phase="ROLLOUT",
             throttle_mode="idle",
@@ -1083,6 +1083,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="dest_runway",
             gear_down=True, flap_ratio=1.0, brake_ratio=1.0,
             roll_limit=0.02,
+            yaw_hold=True, yaw_kp=0.02, yaw_limit=0.35,
             trigger=Trigger("speed_lte", value=5.0),
         ),
 
