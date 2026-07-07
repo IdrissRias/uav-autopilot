@@ -668,10 +668,21 @@ class Autopilot:
                          "phase": p.phase, "heading": round(p.heading_deg, 1)}
                         for i, p in enumerate(ribbon.points) if i % step == 0
                     ])
-                    # Use raw SQL since finalize_flight adds ended_at
+                    # Use raw SQL since finalize_flight adds ended_at.
+                    # ALSO enqueue the sync — this UPDATE bypassed the
+                    # queue, so Supabase's flights.ribbon_waypoints was
+                    # NULL for every flight and the app's DB-hydrate
+                    # path never had a ribbon to load (the live map
+                    # depended entirely on catching broadcasts).
                     conn = local_db.get_connection()
                     conn.execute("UPDATE flights SET ribbon_waypoints = ? WHERE id = ?",
                                  (wp_json, self._flight_id))
+                    conn.execute(
+                        "INSERT INTO _sync_queue (table_name, row_id, "
+                        "operation, created_at) VALUES ('flights', ?, "
+                        "'update', datetime('now'))",
+                        (self._flight_id,),
+                    )
                     conn.commit()
                     print(f"[PEREGRINE] Ribbon stored in flight record ({len(ribbon.points)} pts → {len(wp_json)} bytes)")
             except Exception as e:
