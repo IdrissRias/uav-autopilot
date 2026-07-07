@@ -899,7 +899,11 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         Keyframe(
             name="DECELERATE", phase="CRUISE",
             throttle_mode="idle",
-            target_speed_kts=g.flap_safe_kts,
+            # Never target ABOVE cruise: with learned speeds flap_safe
+            # (132.8) sat higher than v_cruise (129.6), so the
+            # "decelerate" phase commanded an acceleration step at
+            # entry. Phase targets must continue from the last phase.
+            target_speed_kts=min(g.flap_safe_kts, g.v_cruise),
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
             aim_lat=g.descent_start_lat, aim_lon=g.descent_start_lon,

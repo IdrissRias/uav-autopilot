@@ -23,6 +23,7 @@ Interface contract (consumed by Autopilot as `mode_manager`):
 from __future__ import annotations
 
 import math
+import time
 from typing import Optional
 
 from uav.nav.flight_plan_v2 import (
@@ -54,6 +55,19 @@ class FlightEngine:
         # stops flying and starts landing: one-way, no exit until wheels.
         self._land_committed = False
         self._commit_vs_fpm: Optional[float] = None
+        # Command-continuity ramps: each phase CONTINUES from where the
+        # last one left the plane. Keyframe targets may step (descent
+        # trigger fires 0.3 nm late → alt target steps 300 ft; gear
+        # keyframe steps the speed target 24 kts) — the EMITTED command
+        # never does. Alt ≤ 50 ft/s, speed ≤ 2.5 kts/s.
+        self._cmd_alt_smooth: Optional[float] = None
+        self._cmd_spd_smooth: Optional[float] = None
+        self._ramp_ts: Optional[float] = None
+        # Centerline-correction integrator: a P-only law can't remove a
+        # STEADY lateral offset (crosswind, geometry bias) — the plane
+        # lands parallel to the runway, beside it. Slow integral trims
+        # the residual to zero. Degrees; clamped ±5.
+        self._cl_int_deg = 0.0
 
     # ── Public interface ─────────────────────────────────────────────
 
@@ -81,6 +95,10 @@ class FlightEngine:
         self._last_track = None
         self._land_committed = False
         self._commit_vs_fpm = None
+        self._cmd_alt_smooth = None
+        self._cmd_spd_smooth = None
+        self._ramp_ts = None
+        self._cl_int_deg = 0.0
         self.ctx.pop("mode_state", None)
         self.ctx.pop("destination", None)
         self.ctx.pop("_aim_passed_kf", None)
@@ -225,6 +243,12 @@ class FlightEngine:
         """Turn a Keyframe into a concrete Targets for this tick."""
         g = r.geometry
         prev = self._prev_targets
+        # Wall-clock dt for command ramps / integrators (bounded so a
+        # hiccup can't produce a giant step).
+        _now = time.time()
+        ramp_dt = (min(0.5, max(0.0, _now - self._ramp_ts))
+                   if self._ramp_ts is not None else 0.05)
+        self._ramp_ts = _now
 
         # ── Heading ──────────────────────────────────────────────────
         # Strict per-phase heading sources:
@@ -279,7 +303,13 @@ class FlightEngine:
                 # Gain 60/cap 12° (was 40/8): flight 96786124 drifted
                 # onto the grass in the flare balloon — the correction
                 # was too polite to pull it back in the final seconds.
-                correction = max(-12.0, min(12.0, cross_nm * 60.0))
+                # The INTEGRAL term kills what P never can: a STEADY
+                # offset (crosswind / geometry bias) that had the plane
+                # landing parallel to the runway, beside it.
+                self._cl_int_deg += cross_nm * 10.0 * ramp_dt
+                self._cl_int_deg = max(-5.0, min(5.0, self._cl_int_deg))
+                correction = (max(-12.0, min(12.0, cross_nm * 60.0))
+                              + self._cl_int_deg)
                 hdg = (g.rwy_heading + correction) % 360.0
         elif kf.heading_mode == "aim_at" and t.has_position() and self._follower is not None:
             track = self._follower.update(t)
@@ -560,6 +590,39 @@ class FlightEngine:
                 vs_target = self._commit_vs_fpm
                 if (not math.isnan(t.vs_fpm) and t.vs_fpm < -1000.0):
                     vs_target = -150.0  # emergency arrest, ratchet bypassed
+
+        # ── Command continuity ramps ─────────────────────────────────
+        # Phases CONTINUE each other: the emitted alt/speed commands are
+        # rate-limited (alt ≤ 50 ft/s, speed ≤ 2.5 kts/s) so a keyframe
+        # advance can never step the plane's orders — the wobble at
+        # every transition was the controller flinching at target steps.
+        # Near-ground phases bypass: those targets must be instant truth.
+        if kf.phase in ("FLARE", "ROLLOUT", "GROUND") or self._land_committed:
+            self._cmd_alt_smooth = alt
+            self._cmd_spd_smooth = speed
+        else:
+            if alt is not None:
+                if self._cmd_alt_smooth is None:
+                    self._cmd_alt_smooth = alt
+                else:
+                    step = 50.0 * ramp_dt
+                    self._cmd_alt_smooth = max(
+                        self._cmd_alt_smooth - step,
+                        min(self._cmd_alt_smooth + step, alt))
+                alt = self._cmd_alt_smooth
+            else:
+                self._cmd_alt_smooth = None
+            if speed is not None:
+                if self._cmd_spd_smooth is None:
+                    self._cmd_spd_smooth = speed
+                else:
+                    step = 2.5 * ramp_dt
+                    self._cmd_spd_smooth = max(
+                        self._cmd_spd_smooth - step,
+                        min(self._cmd_spd_smooth + step, speed))
+                speed = self._cmd_spd_smooth
+            else:
+                self._cmd_spd_smooth = None
 
         return Targets(
             heading_deg=hdg,

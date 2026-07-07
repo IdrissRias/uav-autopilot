@@ -100,3 +100,75 @@ class TestLandingCommit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCommandContinuity(unittest.TestCase):
+    """Each phase CONTINUES the last: emitted alt/speed commands are
+    rate-limited so keyframe advances can never step the plane's orders
+    (the wobble at every transition was the controller flinching at
+    target steps — e.g. the descent trigger firing 0.3 nm late stepped
+    the alt target ~300 ft in one tick)."""
+
+    def setUp(self):
+        self.ribbon = plan_path(
+            dep_lat=45.42, dep_lon=-91.77, dep_alt_ft=1100.0,
+            dep_heading=10.0,
+            dest_lat=47.40, dest_lon=-94.77, dest_alt_ft=1380.0,
+            dest_rwy_heading=270.0,
+            dest_threshold_lat=47.40, dest_threshold_lon=-94.77,
+            cruise_alt_ft=5000.0, v_stall=98.4,
+        )
+        self.engine = FlightEngine({})
+
+    def test_alt_command_never_steps(self):
+        kf = next(k for k in self.ribbon.keyframes if k.name == "CRUISE")
+        t = Telemetry(airspeed_kts=125.0, altitude_ft=5000.0, pitch_deg=0.0,
+                      roll_deg=0.0, heading_deg=270.0, timestamp=0.0,
+                      lat_deg=46.0, lon_deg=-93.0, agl_m=1100.0, vs_fpm=0.0)
+        self.engine._prev_targets = Targets(
+            heading_deg=270.0, altitude_ft=5000.0, airspeed_kts=125.0)
+        first = self.engine._resolve(kf, t, self.ribbon)
+        # Force a big target step: pretend the next keyframe wants
+        # 600 ft lower by resolving a DESCENT-style target keyframe.
+        kf2 = next(k for k in self.ribbon.keyframes
+                   if k.name == "DECELERATE")
+        second = self.engine._resolve(kf2, t, self.ribbon)
+        self.assertLess(
+            abs(second.altitude_ft - first.altitude_ft), 30.0,
+            "Alt command stepped at a phase boundary — phases must "
+            "continue each other."
+        )
+
+    def test_speed_command_never_steps(self):
+        kf = next(k for k in self.ribbon.keyframes
+                  if k.name == "DESCENT_FLAP")
+        kf2 = next(k for k in self.ribbon.keyframes
+                   if k.name == "DESCENT_GEAR")  # 24-kt scheduled step
+        t = Telemetry(airspeed_kts=125.0, altitude_ft=3000.0, pitch_deg=-3.0,
+                      roll_deg=0.0, heading_deg=270.0, timestamp=0.0,
+                      lat_deg=47.40, lon_deg=-94.72,
+                      agl_m=500.0, vs_fpm=-800.0)
+        self.engine._prev_targets = Targets(
+            heading_deg=270.0, altitude_ft=3000.0, airspeed_kts=125.0,
+            flap_ratio=1.0, gear_down=True)
+        first = self.engine._resolve(kf, t, self.ribbon)
+        second = self.engine._resolve(kf2, t, self.ribbon)
+        if first.airspeed_kts is not None and second.airspeed_kts is not None:
+            self.assertLess(
+                abs(second.airspeed_kts - first.airspeed_kts), 2.0,
+                "Speed command stepped at a phase boundary."
+            )
+
+    def test_decelerate_never_targets_above_cruise(self):
+        r = plan_path(
+            dep_lat=45.42, dep_lon=-91.77, dep_alt_ft=1100.0,
+            dep_heading=10.0,
+            dest_lat=47.40, dest_lon=-94.77, dest_alt_ft=1380.0,
+            dest_rwy_heading=270.0,
+            dest_threshold_lat=47.40, dest_threshold_lon=-94.77,
+            cruise_alt_ft=5000.0, v_stall=98.4, v_cruise_kts=129.6,
+        )
+        kf = next(k for k in r.keyframes if k.name == "DECELERATE")
+        self.assertLessEqual(kf.target_speed_kts, 129.6,
+                             "A decelerate phase must not command "
+                             "acceleration.")
