@@ -280,9 +280,14 @@ class FlightEngine:
                     brg = bearing_deg(g.dep_lat, g.dep_lon,
                                       t.lat_deg, t.lon_deg)
                     diff = ((brg - g.dep_heading + 180.0) % 360.0) - 180.0
-                    cross_nm = d_nm * math.sin(math.radians(diff))
+                    cross_m = d_nm * 1852.0 * math.sin(math.radians(diff))
+                    # METER-scale gain. The old 60°/nm gave <1° for a
+                    # 10 m drift — a whisper; the plane left the pavement
+                    # with the loop nominally "working". On a 45 m-wide
+                    # runway, meters are the unit that matters:
+                    # 0.8°/m → 8° at 10 m off, capped 15°.
                     hdg = (g.dep_heading
-                           - max(-6.0, min(6.0, cross_nm * 60.0))) % 360.0
+                           - max(-15.0, min(15.0, cross_m * 0.8))) % 360.0
         elif kf.heading_mode == "dest_runway":
             # Runway heading + a small centerline correction. A pure
             # heading hold let any residual cross-track at flare entry
@@ -300,16 +305,21 @@ class FlightEngine:
                 # diff > 0 → plane displaced left of the approach course
                 # (facing the runway) → steer right (positive correction).
                 cross_nm = d_nm * math.sin(math.radians(diff))
-                # Gain 60/cap 12° (was 40/8): flight 96786124 drifted
-                # onto the grass in the flare balloon — the correction
-                # was too polite to pull it back in the final seconds.
                 # The INTEGRAL term kills what P never can: a STEADY
                 # offset (crosswind / geometry bias) that had the plane
                 # landing parallel to the runway, beside it.
                 self._cl_int_deg += cross_nm * 10.0 * ramp_dt
                 self._cl_int_deg = max(-5.0, min(5.0, self._cl_int_deg))
-                correction = (max(-12.0, min(12.0, cross_nm * 60.0))
-                              + self._cl_int_deg)
+                on_ground = (not math.isnan(t.agl_m)) and t.agl_m < 5.0
+                if on_ground:
+                    # Rollout: meter-scale, assertive (0.8°/m, cap 15°) —
+                    # nm-scale gains are whispers at runway width.
+                    cross_m = cross_nm * 1852.0
+                    p_term = max(-15.0, min(15.0, cross_m * 0.8))
+                else:
+                    # Airborne final: gain 60/nm, cap 12°.
+                    p_term = max(-12.0, min(12.0, cross_nm * 60.0))
+                correction = p_term + self._cl_int_deg
                 hdg = (g.rwy_heading + correction) % 360.0
         elif kf.heading_mode == "aim_at" and t.has_position() and self._follower is not None:
             track = self._follower.update(t)

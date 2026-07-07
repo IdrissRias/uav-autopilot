@@ -744,7 +744,12 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="hold",
             heading_mode="dep_runway",
             gear_down=True, flap_ratio=0.5, brake_ratio=0.0,
-            yaw_hold=True, yaw_kp=0.02, yaw_limit=0.35,
+            # yaw_kp 0.06 / limit 0.6 (was 0.02/0.35): the commanded
+            # heading correction is only as strong as the rudder that
+            # executes it — 2% pedal was losing to P-factor at full
+            # power. The -0.008·hdg_rate damping in the yaw law keeps
+            # the stronger gain from oscillating.
+            yaw_hold=True, yaw_kp=0.06, yaw_limit=0.60,
             trigger=Trigger("speed_gte", value=g.v_rotate),
         ),
 
@@ -1095,7 +1100,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             # protection); the engine's derotation VS demand supplies
             # the gentle forward stick.
             pitch_limit=0.02,
-            yaw_hold=True, yaw_kp=0.02, yaw_limit=0.35,
+            yaw_hold=True, yaw_kp=0.06, yaw_limit=0.60,
             trigger=Trigger("speed_lte", value=5.0),
         ),
 
