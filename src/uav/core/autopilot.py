@@ -509,11 +509,74 @@ class Autopilot:
 
                 # Prefer v_land (landing reference) over v_stall; default 77.
                 v_stall = float(ctx["airframe"]["speeds_kts"].get("v_land", 77.0))
+
+                # ── Snap the departure anchor onto the RUNWAY CENTERLINE ──
+                # The ground steering holds the anchor line. Anchoring on
+                # the plane's parking spot held a line through the grass
+                # (loop flights 96786124 + follow-up: spawn sat offset
+                # from the centerline, and the roll faithfully tracked
+                # the offset line). Two snap sources:
+                #   1. runway detection → shift by -lateral_ft
+                #   2. loop flights: project onto the DEST runway axis
+                #      when close and roughly aligned (detection often
+                #      misses when spawn is outside the runway box)
+                dep_lat_p = telemetry.lat_deg
+                dep_lon_p = telemetry.lon_deg
+                dep_hdg_p = (rwy.runway_heading_deg
+                             if rwy and rwy.detected else telemetry.heading_deg)
+                try:
+                    from uav.nav.flight_plan_v2 import _dest_pt as _snap_pt
+                    from uav.nav.geo import (bearing_deg as _sbrg,
+                                             haversine_m as _shav)
+                    import math as _sm
+                    if (rwy and rwy.detected and rwy.position is not None
+                            and abs(rwy.position.lateral_ft) > 1.0):
+                        lat_ft = rwy.position.lateral_ft  # + = right of CL
+                        shift_brg = ((rwy.runway_heading_deg - 90.0) % 360.0
+                                     if lat_ft > 0
+                                     else (rwy.runway_heading_deg + 90.0) % 360.0)
+                        dep_lat_p, dep_lon_p = _snap_pt(
+                            dep_lat_p, dep_lon_p, shift_brg,
+                            abs(lat_ft) * 0.3048)
+                        print(f"[GROUND] Takeoff anchor snapped "
+                              f"{abs(lat_ft):.0f} ft onto "
+                              f"{rwy.runway_designator} centerline")
+                    elif dest_rwy and dest_rwy.get("heading") is not None:
+                        thr_la = float(dest_rwy["threshold_lat"])
+                        thr_lo = float(dest_rwy["threshold_lon"])
+                        d_nm = _shav(telemetry.lat_deg, telemetry.lon_deg,
+                                     thr_la, thr_lo) / 1852.0
+                        rh = float(dest_rwy["heading"])
+                        # Axis direction closest to the nose
+                        diff_fwd = abs(((telemetry.heading_deg - rh + 180.0)
+                                        % 360.0) - 180.0)
+                        axis = rh if diff_fwd <= 90.0 else (rh + 180.0) % 360.0
+                        axis_diff = abs(((telemetry.heading_deg - axis + 180.0)
+                                         % 360.0) - 180.0)
+                        if d_nm < 2.0 and axis_diff <= 30.0:
+                            brg = _sbrg(thr_la, thr_lo,
+                                        telemetry.lat_deg, telemetry.lon_deg)
+                            dd = ((brg - axis + 180.0) % 360.0) - 180.0
+                            cross_nm = d_nm * _sm.sin(_sm.radians(dd))
+                            if abs(cross_nm) > 0.0003:  # > ~0.5 m
+                                shift_brg = ((axis - 90.0) % 360.0
+                                             if cross_nm > 0
+                                             else (axis + 90.0) % 360.0)
+                                dep_lat_p, dep_lon_p = _snap_pt(
+                                    dep_lat_p, dep_lon_p, shift_brg,
+                                    abs(cross_nm) * 1852.0)
+                            dep_hdg_p = axis
+                            print(f"[GROUND] Takeoff anchor snapped "
+                                  f"{abs(cross_nm)*1852.0:.0f} m onto the "
+                                  f"runway axis ({axis:.0f}°, loop flight)")
+                except Exception as e:
+                    print(f"[GROUND] Anchor snap failed (using raw pos): {e}")
+
                 ribbon = plan_path(
-                    dep_lat=telemetry.lat_deg,
-                    dep_lon=telemetry.lon_deg,
+                    dep_lat=dep_lat_p,
+                    dep_lon=dep_lon_p,
                     dep_alt_ft=telemetry.altitude_ft,
-                    dep_heading=rwy.runway_heading_deg if rwy and rwy.detected else telemetry.heading_deg,
+                    dep_heading=dep_hdg_p,
                     dest_lat=float(dest["lat"]),
                     dest_lon=float(dest["lon"]),
                     dest_alt_ft=float(dest_rwy["elevation_ft"]) if dest_rwy and dest_rwy.get("elevation_ft") is not None else ground_msl_ft,
