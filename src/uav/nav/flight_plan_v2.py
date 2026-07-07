@@ -932,7 +932,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
-            pitch_limit=0.15,
+            pitch_limit=0.25,  # VS-tracking pitch needs nose-up room
             # pitch_down_limit 0.40 (~23° stick) so plane can actually
             # descend when behind the glideslope. Previous 0.15 (~8.6°)
             # was too restrictive: flight 20260419_173924 arrived at
@@ -942,11 +942,12 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             # throttle to idle on any overspeed, so PE→KE conversion
             # during a steeper dive won't shred the flap envelope.
             pitch_down_limit=0.40,
-            gear_down=False, flap_ratio=0.0,
-            # Flaps only deploy when BOTH: speed below Vfe AND we're
-            # low enough (2000ft AGL). Using `any` let flaps out at 170
-            # kts in flight 135940; `all` prevents that structural
-            # violation.
+            # Full flaps SCHEDULED from the top of the descent —
+            # configure early, take the disturbance high. The engine's
+            # speed staging decides how much actually deploys (half
+            # above v_app+10, full below), so the schedule is a cap,
+            # not a command to slam them at cruise speed.
+            gear_down=True, flap_ratio=1.0,
             trigger=Trigger(
                 "all",
                 subs=(
@@ -971,9 +972,9 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
-            pitch_limit=0.15,
+            pitch_limit=0.25,
             pitch_down_limit=0.40,
-            gear_down=False, flap_ratio=0.5,
+            gear_down=True, flap_ratio=1.0,
             # Gear drop logic:
             #   (A) Normal: speed ≤ Vlo AND ≤ 1200 AGL  — clean config
             #       change while still high enough to stabilise.
@@ -1016,9 +1017,9 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.flare_start_lat, aim_lon=g.flare_start_lon,
-            pitch_limit=0.15,
+            pitch_limit=0.25,
             pitch_down_limit=0.40,
-            gear_down=True, flap_ratio=0.5,
+            gear_down=True, flap_ratio=1.0,
             trigger=Trigger("agl_lte", value=500.0),
         ),
 
@@ -1039,7 +1040,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.touchdown_lat, aim_lon=g.touchdown_lon,
-            pitch_limit=0.15,
+            pitch_limit=0.25,
             # APPROACH stays tighter than outer DESCENT keyframes (0.20)
             # because we're short final: a big dive here would smash the
             # gear. Still relaxed from 0.15 so we can catch a

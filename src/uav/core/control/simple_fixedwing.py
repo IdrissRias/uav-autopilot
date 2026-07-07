@@ -235,8 +235,13 @@ class SimpleFixedWingController(Controller):
             # VS damping: climbing through the target → cut power EARLY,
             # before the alt error flips sign. Rate feedback = the D term
             # the P-only law was missing (see phugoid note above).
+            # Damped relative to the COMMANDED sink rate when one exists:
+            # damping against zero would add +0.28 throttle in a normal
+            # 1900 fpm commanded descent — fighting the descent itself.
             ALT_TO_THROTTLE_VS_DAMP = 0.00015  # 1000 fpm → 0.15 throttle
-            vs_thr = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
+            vs_ref = targets.vs_target_fpm if targets.vs_target_fpm is not None else 0.0
+            vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else vs_ref
+            vs_thr = vs_now - vs_ref
             # The P contribution is TAPERED (±0.25 up / −0.35 down):
             # 140 ft below target used to command +0.42 → a ~97% power
             # lunge for a trim-sized correction, then a hard chop at the

@@ -32,17 +32,9 @@ from uav.nav.geo import bearing_deg, haversine_m
 from uav.sim.types import Telemetry, Targets
 from uav.core.guidance.track_follower import TrackFollower, TrackState
 
-# Flaps are an altitude-control device on the glideslope (see flap
-# logic in _resolve): they add lift, so they deploy only when the plane
-# has sunk BELOW the slope and needs pulling back up. On-slope or above,
-# the wing stays clean. Hysteresis gap so they don't cycle on noise:
-#   ≥ _FLAP_DEPLOY_BELOW_FT below slope → deploy the keyframe's
-#     scheduled setting
-#   ≤ _FLAP_CLEAN_BELOW_FT below slope (incl. any amount above it)
-#     → retract to clean (speed permitting)
-#   in between → hold current setting
-_FLAP_DEPLOY_BELOW_FT = 100.0
-_FLAP_CLEAN_BELOW_FT = 50.0
+# Flap deployment is speed-staged and EARLY (see flap logic in
+# _resolve): all drag comes out at the top of the descent, the
+# VS-tracking pitch counters the lift spike, and nothing deploys low.
 
 
 class FlightEngine:
@@ -366,27 +358,55 @@ class FlightEngine:
         else:
             throttle = prev.throttle if prev else None
 
-        # ── Flare sink-rate command ──────────────────────────────────
-        # During FLARE, pitch tracks a sink rate instead of an altitude.
-        # Target decays with AGL: -420 fpm entering at 30 ft, -220 at
-        # 10 ft, -120 at the pavement — an exponential-style arrest to
-        # a gentle touchdown regardless of what the approach delivered.
-        # (The old alt-PID flare commanded nose-DOWN at 30 ft because
-        # the clamped target alt sat below the plane.)
+        # ── Sink-rate commands (pitch flies the path) ────────────────
+        # FLARE: target decays with AGL: -420 fpm entering at 30 ft,
+        # -220 at 10 ft, -120 at the pavement — an exponential-style
+        # arrest regardless of what the approach delivered.
+        #
+        # DESCENT/APPROACH (glideslope): pitch tracks the REQUIRED sink
+        # rate directly — local slope gradient × ground speed, plus a
+        # convergence term when off the slope. This is the "counter the
+        # config instantly" law: a flap balloon shows up as a VS error
+        # the same tick and the elevator eats it, instead of the plane
+        # gaining 50 ft while a speed-error law wakes up. Never commands
+        # a climb (throttle owns the low side).
         vs_target = None
         if kf.phase == "FLARE":
             agl_ft = ((t.agl_m * 3.28084)
                       if not math.isnan(t.agl_m) else 30.0)
             vs_target = -(120.0 + max(0.0, agl_ft) * 10.0)
             vs_target = max(vs_target, -600.0)  # never command a dive
+        elif kf.alt_mode == "glideslope" and t.has_position():
+            from uav.nav.flight_plan_v2 import (
+                _GLIDE_FT_PER_NM as _STEEP2,
+                _FINAL_FT_PER_NM as _FINAL2,
+                _APPROACH_ALT_AGL_FT as _APP_AGL2,
+                _FLARE_ALT_AGL_FT as _FLARE_AGL2,
+            )
+            d_thr_nm = haversine_m(t.lat_deg, t.lon_deg,
+                                   g.thr_lat, g.thr_lon) / 1852.0
+            local_slope = (_FINAL2
+                           if d_thr_nm <= (_APP_AGL2 - _FLARE_AGL2) / _FINAL2
+                           else _STEEP2)
+            gs_kts = (t.groundspeed_kts
+                      if not math.isnan(t.groundspeed_kts) and t.groundspeed_kts > 30
+                      else t.airspeed_kts)
+            gs_nm_min = max(0.0, gs_kts) / 60.0
+            required_fpm = -(local_slope * gs_nm_min)
+            # Convergence: 1.5 fpm extra per ft above the slope (200 ft
+            # high → -300 fpm steeper). Below the slope the sink eases
+            # toward -200 but never goes positive.
+            off_slope_ft = t.altitude_ft - alt
+            vs_target = required_fpm - off_slope_ft * 1.5
+            vs_target = max(-2600.0, min(-200.0, vs_target))
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
-        # On glideslope phases the alt→throttle P-law pivots around near
-        # idle: on-slope (alt_error ≈ 0) means gravity does the work, and
-        # thrust only comes in when we sink below the slope. The old
-        # baseline was cruise_throttle (~0.55), which flew the descent
-        # hot — 180+ ft above slope before throttle even hit zero.
-        throttle_base = 0.12 if (kf.throttle_for_alt
+        # Glideslope descents now fly CONFIGURED (gear + flaps out from
+        # the top), so the baseline is a spooled 0.30 — the drag exceeds
+        # the slope's needs and the engine works against it, giving the
+        # alt law authority in BOTH directions (old near-idle base could
+        # only fix "too low"; "too high" hit the idle stop).
+        throttle_base = 0.30 if (kf.throttle_for_alt
                                  and kf.alt_mode == "glideslope") else None
 
         # ── Levers (None inherits) ───────────────────────────────────
@@ -408,32 +428,30 @@ class FlightEngine:
             gear = True
         flap = (kf.flap_ratio if kf.flap_ratio is not None
                 else (prev.flap_ratio if prev and prev.flap_ratio is not None else 0.0))
-        # ── Situational flap control ─────────────────────────────────
-        # Flaps are LIFT. On the glideslope they deploy only when the
-        # plane has sunk below the slope and needs pulling back up:
-        #   ≥ _FLAP_DEPLOY_BELOW_FT below slope → deploy the keyframe's
-        #     scheduled setting (the schedule still caps how much flap
-        #     this phase may use, so Vfe protection is untouched).
-        #   ≤ _FLAP_CLEAN_BELOW_FT below slope, or anywhere above it
-        #     → retract to clean, IF speed is at/above v_approach
-        #     (retracting raises stall speed; never clean up slow).
-        #   in between → hold current setting (hysteresis, no cycling).
-        # FLARE is exempt — it always gets its full flaps. Gear is NOT
-        # gated: gear is drag without lift, which always helps slow us.
+        # ── Configure EARLY: speed-staged flap deployment ────────────
+        # Every mid-descent flap event went wrong (balloon at 120 kts,
+        # deploy-lockout until the flare, low-altitude config churn).
+        # New philosophy: ALL drag comes out at the top of the descent,
+        # where there's 4000 ft of margin and the VS-tracking pitch
+        # counters the lift spike the same tick. Only SPEED stages the
+        # notches — half the moment it's legal, full once the drag has
+        # bled the plane under full-flap speed (seconds later):
+        #   speed > flap_safe          → no new flap (hold current)
+        #   flap_safe ≥ speed > v_app+10 → up to HALF
+        #   speed ≤ v_app+10           → full scheduled setting
+        # Once out, flaps stay out (monotonic) — except the hard
+        # overspeed retract below. FLARE keeps its schedule as-is.
         if (kf.alt_mode == "glideslope" and kf.phase != "FLARE"
-                and prev is not None and prev.flap_ratio is not None):
-            alt_below_ft = alt - t.altitude_ft  # positive = below slope
-            if alt_below_ft >= _FLAP_DEPLOY_BELOW_FT:
-                pass  # keep the scheduled `flap` — we need the lift
-            elif alt_below_ft <= _FLAP_CLEAN_BELOW_FT:
-                if (prev.flap_ratio == 0.0
-                        or (not math.isnan(t.airspeed_kts)
-                            and t.airspeed_kts >= g.v_approach)):
-                    flap = 0.0
-                else:
-                    flap = prev.flap_ratio  # too slow to clean up
+                and prev is not None and prev.flap_ratio is not None
+                and not math.isnan(t.airspeed_kts)):
+            full_flap_safe = g.v_approach + 10.0
+            if t.airspeed_kts > g.flap_safe_kts:
+                allowed = prev.flap_ratio       # too fast for anything new
+            elif t.airspeed_kts > full_flap_safe:
+                allowed = max(prev.flap_ratio, min(flap, 0.5))
             else:
-                flap = prev.flap_ratio  # hysteresis band: hold
+                allowed = max(prev.flap_ratio, flap)
+            flap = allowed
 
         # ── Flap SPEED protection (all phases, overrides everything) ─
         # Flaps while fast is how the last crash happened: deployed at
