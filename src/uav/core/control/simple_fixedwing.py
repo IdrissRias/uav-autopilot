@@ -182,10 +182,17 @@ class SimpleFixedWingController(Controller):
             if self._vs_target_smooth is None:
                 self._vs_target_smooth = targets.vs_target_fpm
             else:
-                max_step = 1500.0 * dt
+                # ASYMMETRIC slew: shallowing (arresting) is limited to
+                # 600 fpm/s — flight 8baa5ae1's flare demanded a
+                # 1100 fpm change instantly, saturated the stick, and
+                # overshot into a +1000 fpm balloon zoom. Steepening
+                # stays fast (1500 fpm/s): diving for the line must not
+                # lag.
+                up_step = 600.0 * dt
+                down_step = 1500.0 * dt
                 self._vs_target_smooth = max(
-                    self._vs_target_smooth - max_step,
-                    min(self._vs_target_smooth + max_step,
+                    self._vs_target_smooth - down_step,
+                    min(self._vs_target_smooth + up_step,
                         targets.vs_target_fpm))
             # Filtered VS rate
             if self._prev_vs is not None and dt > 0:

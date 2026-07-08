@@ -420,6 +420,7 @@ class FlightEngine:
             throttle = prev.throttle if prev else None
 
         pitch_cap = kf.pitch_limit
+        pitch_down_cap = kf.pitch_down_limit
         # ── Sink-rate commands (pitch flies the path) ────────────────
         # FLARE: target decays with AGL: -420 fpm entering at 30 ft,
         # -220 at 10 ft, -120 at the pavement — an exponential-style
@@ -618,6 +619,14 @@ class FlightEngine:
                 throttle_base = None
                 stall_floor = None
                 roll_lim = 0.10         # ~9° bank cap near the ground
+                # BALLOON AUTHORITY: the flare's tail-strike pitch-down
+                # cap (0.05) trapped flight 8baa5ae1 in a +1000 fpm
+                # balloon zoom it couldn't push out of — it hung, bled
+                # 92→68 kts, and fell 110 ft on a dead elevator.
+                # Climbing while committed opens the nose-down cap;
+                # stopping a balloon IS respecting V/S.
+                if (not math.isnan(t.vs_fpm) and t.vs_fpm > 100.0):
+                    pitch_down_cap = 0.25
                 curve = max(-600.0, -(120.0 + max(0.0, agl_ft_commit) * 10.0))
                 if self._commit_vs_fpm is None:
                     self._commit_vs_fpm = curve
@@ -670,7 +679,7 @@ class FlightEngine:
             flap_ratio=flap,
             roll_limit=roll_lim,
             pitch_limit=pitch_cap,
-            pitch_down_limit=kf.pitch_down_limit,
+            pitch_down_limit=pitch_down_cap,
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
