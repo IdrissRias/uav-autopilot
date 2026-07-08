@@ -120,7 +120,10 @@ class TestNoDiveForSpeed(unittest.TestCase):
         t = Telemetry(airspeed_kts=112.0, altitude_ft=5900.0, pitch_deg=5.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
                       vs_fpm=0.0, agl_m=1440.0)
-        act = ctl.compute(t, tg, 0.05)
+        # A few ticks: the stick slew (2.0/s) means one 50 ms tick
+        # can only move 0.1 — smoothness is the point.
+        for _ in range(5):
+            act = ctl.compute(t, tg, 0.05)
         self.assertLess(act.pitch, -0.1,
                         "With altitude to spare, diving for speed is fine.")
 

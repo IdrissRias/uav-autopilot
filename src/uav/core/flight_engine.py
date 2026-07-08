@@ -69,6 +69,9 @@ class FlightEngine:
         # the residual to zero. Degrees; clamped ±5.
         self._cl_int_deg = 0.0
         self._td_ticks = 0
+        # Tangential-capture state (see glideslope vs block).
+        self._off_slope_prev: Optional[float] = None
+        self._off_rate_filt = 0.0
 
     # ── Public interface ─────────────────────────────────────────────
 
@@ -101,6 +104,8 @@ class FlightEngine:
         self._ramp_ts = None
         self._cl_int_deg = 0.0
         self._td_ticks = 0
+        self._off_slope_prev = None
+        self._off_rate_filt = 0.0
         self.ctx.pop("mode_state", None)
         self.ctx.pop("destination", None)
         self.ctx.pop("_aim_passed_kf", None)
@@ -479,12 +484,29 @@ class FlightEngine:
             required_fpm = -(local_slope * gs_nm_min)
             # Convergence: 1.5 fpm extra per ft above the slope. NO
             # lower clamp — the target line is religion and the plane
-            # dives as hard as the line demands (the -2600 ceiling was
-            # why it converged too slowly to land on target). The only
-            # bound is the -200 upper edge: pitch never commands UP on
-            # the glideslope; below the line, power is the fix.
+            # dives as hard as the line demands. The only bound is the
+            # -200 upper edge: pitch never commands UP on the
+            # glideslope; below the line, power is the fix.
+            #
+            # TANGENTIAL CAPTURE (PD): the P-only demand held the full
+            # dive until the line then released all at once — the dive's
+            # stored speed converted to lift and the plane floated back
+            # up (dive → release → balloon limit cycle, landing far
+            # beyond the runway). The closure-rate term eases the demand
+            # EARLY, in proportion to how fast the gap is closing, so
+            # the plane rounds off into the slope with nothing left to
+            # release. Rate is low-passed against altimeter noise.
             off_slope_ft = t.altitude_ft - alt
-            vs_target = min(-200.0, required_fpm - off_slope_ft * 1.5)
+            if self._off_slope_prev is not None and ramp_dt > 0:
+                raw_rate = (off_slope_ft - self._off_slope_prev) / ramp_dt
+                self._off_rate_filt = (0.3 * raw_rate
+                                       + 0.7 * self._off_rate_filt)
+            self._off_slope_prev = off_slope_ft
+            CLOSURE_DAMP = 30.0   # fpm of easing per ft/s of closure
+            vs_target = min(-200.0,
+                            required_fpm
+                            - off_slope_ft * 1.5
+                            - self._off_rate_filt * CLOSURE_DAMP)
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
         # Glideslope descents now fly CONFIGURED (gear + flaps out from

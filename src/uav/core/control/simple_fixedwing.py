@@ -116,6 +116,8 @@ class SimpleFixedWingController(Controller):
         self._vs_target_smooth: float | None = None
         self._prev_vs: float | None = None
         self._vs_rate_filt = 0.0
+        # Last commanded pitch, for the stick slew limiter.
+        self._prev_pitch = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -248,7 +250,16 @@ class SimpleFixedWingController(Controller):
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
         if targets.pitch_down_limit is not None:
             pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
+        # The stick is not a relay either: pitch slews at most 2.0/s
+        # (full sweep in ~1 s). Same medicine as the throttle slew —
+        # smooth hands, no single-tick full-scale jumps, and sensor
+        # noise stops reaching the elevator.
+        if dt > 0:
+            max_step = 2.0 * dt
+            pitch_cmd = max(self._prev_pitch - max_step,
+                            min(self._prev_pitch + max_step, pitch_cmd))
         pitch_cmd = _clamp(pitch_cmd, 1.0)  # hardware truth
+        self._prev_pitch = pitch_cmd
 
         # ── Throttle ─────────────────────────────────────────────────
         if targets.throttle is not None:
