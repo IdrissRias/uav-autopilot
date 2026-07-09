@@ -10,6 +10,7 @@ Background sync keeps SQLite ↔ Supabase in agreement.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -90,7 +91,17 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
             f"Run a sync or check seed data."
         )
 
-    learned: Dict[str, Any] = row.get("envelope") or {}
+    # envelope may arrive as a dict (already parsed) or a raw JSON
+    # string (a freshly-added plane whose column is the default "{}").
+    # Tolerate both so a new aircraft's first load doesn't crash.
+    learned = row.get("envelope") or {}
+    if isinstance(learned, str):
+        try:
+            learned = json.loads(learned) if learned.strip() else {}
+        except (ValueError, TypeError):
+            learned = {}
+    if not isinstance(learned, dict):
+        learned = {}
     learned_speeds = learned.get("speeds_kts", {})
     learned_perf = learned.get("performance", {})
     learned_pids = learned.get("pid_tuned", {})
@@ -105,8 +116,16 @@ def load_aircraft(icao_type: str) -> AircraftEnvelope:
         val = row.get(seed_key)
         return float(val) if val is not None else default
 
-    # Build PID gains — learned overrides seed
+    # Build PID gains — learned overrides seed. Same dict-or-string
+    # tolerance as the envelope (a new plane's column is "{}").
     pid_gains = row.get("pid_gains") or {}
+    if isinstance(pid_gains, str):
+        try:
+            pid_gains = json.loads(pid_gains) if pid_gains.strip() else {}
+        except (ValueError, TypeError):
+            pid_gains = {}
+    if not isinstance(pid_gains, dict):
+        pid_gains = {}
     for key in ("heading", "altitude", "airspeed"):
         if key in learned_pids:
             pid_gains[key] = learned_pids[key]

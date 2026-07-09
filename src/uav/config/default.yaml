@@ -6,7 +6,7 @@ ports:
 # Which aircraft to load from the database.
 # All speeds, PID gains, and performance numbers come from Supabase.
 airframe:
-  icao_type: "SF50"
+  icao_type: "BE9L"
 
 loop:
   rate_hz: 15
