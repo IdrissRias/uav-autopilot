@@ -229,14 +229,21 @@ class SimpleFixedWingController(Controller):
                             min(self._theta_cmd_prev + step, theta_raw))
             self._theta_cmd_prev = theta_cmd
 
-            # INNER: attitude hold with pitch-rate damping.
+            # INNER: attitude hold — SOFT spring, STRONG timely damper.
+            # Forensics (flight b71fa83f→013738 descent): the loop rang
+            # at ~1 Hz with the stick alternating sign every 0.6 s. The
+            # stick low-pass (τ 0.15) + heavy rate filtering added
+            # 50-90° of phase lag INSIDE the loop — the damping term
+            # arrived late enough to DRIVE the oscillation instead of
+            # opposing it. Damping must arrive on time: light filter
+            # (0.5 blend), kd nearly tripled, kp halved.
             if self._prev_pitch_deg is not None and dt > 0:
                 raw_rate = (telemetry.pitch_deg - self._prev_pitch_deg) / dt
-                self._pitch_rate_filt = (0.3 * raw_rate
-                                         + 0.7 * self._pitch_rate_filt)
+                self._pitch_rate_filt = (0.5 * raw_rate
+                                         + 0.5 * self._pitch_rate_filt)
             self._prev_pitch_deg = telemetry.pitch_deg
-            pitch_cmd = (0.10 * (theta_cmd - telemetry.pitch_deg)
-                         - 0.02 * self._pitch_rate_filt)
+            pitch_cmd = (0.05 * (theta_cmd - telemetry.pitch_deg)
+                         - 0.055 * self._pitch_rate_filt)
         elif targets.throttle_for_alt:
             # Speed → Pitch (sign-inverted) + vertical-speed damping.
             #   spd_err > 0 (too slow) → pitch_cmd < 0 (nose-down → gain speed)
@@ -289,13 +296,13 @@ class SimpleFixedWingController(Controller):
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
         if targets.pitch_down_limit is not None:
             pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
-        # Smooth hands via FIRST-ORDER LOW-PASS (τ≈0.15 s), not a hard
-        # rate limit: a rate limiter is a saturation nonlinearity that
-        # itself limit-cycles (stick pegs at its rate, lags the loop,
-        # overshoots, reverses — observed immediately after adding one).
-        # The low-pass rounds every command with no saturation to ring.
+        # Minimal output smoothing (τ≈0.04 s): spike removal ONLY.
+        # The previous τ 0.15 sat INSIDE the attitude loop and its
+        # phase lag turned the damping term into a driver (~1 Hz ring,
+        # stick alternating every 0.6 s). Smoothness comes from proper
+        # rate damping arriving ON TIME, never from filtering the loop.
         if dt > 0:
-            alpha = min(1.0, dt / 0.15)
+            alpha = min(1.0, dt / 0.04)
             pitch_cmd = self._prev_pitch + alpha * (pitch_cmd - self._prev_pitch)
         pitch_cmd = _clamp(pitch_cmd, 1.0)  # hardware truth
         self._prev_pitch = pitch_cmd
