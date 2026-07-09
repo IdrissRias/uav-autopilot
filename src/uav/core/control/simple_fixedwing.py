@@ -120,6 +120,8 @@ class SimpleFixedWingController(Controller):
         self._theta_ref_deg: float | None = None
         self._prev_pitch_deg: float | None = None
         self._pitch_rate_filt = 0.0
+        self._vs_filt: float | None = None
+        self._theta_cmd_prev: float | None = None
         # Last commanded pitch, for the stick slew limiter.
         self._prev_pitch = 0.0
 
@@ -194,17 +196,38 @@ class SimpleFixedWingController(Controller):
                     self._vs_target_smooth - down_step,
                     min(self._vs_target_smooth + up_step,
                         targets.vs_target_fpm))
-            vs_err = self._vs_target_smooth - vs_now_fpm  # fpm, + = pull
+            # HOLD the attitude; correct in MICRO-adjustments driven by
+            # descent-rate error (user doctrine). Three guards keep the
+            # attitude target from dancing:
+            #   • the raw vs telemetry is LOW-PASSED (τ≈0.4 s) before it
+            #     steers anything — X-Plane's vs is noisy at 20 Hz
+            #   • a ±50 fpm DEADBAND: close enough = touch nothing
+            #   • the target may only CREEP (≤1.5°/s), never jump
+            if self._vs_filt is None:
+                self._vs_filt = vs_now_fpm
+            else:
+                a_vs = min(1.0, dt / 0.4)
+                self._vs_filt += a_vs * (vs_now_fpm - self._vs_filt)
+            vs_err = self._vs_target_smooth - self._vs_filt  # fpm, + = pull
+            if abs(vs_err) < 50.0:
+                vs_err = 0.0
 
             # OUTER: attitude target. Trim ref initialises to the
-            # CURRENT attitude (continuity — no entry step) and slowly
-            # walks toward whatever attitude actually holds the target.
+            # CURRENT attitude (continuity — no entry step) and creeps
+            # toward whatever attitude actually holds the target.
             if self._theta_ref_deg is None:
                 self._theta_ref_deg = telemetry.pitch_deg
-            self._theta_ref_deg += vs_err * 0.003 * dt   # 300 fpm → 0.9°/s
+            self._theta_ref_deg += vs_err * 0.0012 * dt  # 300 fpm → 0.36°/s
             self._theta_ref_deg = max(-10.0, min(12.0, self._theta_ref_deg))
-            theta_cmd = self._theta_ref_deg + vs_err * 0.004  # 500 fpm → 2°
-            theta_cmd = max(-10.0, min(14.0, theta_cmd))
+            theta_raw = self._theta_ref_deg + vs_err * 0.0015  # 500 fpm → 0.75°
+            theta_raw = max(-10.0, min(14.0, theta_raw))
+            # Rate-limit the commanded attitude itself: micro-steps only.
+            if self._theta_cmd_prev is None:
+                self._theta_cmd_prev = telemetry.pitch_deg
+            step = 1.5 * dt
+            theta_cmd = max(self._theta_cmd_prev - step,
+                            min(self._theta_cmd_prev + step, theta_raw))
+            self._theta_cmd_prev = theta_cmd
 
             # INNER: attitude hold with pitch-rate damping.
             if self._prev_pitch_deg is not None and dt > 0:
@@ -247,6 +270,8 @@ class SimpleFixedWingController(Controller):
             self._prev_vs = None
             self._vs_rate_filt = 0.0
             self._theta_ref_deg = None
+            self._vs_filt = None
+            self._theta_cmd_prev = None
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
@@ -255,6 +280,8 @@ class SimpleFixedWingController(Controller):
             self._prev_vs = None
             self._vs_rate_filt = 0.0
             self._theta_ref_deg = None
+            self._vs_filt = None
+            self._theta_cmd_prev = None
 
         # Commander-issued pitch clamp. Nose-up cap is always honored; nose-down
         # cap is opt-in.
