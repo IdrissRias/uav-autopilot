@@ -116,6 +116,10 @@ class SimpleFixedWingController(Controller):
         self._vs_target_smooth: float | None = None
         self._prev_vs: float | None = None
         self._vs_rate_filt = 0.0
+        # Attitude-cascade state (VS branch): trim reference + rate filter.
+        self._theta_ref_deg: float | None = None
+        self._prev_pitch_deg: float | None = None
+        self._pitch_rate_filt = 0.0
         # Last commanded pitch, for the stick slew limiter.
         self._prev_pitch = 0.0
 
@@ -166,44 +170,50 @@ class SimpleFixedWingController(Controller):
         # swapped paths (gains picked to match the original PID's
         # full-strength response at typical errors).
         if targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
-            # Sink-rate tracking (glideslope + flare). The commander
-            # orders a vertical speed; pitch drives the difference to
-            # zero WITH AUTHORITY (500 fpm error → 0.4 stick) — but
-            # damped, or it porpoises: the airframe's VS answers the
-            # elevator 1–2 s late, so an undamped P-law overshoots and
-            # reverses forever (flight 96786124's rough final). Two
-            # smoothers, neither a limiter:
-            #   • the TARGET is slewed (≤1500 fpm/s) so staircase jumps
-            #     at slope knees don't whip the stick
-            #   • a VS-RATE term opposes fast changes, easing off
-            #     before the overshoot instead of after
-            VS_TO_PITCH_KP = 0.0008
-            VS_RATE_DAMP = 0.00015   # 1000 fpm/s of change → 0.15 opposing
+            # Sink-rate tracking via an ATTITUDE CASCADE. Stick position
+            # is physically a pitch RATE: between stick and vertical
+            # speed sit TWO integrations plus 1–2 s of aero lag, and
+            # proportional control through a double integrator is a
+            # textbook oscillator at ANY gain (low gain = slow porpoise,
+            # high gain = full-scale railing — both flown this week).
+            # Every real autopilot closes an attitude loop first:
+            #   INNER: stick holds pitch ATTITUDE (one integration —
+            #          stiff, self-damping via pitch-rate feedback)
+            #   OUTER: VS error nudges the attitude TARGET a few
+            #          degrees + a slow trim integrator finds the
+            #          attitude that holds the slope.
             vs_now_fpm = telemetry.vs_fpm
-            # Target slew
+            # Target slew (asymmetric: arrests ≤600 fpm/s so they can't
+            # saturate into balloon zooms; steepening 1500 fpm/s).
             if self._vs_target_smooth is None:
                 self._vs_target_smooth = targets.vs_target_fpm
             else:
-                # ASYMMETRIC slew: shallowing (arresting) is limited to
-                # 600 fpm/s — flight 8baa5ae1's flare demanded a
-                # 1100 fpm change instantly, saturated the stick, and
-                # overshot into a +1000 fpm balloon zoom. Steepening
-                # stays fast (1500 fpm/s): diving for the line must not
-                # lag.
                 up_step = 600.0 * dt
                 down_step = 1500.0 * dt
                 self._vs_target_smooth = max(
                     self._vs_target_smooth - down_step,
                     min(self._vs_target_smooth + up_step,
                         targets.vs_target_fpm))
-            # Filtered VS rate
-            if self._prev_vs is not None and dt > 0:
-                raw_rate = (vs_now_fpm - self._prev_vs) / dt
-                self._vs_rate_filt = (0.3 * raw_rate
-                                      + 0.7 * self._vs_rate_filt)
-            self._prev_vs = vs_now_fpm
-            pitch_cmd = ((self._vs_target_smooth - vs_now_fpm) * VS_TO_PITCH_KP
-                         - self._vs_rate_filt * VS_RATE_DAMP)
+            vs_err = self._vs_target_smooth - vs_now_fpm  # fpm, + = pull
+
+            # OUTER: attitude target. Trim ref initialises to the
+            # CURRENT attitude (continuity — no entry step) and slowly
+            # walks toward whatever attitude actually holds the target.
+            if self._theta_ref_deg is None:
+                self._theta_ref_deg = telemetry.pitch_deg
+            self._theta_ref_deg += vs_err * 0.003 * dt   # 300 fpm → 0.9°/s
+            self._theta_ref_deg = max(-10.0, min(12.0, self._theta_ref_deg))
+            theta_cmd = self._theta_ref_deg + vs_err * 0.004  # 500 fpm → 2°
+            theta_cmd = max(-10.0, min(14.0, theta_cmd))
+
+            # INNER: attitude hold with pitch-rate damping.
+            if self._prev_pitch_deg is not None and dt > 0:
+                raw_rate = (telemetry.pitch_deg - self._prev_pitch_deg) / dt
+                self._pitch_rate_filt = (0.3 * raw_rate
+                                         + 0.7 * self._pitch_rate_filt)
+            self._prev_pitch_deg = telemetry.pitch_deg
+            pitch_cmd = (0.10 * (theta_cmd - telemetry.pitch_deg)
+                         - 0.02 * self._pitch_rate_filt)
         elif targets.throttle_for_alt:
             # Speed → Pitch (sign-inverted) + vertical-speed damping.
             #   spd_err > 0 (too slow) → pitch_cmd < 0 (nose-down → gain speed)
@@ -236,6 +246,7 @@ class SimpleFixedWingController(Controller):
             self._vs_target_smooth = None
             self._prev_vs = None
             self._vs_rate_filt = 0.0
+            self._theta_ref_deg = None
         else:
             pitch_cmd = self.altitude_pid.update(
                 alt_error, dt, measurement=telemetry.altitude_ft,
@@ -243,6 +254,7 @@ class SimpleFixedWingController(Controller):
             self._vs_target_smooth = None
             self._prev_vs = None
             self._vs_rate_filt = 0.0
+            self._theta_ref_deg = None
 
         # Commander-issued pitch clamp. Nose-up cap is always honored; nose-down
         # cap is opt-in.
