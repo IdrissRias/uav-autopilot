@@ -156,17 +156,27 @@ class Trigger:
     lon: float = 0.0
     # For kind="any": tuple of sub-triggers that are OR'd together.
     subs: tuple = ()
+    # Arc-length of this trigger's fix on the ribbon polyline (nm).
+    # Set by plan_path after the preview is built. The PASS-BY branch
+    # of near_point may only fire once the follower's along-track
+    # progress has reached the fix: on a loop's outbound leg every
+    # arrival fix sits BEHIND the plane, and "behind" is geometrically
+    # identical to "passed" — the whole pattern cascaded in one tick
+    # (flight at KUBE, 2026-07-08). Direction can lie; distance along
+    # the ribbon can't. None = no gate (pre-gate ribbons).
+    along_gate_nm: Optional[float] = None
 
-    def fired(self, telemetry, agl_ft: float) -> bool:
+    def fired(self, telemetry, agl_ft: float,
+              along_nm: Optional[float] = None) -> bool:
         k = self.kind
         if k == "never":
             return False
         if k == "always":
             return True
         if k == "any":
-            return any(s.fired(telemetry, agl_ft) for s in self.subs)
+            return any(s.fired(telemetry, agl_ft, along_nm) for s in self.subs)
         if k == "all":
-            return all(s.fired(telemetry, agl_ft) for s in self.subs)
+            return all(s.fired(telemetry, agl_ft, along_nm) for s in self.subs)
         spd = telemetry.airspeed_kts
         alt = telemetry.altitude_ft
         if k == "speed_gte":
@@ -182,6 +192,14 @@ class Trigger:
         if k == "near_point":
             if not telemetry.has_position():
                 return False
+            # Along-track gate — applies to PROXIMITY too, not just the
+            # pass-by: a loop's outbound leg physically overlaps the
+            # arrival corridor, so the plane OVERFLIES arrival fixes on
+            # its way out. near_point means "arrived at this fix along
+            # the route," never "happened to fly over it."
+            if (self.along_gate_nm is not None and along_nm is not None
+                    and along_nm < self.along_gate_nm):
+                return False
             d_nm = haversine_m(
                 telemetry.lat_deg, telemetry.lon_deg, self.lat, self.lon,
             ) / 1852.0
@@ -194,7 +212,10 @@ class Trigger:
             # past cruise_aim in CRUISE before being killed). "Past" =
             # bearing-to-point is >90° off plane heading. Capped at 5×radius
             # so a stray heading swing during cross-track correction at long
-            # range can't false-fire.
+            # range can't false-fire. When progress is UNKNOWN the pass-by
+            # is denied outright for gated triggers (conservative).
+            if self.along_gate_nm is not None and along_nm is None:
+                return False
             if (not math.isnan(telemetry.heading_deg)
                     and d_nm < max(5.0, self.value * 5.0)):
                 brg = bearing_deg(
@@ -1362,6 +1383,22 @@ def plan_path(
     )
     keyframes = _build_keyframes(geometry)
     preview = _build_preview(geometry, keyframes)
+    # Stamp each near_point trigger with its fix's arc-length on the
+    # polyline: the pass-by branch may only believe "the fix is behind
+    # me" once the follower's progress has actually reached it (on a
+    # loop's outbound leg every arrival fix sits behind the plane and
+    # the whole pattern cascaded in one tick).
+    def _stamp(trig):
+        if trig.kind == "near_point":
+            best = min(preview,
+                       key=lambda pp: (pp.lat - trig.lat) ** 2
+                                      + (pp.lon - trig.lon) ** 2)
+            trig.along_gate_nm = max(
+                0.0, best.dist_from_start_nm - max(1.0, trig.value * 2.0))
+        for sub in trig.subs:
+            _stamp(sub)
+    for kf in keyframes:
+        _stamp(kf.trigger)
     return Ribbon(keyframes=keyframes, geometry=geometry, points=preview)
 
 

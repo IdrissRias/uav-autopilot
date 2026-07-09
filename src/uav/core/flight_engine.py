@@ -228,9 +228,11 @@ class FlightEngine:
         # Advance keyframe if trigger fired.  Loop so multiple triggers can
         # cascade (e.g. first tick of CRUISE when we already overshot
         # descent_start).
+        _ts = self.ctx.get("track_state") or {}
+        along_nm = _ts.get("along_track_nm")
         while self._idx < len(r.keyframes) - 1:
             kf = r.keyframes[self._idx]
-            if kf.trigger.fired(telemetry, agl_ft):
+            if kf.trigger.fired(telemetry, agl_ft, along_nm):
                 # Touchdown debounce: FLARE→ROLLOUT latched once on a
                 # single transient AGL=0 frame while 22 ft up (bounced
                 # landing, derotation active mid-air). The wheels-down

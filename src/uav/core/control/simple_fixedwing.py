@@ -250,14 +250,14 @@ class SimpleFixedWingController(Controller):
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
         if targets.pitch_down_limit is not None:
             pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
-        # The stick is not a relay either: pitch slews at most 2.0/s
-        # (full sweep in ~1 s). Same medicine as the throttle slew —
-        # smooth hands, no single-tick full-scale jumps, and sensor
-        # noise stops reaching the elevator.
+        # Smooth hands via FIRST-ORDER LOW-PASS (τ≈0.15 s), not a hard
+        # rate limit: a rate limiter is a saturation nonlinearity that
+        # itself limit-cycles (stick pegs at its rate, lags the loop,
+        # overshoots, reverses — observed immediately after adding one).
+        # The low-pass rounds every command with no saturation to ring.
         if dt > 0:
-            max_step = 2.0 * dt
-            pitch_cmd = max(self._prev_pitch - max_step,
-                            min(self._prev_pitch + max_step, pitch_cmd))
+            alpha = min(1.0, dt / 0.15)
+            pitch_cmd = self._prev_pitch + alpha * (pitch_cmd - self._prev_pitch)
         pitch_cmd = _clamp(pitch_cmd, 1.0)  # hardware truth
         self._prev_pitch = pitch_cmd
 
