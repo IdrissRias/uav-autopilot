@@ -79,6 +79,8 @@ class Autopilot:
         self._snapshot_next: float = 0.0  # next telemetry snapshot time
         self._snapshot_tick: int = 0      # tick counter for snapshots
         self._end_flight_requested = False  # set by app "end_flight" command
+        self._fly_epoch_ts = 0.0  # when the last FLY was accepted; grace
+        # window rejects stale end_flight replays that would reset the flight
 
         # ── Crash detector ──
         # Two signals, either triggers a "crashed" finalize:
@@ -120,8 +122,20 @@ class Autopilot:
                 print(f"[COMMAND] Destination changed to {dest}")
 
         elif action == "end_flight":
-            print("[COMMAND] END FLIGHT received — finalizing and resetting")
-            self._end_flight_requested = True
+            # Reject stale REPLAYS. Supabase redelivers the last
+            # broadcast to a freshly-subscribed channel, so an old
+            # "end_flight (aborted)" kept arriving ~1 s after every FLY
+            # and reset_flight() teleported the plane — "click fly, it
+            # just reloads, never flies." A real abort never lands
+            # within a few seconds of the takeoff it would abort; a
+            # replay always does.
+            since_fly = time.time() - getattr(self, "_fly_epoch_ts", 0.0)
+            if since_fly < 8.0:
+                print(f"[COMMAND] END FLIGHT ignored — {since_fly:.1f}s "
+                      f"after FLY (stale broadcast replay)")
+            else:
+                print("[COMMAND] END FLIGHT received — finalizing and resetting")
+                self._end_flight_requested = True
 
         elif action == "preview_ribbon":
             # Build a ribbon preview without starting the flight.
@@ -1005,6 +1019,7 @@ class Autopilot:
                             except Exception as e:
                                 print(f"[NAV] Cruise alt calc failed: {e}")
                     self._fly_command_received = True
+                    self._fly_epoch_ts = time.time()  # grace vs stale end_flight
                     # Don't continue — fall through to normal loop on next iteration
 
                 self._last_step = loop_start
@@ -1419,8 +1434,14 @@ class Autopilot:
                     self._end_poll_next = time.time() + 3.0
                     try:
                         if broadcast.poll_end_flight(self._aircraft_id):
-                            print("[COMMAND] End flight from DB poll")
-                            self._end_flight_requested = True
+                            since_fly = time.time() - getattr(
+                                self, "_fly_epoch_ts", 0.0)
+                            if since_fly < 8.0:
+                                print(f"[COMMAND] End-flight DB poll ignored "
+                                      f"— {since_fly:.1f}s after FLY (stale)")
+                            else:
+                                print("[COMMAND] End flight from DB poll")
+                                self._end_flight_requested = True
                     except Exception:
                         pass
 
