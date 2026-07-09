@@ -442,9 +442,12 @@ class FlightEngine:
         # a climb (throttle owns the low side).
         vs_target = None
         if kf.phase == "FLARE":
+            # Deepened arrest (was 120 + 10/ft): touchdowns were firm.
+            # -80 fpm at the pavement, gentler slope so the hold starts
+            # earlier and the plane is nearly floating at contact.
             agl_ft = ((t.agl_m * 3.28084)
                       if not math.isnan(t.agl_m) else 30.0)
-            vs_target = -(120.0 + max(0.0, agl_ft) * 10.0)
+            vs_target = -(80.0 + max(0.0, agl_ft) * 8.0)
             vs_target = max(vs_target, -600.0)  # never command a dive
         elif kf.phase == "ROLLOUT":
             # DEROTATION. Without this, rollout fell back to the alt-hold
@@ -651,7 +654,7 @@ class FlightEngine:
                 # stopping a balloon IS respecting V/S.
                 if (not math.isnan(t.vs_fpm) and t.vs_fpm > 100.0):
                     pitch_down_cap = 0.25
-                curve = max(-600.0, -(120.0 + max(0.0, agl_ft_commit) * 10.0))
+                curve = max(-600.0, -(80.0 + max(0.0, agl_ft_commit) * 8.0))
                 if self._commit_vs_fpm is None:
                     self._commit_vs_fpm = curve
                 else:  # ratchet: shallower only, never re-steepen
