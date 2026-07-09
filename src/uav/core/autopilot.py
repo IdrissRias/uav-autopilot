@@ -124,13 +124,17 @@ class Autopilot:
         elif action == "end_flight":
             # Reject stale REPLAYS. Supabase redelivers the last
             # broadcast to a freshly-subscribed channel, so an old
-            # "end_flight (aborted)" kept arriving ~1 s after every FLY
-            # and reset_flight() teleported the plane — "click fly, it
-            # just reloads, never flies." A real abort never lands
-            # within a few seconds of the takeoff it would abort; a
-            # replay always does.
+            # "end_flight (aborted)" kept arriving around every FLY and
+            # reset_flight() teleported the plane — "click fly, it just
+            # reloads, never flies." Two guards, because the replay can
+            # land either BEFORE fly is processed or just after:
+            #   1. nothing is flying → an end_flight is meaningless
+            #   2. < 8 s since FLY was accepted → too soon to be real
             since_fly = time.time() - getattr(self, "_fly_epoch_ts", 0.0)
-            if since_fly < 8.0:
+            if not self._fly_command_received:
+                print("[COMMAND] END FLIGHT ignored — no active flight "
+                      "(stale broadcast replay)")
+            elif since_fly < 8.0:
                 print(f"[COMMAND] END FLIGHT ignored — {since_fly:.1f}s "
                       f"after FLY (stale broadcast replay)")
             else:
@@ -1436,7 +1440,10 @@ class Autopilot:
                         if broadcast.poll_end_flight(self._aircraft_id):
                             since_fly = time.time() - getattr(
                                 self, "_fly_epoch_ts", 0.0)
-                            if since_fly < 8.0:
+                            if not self._fly_command_received:
+                                print("[COMMAND] End-flight DB poll ignored "
+                                      "— no active flight (stale)")
+                            elif since_fly < 8.0:
                                 print(f"[COMMAND] End-flight DB poll ignored "
                                       f"— {since_fly:.1f}s after FLY (stale)")
                             else:
