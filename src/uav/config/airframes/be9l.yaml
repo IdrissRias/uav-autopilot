@@ -1,0 +1,39 @@
+airframe_id: "be9l"
+name: "Beechcraft King Air C90"
+type: "twin_turboprop"
+
+# FALLBACK values only — used if the database is unreachable. In normal
+# operation all speeds come from the DB via load_aircraft() and are
+# refined by the observer flight by flight. Published book numbers.
+speeds_kts:
+  v_stall: 78
+  v_rotate: 95
+  v_takeoff: 100
+  v_climb: 120
+  v_cruise: 180
+  v_approach: 110
+  v_land: 100
+  v_never_exceed: 208
+
+rates_fpm:
+  climb: 2000
+  descent: 800
+
+throttle:
+  takeoff: 1.0
+  climb: 0.95
+  cruise: 0.60
+  approach: 0.25
+  idle: 0.0
+
+limits:
+  max_roll_cmd: 0.35
+  max_pitch_cmd: 1.0
+  max_yaw_cmd: 1.0
+
+thresholds:
+  takeoff_to_climb_speed_kts: 95
+  rotate_altitude_gain_ft: 200
+  climb_to_cruise_altitude_tolerance_ft: 10
+  approach_transition_alt_ft: 1500
+  land_transition_alt_ft: 200
