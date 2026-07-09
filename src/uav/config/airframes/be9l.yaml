@@ -1,19 +1,19 @@
 airframe_id: "be9l"
-name: "Beechcraft King Air C90"
+name: "Beechcraft King Air C90B"
 type: "twin_turboprop"
 
 # FALLBACK values only — used if the database is unreachable. In normal
 # operation all speeds come from the DB via load_aircraft() and are
 # refined by the observer flight by flight. Published book numbers.
 speeds_kts:
-  v_stall: 78
-  v_rotate: 95
+  v_stall: 80
+  v_rotate: 100
   v_takeoff: 100
   v_climb: 120
-  v_cruise: 180
+  v_cruise: 185
   v_approach: 110
   v_land: 100
-  v_never_exceed: 208
+  v_never_exceed: 226
 
 rates_fpm:
   climb: 2000

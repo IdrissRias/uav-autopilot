@@ -34,14 +34,19 @@ DB_PATH = Path.home() / ".peregrine" / "peregrine.db"
 # the IAS we want to plan around at pattern altitude, not the high-alt
 # TAS brochure figure.
 PRESETS = {
+    # King Air C90B, published (POH / AOPA / manufacturer): Vso 75,
+    # Vs clean ~80, Vref ~100, Vy 120, Vmo 226 KIAS, climb 2010 fpm,
+    # ceiling 30k, TO/LDG over 50 ft = 2714/3692 ft (ground rolls
+    # ~2100/2500). Cruise seed is pattern-altitude IAS, not the 234 kt
+    # high-alt TAS brochure figure.
     "KINGAIR": dict(
-        icao_type="BE9L", name="Beechcraft King Air C90",
+        icao_type="BE9L", name="Beechcraft King Air C90B",
         category="twin_turboprop",
-        v_stall_clean=78.0, v_stall_flap=72.0, v_rotate=95.0,
-        v_best_climb=120.0, v_cruise=180.0, v_approach=110.0,
-        v_land=100.0, v_never_exceed=208.0,
-        takeoff_roll_ft=2000.0, landing_roll_ft=2250.0,
-        best_climb_fpm=2000.0, service_ceiling=30000.0,
+        v_stall_clean=80.0, v_stall_flap=75.0, v_rotate=100.0,
+        v_best_climb=120.0, v_cruise=185.0, v_approach=110.0,
+        v_land=100.0, v_never_exceed=226.0,
+        takeoff_roll_ft=2100.0, landing_roll_ft=2500.0,
+        best_climb_fpm=2010.0, service_ceiling=30000.0,
     ),
     "BARON58": dict(
         icao_type="BE58", name="Beechcraft Baron 58",
