@@ -386,7 +386,13 @@ class SimpleFixedWingController(Controller):
                             - vs_thr * ALT_TO_THROTTLE_VS_DAMP)
         else:
             self._alt_thr_integral = 0.0
-            throttle_cmd = self.cruise_throttle + self.airspeed_pid.update(
+            # Base = commander-supplied when present (0.30 on the
+            # glideslope), else cruise power. The speed PID trims around
+            # the PHASE's power band, not cruise's.
+            base = (targets.throttle_base
+                    if targets.throttle_base is not None
+                    else self.cruise_throttle)
+            throttle_cmd = base + self.airspeed_pid.update(
                 spd_error, dt, measurement=telemetry.airspeed_kts,
             )
         # The engine is not a switch. Closed-loop throttle (both coupled

@@ -637,10 +637,12 @@ class FlightEngine:
         # the slope's needs and the engine works against it, giving the
         # alt law authority in BOTH directions (old near-idle base could
         # only fix "too low"; "too high" hit the idle stop).
-        # (No spooled baseline when decoupled — throttle holds speed.)
-        throttle_base = 0.30 if (kf.throttle_for_alt
-                                 and kf.alt_mode == "glideslope"
-                                 and not glide_decouple) else None
+        # Approach base for ANY glideslope descent: the classic speed
+        # loop adds/subtracts around this. Without it the controller used
+        # its default base — CRUISE power 0.60 — so a 2-4 kt deficit on a
+        # full-flap final commanded 0.85 while ABOVE the slope (the 80%-
+        # with-flaps bug): cruise arithmetic flying the approach.
+        throttle_base = 0.30 if kf.alt_mode == "glideslope" else None
 
         # ── Levers (None inherits) ───────────────────────────────────
         gear = (kf.gear_down if kf.gear_down is not None
@@ -846,7 +848,8 @@ class FlightEngine:
             # power to accelerate from the slow level-off speed to cruise
             # climbs the plane faster than pitch can hold (1300 ft
             # overshoot). 0.75 still reaches 175 kt (level needs ~0.55).
-            throttle_max=0.75 if cruise_hold else None,
+            throttle_max=(0.75 if cruise_hold
+                          else 0.55 if glide_decouple else None),
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
         )
