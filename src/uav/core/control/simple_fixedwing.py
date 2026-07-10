@@ -255,7 +255,12 @@ class SimpleFixedWingController(Controller):
             # exchange RATE (climbing fast → ease the nose down) removes
             # the oscillation without touching the setpoints.
             SPEED_TO_PITCH_KP = 0.015   # 10 kts → 0.15 pitch (~9°)
-            VS_TO_PITCH_DAMP = 0.00008  # 1000 fpm → 0.08 pitch opposing
+            # VS damping is the phugoid killer, and it was tuned soft for
+            # the SF50 (0.00008). The heavier/faster King Air phugoided
+            # +-260 ft / +-25 kt through it. Tripled to 0.00025 (1000 fpm
+            # -> 0.25 pitch opposing): climbing hard now gets a firm
+            # nose-down BEFORE the swing builds, sinking a firm nose-up.
+            VS_TO_PITCH_DAMP = 0.00025
             vs = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
             pitch_cmd = (-spd_error * SPEED_TO_PITCH_KP
                          - vs * VS_TO_PITCH_DAMP)
@@ -343,7 +348,10 @@ class SimpleFixedWingController(Controller):
             # Damped relative to the COMMANDED sink rate when one exists:
             # damping against zero would add +0.28 throttle in a normal
             # 1900 fpm commanded descent — fighting the descent itself.
-            ALT_TO_THROTTLE_VS_DAMP = 0.00015  # 1000 fpm → 0.15 throttle
+            ALT_TO_THROTTLE_VS_DAMP = 0.00030  # 1000 fpm → 0.30 throttle
+            # (doubled from 0.00015 with the pitch VS damp — the King Air
+            # phugoid needs the throttle to back off EARLY as it climbs,
+            # not after the alt error flips.)
             vs_ref = targets.vs_target_fpm if targets.vs_target_fpm is not None else 0.0
             vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else vs_ref
             vs_thr = vs_now - vs_ref

@@ -441,7 +441,6 @@ class FlightEngine:
         # gaining 50 ft while a speed-error law wakes up. Never commands
         # a climb (throttle owns the low side).
         vs_target = None
-        cruise_alt_hold = False  # level ALT HOLD via cascade (see below)
         if kf.phase == "FLARE":
             # Deepened arrest (was 120 + 10/ft): touchdowns were firm.
             # -80 fpm at the pavement, gentler slope so the hold starts
@@ -513,22 +512,6 @@ class FlightEngine:
                             required_fpm
                             - off_slope_ft * 1.5
                             - self._off_rate_filt * CLOSURE_DAMP)
-        elif (kf.alt_mode == "target" and kf.target_alt_ft is not None
-                and kf.phase == "CRUISE"):
-            # LEVEL ALT HOLD via the attitude cascade. Cruise used the
-            # INVERTED coupling (throttle defends alt, pitch trims
-            # speed), which phugoids in level flight: energy sloshes
-            # alt<->speed because throttle->alt is slow (engine lag)
-            # while pitch->speed is fast, and the two fight. Worse on
-            # the faster/heavier King Air (±260 ft / ±25 kt observed).
-            # Instead, do what real ALT HOLD does: altitude error is a
-            # gentle commanded VS the cascade holds with PITCH (stable,
-            # holds attitude not speed, so airframe-robust), and the
-            # throttle simply holds cruise speed (cruise_alt_hold clears
-            # throttle_for_alt below).
-            alt_err_ft = alt - t.altitude_ft   # + = below target
-            vs_target = max(-800.0, min(800.0, alt_err_ft * 4.0))
-            cruise_alt_hold = True
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
         # Glideslope descents now fly CONFIGURED (gear + flaps out from
@@ -727,9 +710,7 @@ class FlightEngine:
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
-            # cruise_alt_hold flips cruise to classic decoupling: pitch
-            # (via the vs cascade) owns altitude, throttle owns speed.
-            throttle_for_alt=kf.throttle_for_alt and not cruise_alt_hold,
+            throttle_for_alt=kf.throttle_for_alt,
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
