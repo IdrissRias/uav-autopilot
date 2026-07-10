@@ -788,10 +788,10 @@ def save_telemetry_snapshot(flight_id: str, snapshot: dict) -> None:
     try:
         conn.execute(f"INSERT INTO telemetry_snapshots ({col_str}) VALUES ({placeholders})", values)
         conn.commit()
-        # Sync every 5th snapshot to avoid overwhelming the queue
-        tick = snapshot.get("tick_num", 0)
-        if tick % 5 == 0:
-            _enqueue_sync(conn, "telemetry_snapshots", snap_id, "insert")
+        # NOTE: telemetry snapshots are NO LONGER enqueued to the sync
+        # queue — they are the bulk that clogged it and starved flight
+        # rows. The autopilot pushes them DIRECTLY to Supabase in batches
+        # (_push_snapshots_direct). Local copy is the durable record.
     except Exception as e:
         log.warning("Failed to save telemetry snapshot: %s", e)
 

@@ -77,6 +77,8 @@ class Autopilot:
         # Flight DB record
         self._flight_id: str | None = None
         self._snapshot_next: float = 0.0  # next telemetry snapshot time
+        self._snapshot_buffer: list = []   # snapshots awaiting direct push
+        self._snapshot_push_next: float = 0.0
         self._snapshot_tick: int = 0      # tick counter for snapshots
         self._end_flight_requested = False  # set by app "end_flight" command
         self._fly_epoch_ts = 0.0  # when the last FLY was accepted; grace
@@ -185,6 +187,23 @@ class Autopilot:
         allowed = set(sample[0].keys()) if sample else set(row.keys())
         payload = {k: v for k, v in row.items() if k in allowed and v is not None}
         client.table("flights").upsert(payload).execute()
+
+    def _push_snapshots_direct(self, batch: list) -> None:
+        """Upsert a batch of telemetry snapshots straight to Supabase,
+        bypassing the FIFO sync queue so the live PATH renders even when
+        the queue is backlogged. Best-effort; local copies stay queued."""
+        if not batch:
+            return
+        from uav.db import sync as _sync
+        client = _sync._get_supabase_client()
+        if client is None:
+            return
+        sample = client.table("telemetry_snapshots").select("*").limit(1).execute().data
+        allowed = set(sample[0].keys()) if sample else set(batch[0].keys())
+        rows = [{k: v for k, v in r.items() if k in allowed and v is not None}
+                for r in batch]
+        for i in range(0, len(rows), 200):
+            client.table("telemetry_snapshots").upsert(rows[i:i + 200]).execute()
 
     def _preview_ribbon(self, dest: dict) -> None:
         """Build a ribbon preview and broadcast waypoints without starting a flight."""
@@ -1359,7 +1378,7 @@ class Autopilot:
                     try:
                         import math as _m
                         agl = (telemetry.agl_m * 3.28084) if not _m.isnan(telemetry.agl_m) else 0.0
-                        local_db.save_telemetry_snapshot(self._flight_id, {
+                        snap = {
                             "tick_num": self._snapshot_tick,
                             "lat": telemetry.lat_deg if telemetry.has_position() else None,
                             "lon": telemetry.lon_deg if telemetry.has_position() else None,
@@ -1376,9 +1395,25 @@ class Autopilot:
                             "yaw_cmd": act.yaw,
                             "brake_ratio": act.brake_ratio,
                             "phase": phase,
-                        })
+                        }
+                        local_db.save_telemetry_snapshot(self._flight_id, snap)
+                        # Buffer for the DIRECT cloud push below — the live
+                        # PATH must not depend on the backlogged sync queue
+                        # (the ribbon draws but the trail was blank).
+                        self._snapshot_buffer.append(
+                            {**snap, "flight_id": self._flight_id})
                     except Exception:
                         pass
+
+                # ── Push buffered snapshots direct to Supabase (~10s) ──
+                if (self._snapshot_buffer
+                        and time.time() >= self._snapshot_push_next):
+                    self._snapshot_push_next = time.time() + 10.0
+                    batch, self._snapshot_buffer = self._snapshot_buffer, []
+                    try:
+                        self._push_snapshots_direct(batch)
+                    except Exception:
+                        pass  # queued copies remain as the fallback
 
                 # Finalize score + observer at ACTUAL touchdown: LAND
                 # phase AND wheels on the ground. LAND begins at FLARE
