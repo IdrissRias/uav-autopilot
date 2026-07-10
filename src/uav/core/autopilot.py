@@ -156,6 +156,36 @@ class Autopilot:
                 airframe["throttle"]["cruise"] = float(value)
                 print(f"[COMMAND] Cruise throttle → {value}")
 
+    def _push_flight_row_direct(self, flight_id: str) -> None:
+        """Upsert one flight row (with its ribbon) straight to Supabase,
+        bypassing the FIFO sync queue.
+
+        The queue is chronically backlogged, so the live flight's row can
+        take minutes to reach the cloud — but the app reads the cloud for
+        the live ribbon and trajectory, so a late row means a blank map.
+        This guarantees the *current* flight is visible immediately. It's
+        best-effort: any failure is swallowed and the queued entry remains
+        the durable fallback.
+        """
+        import sqlite3
+        from uav.db import sync as _sync
+        client = _sync._get_supabase_client()
+        if client is None:
+            return
+        conn = local_db.get_connection()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM flights WHERE id = ?", (flight_id,)
+        ).fetchone()
+        if row is None:
+            return
+        row = dict(row)
+        # Discover the cloud schema once and only send columns it has.
+        sample = client.table("flights").select("*").limit(1).execute().data
+        allowed = set(sample[0].keys()) if sample else set(row.keys())
+        payload = {k: v for k, v in row.items() if k in allowed and v is not None}
+        client.table("flights").upsert(payload).execute()
+
     def _preview_ribbon(self, dest: dict) -> None:
         """Build a ribbon preview and broadcast waypoints without starting a flight."""
         try:
@@ -783,6 +813,19 @@ class Autopilot:
                     )
                     conn.commit()
                     print(f"[PEREGRINE] Ribbon stored in flight record ({len(ribbon.points)} pts → {len(wp_json)} bytes)")
+                    # DIRECT push to Supabase, bypassing the sync queue.
+                    # The queue is FIFO and chronically backlogged (100s
+                    # of old rows), so the CURRENT flight's row + ribbon
+                    # sat behind the pile and never reached the cloud in
+                    # time — the app, which reads the cloud, saw no live
+                    # flight and drew no ribbon (twice). The live ribbon
+                    # must NOT depend on queue health: upsert the flight
+                    # row now, ribbon included. Best-effort; the queued
+                    # entry above stays as the durable fallback.
+                    try:
+                        self._push_flight_row_direct(self._flight_id)
+                    except Exception as _e:
+                        print(f"[PEREGRINE] Direct flight push skipped: {_e}")
             except Exception as e:
                 print(f"[PEREGRINE] Ribbon storage failed: {e}")
 
