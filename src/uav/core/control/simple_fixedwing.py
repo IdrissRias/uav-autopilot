@@ -128,7 +128,12 @@ class SimpleFixedWingController(Controller):
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
         alt_error = targets.altitude_ft - telemetry.altitude_ft
-        spd_error = targets.airspeed_kts - telemetry.airspeed_kts
+        # A keyframe may legitimately carry NO speed target (None =
+        # "no speed regulation", e.g. emergent-speed cruise). No target
+        # means no error — without this guard the subtraction crashes
+        # the control loop mid-flight.
+        spd_error = ((targets.airspeed_kts - telemetry.airspeed_kts)
+                     if targets.airspeed_kts is not None else 0.0)
 
         # Coupling-mode flip → wipe the stale integrals of whichever
         # loops sat unused (they hold minutes-old wound-up state).
