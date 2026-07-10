@@ -409,8 +409,24 @@ class FlightEngine:
         # retargeting — superseded by configure-early + pitch-down.
         speed = kf.target_speed_kts  # None = no speed regulation
 
+        # ── Cruise = EMERGENT SPEED ──────────────────────────────────
+        # In every level CRUISE-phase keyframe, don't chase a speed
+        # number. Chasing an unreachable target (King Air can't make
+        # 185 kt level) floors the throttle forever and the excess power
+        # CLIMBS the plane 10,000 ft past its altitude. Instead: pitch
+        # holds altitude (vs cascade below), throttle is a FIXED cruise
+        # power, and speed is whatever that power sustains at altitude.
+        # "Hold alt, go as fast as the power allows." DECELERATE keeps
+        # its idle (it wants to slow down); everything else that was
+        # speed_pid gets fixed power.
+        cruise_hold = (kf.phase == "CRUISE" and kf.alt_mode == "target"
+                       and kf.target_alt_ft is not None
+                       and kf.throttle_mode != "idle")
+
         # ── Throttle ─────────────────────────────────────────────────
-        if kf.throttle_mode == "alt_scaled":
+        if cruise_hold:
+            throttle = 0.62  # fixed cruise power; pitch holds altitude
+        elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
             # 20kft → 0.85.  Capped so we never float above 85% at cruise.
@@ -512,6 +528,12 @@ class FlightEngine:
                             required_fpm
                             - off_slope_ft * 1.5
                             - self._off_rate_filt * CLOSURE_DAMP)
+        elif cruise_hold:
+            # Pitch holds altitude: error → gentle commanded VS the
+            # cascade tracks (clamped ±700 fpm). With throttle fixed
+            # (above), altitude is defended by PITCH and speed floats.
+            alt_err_ft = alt - t.altitude_ft   # + = below target
+            vs_target = max(-700.0, min(700.0, alt_err_ft * 4.0))
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
         # Glideslope descents now fly CONFIGURED (gear + flaps out from
@@ -710,7 +732,10 @@ class FlightEngine:
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
-            throttle_for_alt=kf.throttle_for_alt,
+            # cruise_hold: pitch (vs cascade) owns altitude, throttle is
+            # fixed, speed floats. Clear throttle_for_alt so it does not
+            # also try to drive the (fixed) throttle off alt error.
+            throttle_for_alt=kf.throttle_for_alt and not cruise_hold,
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
