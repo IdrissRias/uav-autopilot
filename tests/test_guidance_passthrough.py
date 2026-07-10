@@ -54,7 +54,13 @@ class TestPassthroughDropsNothing(unittest.TestCase):
         out = PassthroughGuidance().compute(t, desired)
         self.assertEqual(out.heading_deg, 45.0)
         self.assertEqual(out.altitude_ft, 4321.0)
-        self.assertEqual(out.airspeed_kts, 123.0)
+        # airspeed_kts=None must pass through AS None: it means "no
+        # speed regulation / speed emergent". Substituting the current
+        # telemetry speed as the target gave the controller ~zero speed
+        # error every tick, froze the throttle walk, and starved the
+        # altitude branch — flight 334ded3d sank 1,500 ft at idle and
+        # crashed while the controller believed all was well.
+        self.assertIsNone(out.airspeed_kts)
 
 
 if __name__ == "__main__":
