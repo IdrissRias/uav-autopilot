@@ -293,7 +293,16 @@ class Autopilot:
                 "event": "flight_plan",
                 "waypoints": waypoints,
             })
-            print(f"[PREVIEW] Broadcast {len(waypoints)} waypoints to app")
+            # Queue two rebroadcasts (+2 s, +5 s). A single broadcast is
+            # lost forever if the app's channel is still handshaking when
+            # it fires — the "ribbon sometimes doesn't generate" bug. The
+            # main loop drains this queue (see _preview_rebroadcasts).
+            self._preview_payload = {"event": "flight_plan",
+                                     "waypoints": waypoints}
+            now = time.time()
+            self._preview_rebroadcasts = [now + 2.0, now + 5.0]
+            print(f"[PREVIEW] Broadcast {len(waypoints)} waypoints to app "
+                  f"(+2 rebroadcasts queued)")
 
         except Exception as e:
             print(f"[PREVIEW] Failed: {e}")
@@ -851,6 +860,16 @@ class Autopilot:
                         "airspeed_kts": 0,
                     }
                     broadcast.publish_heartbeat(self._aircraft_id, hb)
+
+                # Drain queued preview rebroadcasts (see _preview_ribbon).
+                rebros = getattr(self, "_preview_rebroadcasts", None)
+                if rebros and time.time() >= rebros[0]:
+                    rebros.pop(0)
+                    try:
+                        broadcast.publish_status(self._preview_payload)
+                        print("[PREVIEW] Rebroadcast flight_plan")
+                    except Exception:
+                        pass
 
                 # Accept fly/preview command from broadcast OR DB poll
                 if not self._fly_destination and self._aircraft_id:
