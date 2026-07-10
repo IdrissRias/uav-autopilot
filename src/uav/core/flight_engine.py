@@ -462,19 +462,21 @@ class FlightEngine:
 
         # ── Throttle ─────────────────────────────────────────────────
         if cruise_hold:
-            # ALTITUDE IS RELIGION (the user's rule): never add throttle to
-            # a plane ABOVE its cruise target — cut power, let it descend.
-            # Proportional/clamped: idles ~100 ft high, sustains ~0.50 at
-            # target, adds when low. Pitch holds altitude; speed is
-            # emergent. Safe in CRUISE because it's clean/low-drag — idle
-            # just coasts. NOT extended to the configured final: there,
-            # full flaps + gear at idle bleed speed into a stall in
-            # seconds (observed 85 kt / stall floor at full power). On
-            # final the throttle MUST hold approach speed; the way to fix
-            # "too high on final" is PITCH (dive to the slope) + geometry,
-            # never cutting power the plane needs to stay flying.
+            # POWER FOR ALTITUDE. The throttle is the altitude control in
+            # cruise, moved gently: below target → ease power up (plane
+            # rises), above → ease it down (falls). A SLOW trim integral
+            # settles onto the exact power that holds this altitude — the
+            # "power band" — so at steady state the plane sits level at a
+            # stable speed with the stick barely moving. Proportional part
+            # is soft (a nudge, not a lunge); the integral does the
+            # settling over ~40 s, far slower than any oscillation.
+            # (Stays in CRUISE only — the configured final MUST hold
+            # approach speed or it stalls; see the revert note.)
             alt_err_c = alt - t.altitude_ft   # + = below target → add
-            throttle = max(0.0, min(0.78, 0.50 + alt_err_c * 0.005))
+            self._cruise_thr_trim += alt_err_c * 0.00004 * ramp_dt
+            self._cruise_thr_trim = max(-0.25, min(0.25, self._cruise_thr_trim))
+            p_nudge = max(-0.15, min(0.15, alt_err_c * 0.0015))
+            throttle = max(0.0, min(0.85, 0.50 + p_nudge + self._cruise_thr_trim))
         elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
@@ -502,10 +504,12 @@ class FlightEngine:
         if (kf.phase == "CLIMB" and kf.alt_mode == "target"
                 and kf.target_alt_ft is not None and throttle is not None):
             CAPTURE_FT = 700.0
-            CRUISE_PWR = 0.52
+            CRUISE_PWR = 0.50
             remaining = kf.target_alt_ft - t.altitude_ft
-            if 0.0 < remaining < CAPTURE_FT and throttle > CRUISE_PWR:
-                frac = remaining / CAPTURE_FT   # 1 at edge → 0 at target
+            if remaining < CAPTURE_FT and throttle > CRUISE_PWR:
+                # frac 1 at band edge → 0 at/above target (never full
+                # power once past the target waiting for the trigger).
+                frac = max(0.0, min(1.0, remaining / CAPTURE_FT))
                 throttle = CRUISE_PWR + (throttle - CRUISE_PWR) * frac
 
         pitch_cap = kf.pitch_limit
@@ -595,11 +599,37 @@ class FlightEngine:
                             - off_slope_ft * 1.5
                             - self._off_rate_filt * CLOSURE_DAMP)
         elif cruise_hold:
-            # Pitch holds altitude: error → gentle commanded VS the
-            # cascade tracks (clamped ±700 fpm). With throttle fixed
-            # (above), altitude is defended by PITCH and speed floats.
+            # POWER FOR ALTITUDE, PITCH FOR ATTITUDE (user doctrine). The
+            # yoke holds a STEADY, near-level attitude — it does NOT chase
+            # altitude with big VS demands (that was the twitchy, constant
+            # stick). Just a whisper of VS toward the target (±90 fpm) so
+            # the plane doesn't drift, but mostly it holds level. THROTTLE
+            # walks the altitude to the target (see the cruise throttle
+            # block: power up → the plane rises, power down → it falls) and
+            # settles into the power band that holds it. Steady stick,
+            # slow power, speed emergent.
             alt_err_ft = alt - t.altitude_ft   # + = below target
-            vs_target = max(-700.0, min(700.0, alt_err_ft * 4.0))
+            vs_target = max(-90.0, min(90.0, alt_err_ft * 0.6))
+        elif (kf.phase == "CLIMB" and kf.alt_mode == "target"
+                and kf.target_alt_ft is not None
+                and kf.name != "CLIMB_ROTATE"):
+            # STEADY CLIMB (user doctrine): pitch holds ONE climb rate all
+            # the way up — the yoke does not chase the altitude error. The
+            # commanded rate tapers over the last 600 ft so the plane
+            # rounds onto cruise altitude (in step with the throttle
+            # capture taper below), then cruise_hold's steady-level law
+            # takes over. Rate comes from the airframe (rates_fpm.climb).
+            # CLIMB_ROTATE keeps the alt-PID: rotation needs the nose
+            # yanked up, not a rate hold.
+            rates_af = self.ctx.get("airframe", {}).get("rates_fpm", {})
+            climb_fpm = float(rates_af.get("climb", 1500.0) or 1500.0)
+            climb_fpm = max(500.0, min(2200.0, climb_fpm))
+            remaining_c = kf.target_alt_ft - t.altitude_ft
+            if remaining_c > 0:
+                vs_target = max(150.0,
+                                climb_fpm * min(1.0, remaining_c / 600.0))
+            else:
+                vs_target = 0.0   # at/above target: level, wait for trigger
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
         # Glideslope descents now fly CONFIGURED (gear + flaps out from
