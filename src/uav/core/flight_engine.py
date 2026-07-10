@@ -428,6 +428,8 @@ class FlightEngine:
         # overspeed protection above). No pitch-up bleed, no speed
         # retargeting — superseded by configure-early + pitch-down.
         speed = kf.target_speed_kts  # None = no speed regulation
+        # (cruise_hold is computed below; speed is cleared there —
+        # power walks altitude and speed is EMERGENT, per doctrine.)
 
         # ── Cruise = ALTITUDE-COORDINATED, EMERGENT SPEED ────────────
         # In every level CRUISE-phase keyframe, don't chase a speed
@@ -459,24 +461,18 @@ class FlightEngine:
         # keeps its own idle + arrest.
         glide_decouple = (kf.alt_mode == "glideslope"
                           and kf.phase != "FLARE")
+        if cruise_hold:
+            speed = None   # speed is emergent in cruise (power ↔ altitude)
 
         # ── Throttle ─────────────────────────────────────────────────
+        # No fixed cruise law and NO fixed bases/caps anywhere (user
+        # doctrine): closed-loop phases hand throttle=None to the
+        # controller, whose single slow-walk integrator ranges the FULL
+        # 0–100% and settles on whatever power the plane needs. In
+        # cruise_hold the walk is driven by ALTITUDE (speed emergent);
+        # on the glideslope by the approach speed target.
         if cruise_hold:
-            # POWER FOR ALTITUDE. The throttle is the altitude control in
-            # cruise, moved gently: below target → ease power up (plane
-            # rises), above → ease it down (falls). A SLOW trim integral
-            # settles onto the exact power that holds this altitude — the
-            # "power band" — so at steady state the plane sits level at a
-            # stable speed with the stick barely moving. Proportional part
-            # is soft (a nudge, not a lunge); the integral does the
-            # settling over ~40 s, far slower than any oscillation.
-            # (Stays in CRUISE only — the configured final MUST hold
-            # approach speed or it stalls; see the revert note.)
-            alt_err_c = alt - t.altitude_ft   # + = below target → add
-            self._cruise_thr_trim += alt_err_c * 0.00004 * ramp_dt
-            self._cruise_thr_trim = max(-0.25, min(0.25, self._cruise_thr_trim))
-            p_nudge = max(-0.15, min(0.15, alt_err_c * 0.0015))
-            throttle = max(0.0, min(0.85, 0.50 + p_nudge + self._cruise_thr_trim))
+            throttle = None
         elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
@@ -637,12 +633,9 @@ class FlightEngine:
         # the slope's needs and the engine works against it, giving the
         # alt law authority in BOTH directions (old near-idle base could
         # only fix "too low"; "too high" hit the idle stop).
-        # Approach base for ANY glideslope descent: the classic speed
-        # loop adds/subtracts around this. Without it the controller used
-        # its default base — CRUISE power 0.60 — so a 2-4 kt deficit on a
-        # full-flap final commanded 0.85 while ABOVE the slope (the 80%-
-        # with-flaps bug): cruise arithmetic flying the approach.
-        throttle_base = 0.30 if kf.alt_mode == "glideslope" else None
+        # No fixed bases: the controller's walk integrator finds the
+        # power band on its own (user doctrine — nothing is pinned).
+        throttle_base = None
 
         # ── Levers (None inherits) ───────────────────────────────────
         gear = (kf.gear_down if kf.gear_down is not None
@@ -848,8 +841,7 @@ class FlightEngine:
             # power to accelerate from the slow level-off speed to cruise
             # climbs the plane faster than pitch can hold (1300 ft
             # overshoot). 0.75 still reaches 175 kt (level needs ~0.55).
-            throttle_max=(0.75 if cruise_hold
-                          else 0.55 if glide_decouple else None),
+            throttle_max=None,  # full 0–100% range in every phase
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
         )

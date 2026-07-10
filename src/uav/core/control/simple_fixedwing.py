@@ -149,6 +149,11 @@ class SimpleFixedWingController(Controller):
         self._theta_cmd_prev: float | None = None
         # Last commanded pitch, for the stick slew limiter.
         self._prev_pitch = 0.0
+        # The ONE closed-loop throttle: a slow-walk integrator, full
+        # 0–100% range, seeded from the last commanded throttle when a
+        # closed-loop phase begins (continuity). None while the ribbon
+        # commands throttle explicitly.
+        self._thr_walk: float | None = None
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -347,6 +352,7 @@ class SimpleFixedWingController(Controller):
         if targets.throttle is not None:
             # Explicit throttle from ribbon (e.g. CLIMB full, FLARE idle)
             self._alt_thr_integral = 0.0
+            self._thr_walk = None   # next closed-loop phase re-seeds
             throttle_cmd = targets.throttle
         elif targets.throttle_for_alt:
             # Alt → Throttle: GENTLE proportional + a slow TRIM INTEGRAL
@@ -386,15 +392,28 @@ class SimpleFixedWingController(Controller):
                             - vs_thr * ALT_TO_THROTTLE_VS_DAMP)
         else:
             self._alt_thr_integral = 0.0
-            # Base = commander-supplied when present (0.30 on the
-            # glideslope), else cruise power. The speed PID trims around
-            # the PHASE's power band, not cruise's.
-            base = (targets.throttle_base
-                    if targets.throttle_base is not None
-                    else self.cruise_throttle)
-            throttle_cmd = base + self.airspeed_pid.update(
-                spd_error, dt, measurement=telemetry.airspeed_kts,
-            )
+            # ONE continuous throttle law (user doctrine): the power is
+            # free from 0 to 100% in EVERY closed-loop phase, and it only
+            # ever WALKS — bit by bit — toward whatever the plane needs,
+            # settling there. No fixed bases, no caps, no per-phase
+            # arithmetic. The integrator seeds from the last command so
+            # each phase continues the last.
+            #   speed target present (glideslope/approach) → walk on the
+            #     speed error (power holds landing speed);
+            #   no speed target (cruise — speed emergent)  → walk on the
+            #     altitude error, damped by vertical speed so the power
+            #     eases off as the climb develops instead of overshooting.
+            if self._thr_walk is None:
+                self._thr_walk = self._prev_throttle
+            if targets.airspeed_kts is not None:
+                drive = spd_error * 0.004          # /s per knot
+            else:
+                vs_now = (telemetry.vs_fpm
+                          if not math.isnan(telemetry.vs_fpm) else 0.0)
+                drive = alt_error * 0.0004 - vs_now * 0.00012
+            self._thr_walk += drive * dt
+            self._thr_walk = max(0.0, min(1.0, self._thr_walk))
+            throttle_cmd = self._thr_walk
         # The engine is not a switch. Closed-loop throttle (both coupled
         # and classic modes) slews at most 0.5/s — full sweep in 2 s.
         # Explicit ribbon throttle (takeoff full power, flare idle) is
