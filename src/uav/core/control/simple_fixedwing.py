@@ -517,6 +517,14 @@ class SimpleFixedWingController(Controller):
         else:
             # Danger cleared: release the boost smoothly (no chop).
             self._stall_boost = max(0.0, self._stall_boost - 0.3 * dt)
+        # The boost exists ONLY while a stall floor is armed. FLARE and
+        # ROLLOUT carry stall_floor_kts=None — slow there is by design
+        # and throttle=idle is a commander order. The smooth release
+        # leaked ~0.97 of emergency power INTO the flare and the plane
+        # hit the runway with the engine pushing (flight 73da8c44).
+        # Crossing into a floorless phase kills the boost outright.
+        if targets.stall_floor_kts is None:
+            self._stall_boost = 0.0
         # Slew reference stays PRE-boost: otherwise the boost leaks into
         # prev and the slew chases the boosted value while the boost adds
         # again — compounding growth (0.13/tick observed in test). The
