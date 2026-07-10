@@ -70,6 +70,7 @@ class FlightEngine:
         self._cl_int_deg = 0.0
         self._cl_cross_prev = None
         self._cl_cross_rate = 0.0
+        self._cruise_thr_trim = 0.0
         self._td_ticks = 0
         # Tangential-capture state (see glideslope vs block).
         self._off_slope_prev: Optional[float] = None
@@ -107,6 +108,7 @@ class FlightEngine:
         self._cl_int_deg = 0.0
         self._cl_cross_prev = None
         self._cl_cross_rate = 0.0
+        self._cruise_thr_trim = 0.0
         self._td_ticks = 0
         self._off_slope_prev = None
         self._off_rate_filt = 0.0
@@ -460,16 +462,18 @@ class FlightEngine:
 
         # ── Throttle ─────────────────────────────────────────────────
         if cruise_hold:
-            # FIXED cruise power; pitch owns altitude. We tried reactive
-            # power both ways and both diverged because we don't yet know
-            # the King Air's true level-cruise operating point: reactive-
-            # to-altitude drove a phugoid, reactive-to-speed climbed away
-            # (155 kt still needed more than level power, so the excess
-            # climbed the plane 900 ft). Fixed power can't get the point
-            # wrong — pitch pins the altitude and speed settles wherever
-            # this power sustains. Once the observer learns the real
-            # cruise speed, throttle can react to THAT safely.
-            throttle = 0.60
+            # Cruise power = a base + a VERY SLOW self-trim that finds the
+            # level-flight power on its own. Pitch owns altitude; the trim
+            # only nudges the mean power so pitch isn't left fighting a
+            # standing climb (0.60 fixed was too much power — the plane
+            # kept climbing 375 ft after level-off and pitch had to haul
+            # it back). The trim's time constant (~60 s) is far slower
+            # than the ~24 s phugoid, so it settles the mean without
+            # exciting the oscillation the fast reactive laws did.
+            alt_err_c = alt - t.altitude_ft   # + = below target → add power
+            self._cruise_thr_trim += alt_err_c * 0.00003 * ramp_dt
+            self._cruise_thr_trim = max(-0.18, min(0.18, self._cruise_thr_trim))
+            throttle = max(0.30, min(0.85, 0.52 + self._cruise_thr_trim))
         elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
@@ -497,7 +501,7 @@ class FlightEngine:
         if (kf.phase == "CLIMB" and kf.alt_mode == "target"
                 and kf.target_alt_ft is not None and throttle is not None):
             CAPTURE_FT = 700.0
-            CRUISE_PWR = 0.60
+            CRUISE_PWR = 0.52
             remaining = kf.target_alt_ft - t.altitude_ft
             if 0.0 < remaining < CAPTURE_FT and throttle > CRUISE_PWR:
                 frac = remaining / CAPTURE_FT   # 1 at edge → 0 at target
