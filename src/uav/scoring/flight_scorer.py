@@ -4,11 +4,24 @@ Flight performance scorer.
 After each flight, scores across four dimensions and saves to logs/scores.json.
 Every flight gets compared to the personal best — improvements are highlighted.
 
-Score (0–100):
-  40 pts  Landing accuracy   — distance from destination (0 = >500m, 40 = <50m)
-  30 pts  Landing speed      — vs v_land (0 = >110kts, 30 = ≤v_land+5kts)
-  20 pts  Flight time        — vs personal best for this route (20 = PB, 0 = 2× PB)
-  10 pts  Cruise stability   — std-dev of altitude vs cruise target (0 = ±300ft, 10 = ±10ft)
+Score (0–100) — QUALITY of flight, not just "did it land":
+  30 pts  Path adherence     — RMS of altitude error vs the PLANNED target,
+                               every airborne tick (climb, cruise, descent,
+                               approach). Full ≤20 ft, 0 ≥170 ft. A porpoising
+                               descent that balloons ±150 ft off the glideslope
+                               is scored here, where it was invisible before.
+  25 pts  Ride smoothness    — vertical-speed reversal rate (the wobble). A
+                               smooth flight barely changes VS sign; a
+                               porpoising one flips it constantly.
+                               Full ≤0.04 /s, 0 ≥0.28 /s.
+  30 pts  Landing accuracy   — touchdown distance from the aim point.
+                               Full ≤40 m, 0 ≥300 m.
+  15 pts  Landing speed      — vs v_land. Full ≤v_land+3, 0 ≥v_land+22.
+
+Adherence + smoothness = 55 % of the score, so a wobbly flight cannot buy a
+high score with a lucky touchdown. (Field names pts_time/pts_stability are
+retained for storage compatibility; pts_time now carries adherence and
+pts_stability carries smoothness.)
 """
 from __future__ import annotations
 
@@ -96,11 +109,64 @@ class FlightScorer:
 
         self._start_ts = time.time()
         self._cruise_alt_samples: List[float] = []  # deviation from target each tick
+        # Whole-flight quality accumulators (see update()).
+        self._alt_err_samples: List[float] = []  # |alt − target| every airborne tick
+        self._vs_reversals: int = 0
+        self._vs_prev_sign: int = 0
+        self._airborne_ticks: int = 0
 
-    def update(self, phase: str, altitude_ft: float) -> None:
-        """Call every autopilot tick to accumulate cruise stability samples."""
+    # Phases that are NOT airborne flying — excluded from adherence/wobble.
+    _GROUND_PHASES = {"GROUND", "TAKEOFF", "TAKEOFF_ROLL", "ROLLOUT", "STOP"}
+
+    def update(
+        self,
+        phase: str,
+        altitude_ft: float,
+        vs_fpm: float | None = None,
+        target_alt_ft: float | None = None,
+    ) -> None:
+        """Call every autopilot tick. Accumulates whole-flight quality:
+        altitude error vs the planned target, and vertical-speed reversals
+        (the wobble). Ground phases are excluded — flare sink and rollout
+        are not 'off target'."""
         if phase == "CRUISE":
             self._cruise_alt_samples.append(altitude_ft - self.cruise_target_ft)
+
+        if phase in self._GROUND_PHASES:
+            return
+        self._airborne_ticks += 1
+
+        # Adherence: distance from the commanded altitude at this instant.
+        # FLARE is excluded from adherence (it is intentionally leaving the
+        # glideslope for the runway) but still counts for wobble.
+        if (target_alt_ft is not None and phase != "FLARE"
+                and not math.isnan(target_alt_ft)):
+            self._alt_err_samples.append(abs(altitude_ft - target_alt_ft))
+
+        # Wobble: count vertical-speed sign flips above a noise floor.
+        if vs_fpm is not None and not math.isnan(vs_fpm):
+            sign = 1 if vs_fpm > 60.0 else (-1 if vs_fpm < -60.0 else 0)
+            if sign != 0:
+                if self._vs_prev_sign != 0 and sign != self._vs_prev_sign:
+                    self._vs_reversals += 1
+                self._vs_prev_sign = sign
+
+    def _quality_points(self) -> tuple:
+        """(pts_adherence 0–30, pts_smoothness 0–25, alt_rms_ft, vs_rev_rate).
+        Shared by finalize() and finalize_partial()."""
+        if self._alt_err_samples:
+            alt_rms = math.sqrt(
+                sum(e * e for e in self._alt_err_samples)
+                / len(self._alt_err_samples))
+        else:
+            alt_rms = 999.0
+        pts_adh = max(0.0, 30.0 * (1.0 - max(0.0, alt_rms - 20.0) / 150.0))
+
+        # Reversals per second of airborne time (tick rate independent).
+        secs = max(1.0, time.time() - self._start_ts)
+        rev_rate = self._vs_reversals / secs
+        pts_smooth = max(0.0, 25.0 * (1.0 - max(0.0, rev_rate - 0.04) / 0.24))
+        return pts_adh, pts_smooth, alt_rms, rev_rate
 
     def finalize(
         self,
@@ -119,25 +185,16 @@ class FlightScorer:
         else:
             cruise_alt_std = 999.0
 
-        # ── Scoring ──────────────────────────────────────────────────────────
+        # ── Scoring (quality-first) ──────────────────────────────────────────
+        # Accuracy: 30 pts, full ≤40 m, 0 ≥300 m (stricter than the old 50/500).
+        pts_acc = max(0.0, 30.0 * (1.0 - max(0.0, landing_dist_m - 40.0) / 260.0))
 
-        # Accuracy: 40 pts linear 50m → 500m
-        pts_acc = max(0.0, 40.0 * (1.0 - max(0.0, landing_dist_m - 50.0) / 450.0))
+        # Speed: 15 pts, full ≤v_land+3, 0 ≥v_land+22.
+        spd_over = max(0.0, landing_speed_kts - (self.V_LAND_KTAS + 3.0))
+        pts_spd = max(0.0, 15.0 * (1.0 - spd_over / 19.0))
 
-        # Speed: 30 pts — full points at v_land+5kts, 0 at v_land+35kts
-        spd_over = max(0.0, landing_speed_kts - (self.V_LAND_KTAS + 5.0))
-        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / 30.0))
-
-        # Time: 20 pts vs personal best for this route
-        prev_best_time = self._load_best_time()
-        if prev_best_time is None:
-            pts_time = 20.0  # first flight always gets full time score
-        else:
-            ratio = duration_s / max(1.0, prev_best_time)  # 1.0 = matches PB, 2.0 = twice as slow
-            pts_time = max(0.0, 20.0 * (2.0 - ratio))
-
-        # Stability: 10 pts — full at ±10ft std-dev, 0 at ±300ft
-        pts_stab = max(0.0, 10.0 * (1.0 - max(0.0, cruise_alt_std - 10.0) / 290.0))
+        # Adherence (stored in pts_time) + smoothness (stored in pts_stability).
+        pts_time, pts_stab, alt_rms, rev_rate = self._quality_points()
 
         total = pts_acc + pts_spd + pts_time + pts_stab
 
@@ -146,15 +203,24 @@ class FlightScorer:
         is_pb = prev_best is None or total > prev_best
 
         notes = []
-        if landing_dist_m < 50:
+        if landing_dist_m < 40:
             notes.append("🎯 Landed on the dot!")
-        elif landing_dist_m < 150:
-            notes.append("✅ Very accurate landing")
-        elif landing_dist_m > 400:
-            notes.append("⚠️  Missed by a lot — approach heading needs work")
-        if landing_speed_kts > self.V_LAND_KTAS + 15.0:
-            notes.append("🔴 Way too fast on touchdown — speed bleed needs improvement")
-        elif landing_speed_kts > self.V_LAND_KTAS + 5.0:
+        elif landing_dist_m < 120:
+            notes.append("✅ Accurate landing")
+        elif landing_dist_m > 300:
+            notes.append("⚠️  Missed by a lot — approach needs work")
+        # Flight-quality notes (the point of the rescoring).
+        if alt_rms > 100.0:
+            notes.append(f"🔴 Wandered off the planned path ({alt_rms:.0f} ft RMS)")
+        elif alt_rms < 30.0:
+            notes.append("✅ Held the path tightly")
+        if rev_rate > 0.18:
+            notes.append(f"🔴 Wobbly ride — porpoised ({rev_rate:.2f} VS flips/s)")
+        elif rev_rate < 0.06:
+            notes.append("✅ Smooth ride")
+        if landing_speed_kts > self.V_LAND_KTAS + 12.0:
+            notes.append("🔴 Too fast on touchdown")
+        elif landing_speed_kts > self.V_LAND_KTAS + 3.0:
             notes.append("🟡 A bit fast on touchdown")
         else:
             notes.append("✅ Good landing speed")
@@ -167,7 +233,7 @@ class FlightScorer:
             duration_s=round(duration_s, 1),
             landing_dist_m=round(landing_dist_m, 1),
             landing_speed_kts=round(landing_speed_kts, 1),
-            cruise_alt_std_ft=round(cruise_alt_std, 1),
+            cruise_alt_std_ft=round(alt_rms, 1),  # airborne path RMS
             pts_accuracy=round(pts_acc, 1),
             pts_speed=round(pts_spd, 1),
             pts_time=round(pts_time, 1),
@@ -217,16 +283,16 @@ class FlightScorer:
             # that would give a meaningless but defined zero regardless; explicit is cleaner.
             cruise_alt_std = 999.0
 
-        pts_acc = max(0.0, 40.0 * (1.0 - max(0.0, landing_dist_m - 50.0) / 450.0))
-        spd_over = max(0.0, current_speed_kts - (self.V_LAND_KTAS + 5.0))
-        pts_spd = max(0.0, 30.0 * (1.0 - spd_over / 30.0))
-        # Partial flights don't earn time points — they never completed the route.
-        pts_time = 0.0
-        pts_stab = max(0.0, 10.0 * (1.0 - max(0.0, cruise_alt_std - 10.0) / 290.0))
+        pts_acc = max(0.0, 30.0 * (1.0 - max(0.0, landing_dist_m - 40.0) / 260.0))
+        spd_over = max(0.0, current_speed_kts - (self.V_LAND_KTAS + 3.0))
+        pts_spd = max(0.0, 15.0 * (1.0 - spd_over / 19.0))
+        # Adherence + smoothness earned up to the point it stopped flying —
+        # a smooth-then-aborted flight still shows the quality it had.
+        pts_time, pts_stab, alt_rms, rev_rate = self._quality_points()
 
         total = pts_acc + pts_spd + pts_time + pts_stab
         if outcome == "crashed":
-            total = max(0.0, total - 10.0)  # crash penalty
+            total = max(0.0, total - 25.0)  # crash penalty (was 10)
 
         prev_best = self._load_best_total()
         # Only "completed" flights can set a personal best.
@@ -248,7 +314,7 @@ class FlightScorer:
             duration_s=round(duration_s, 1),
             landing_dist_m=round(landing_dist_m, 1),
             landing_speed_kts=round(current_speed_kts, 1),
-            cruise_alt_std_ft=round(cruise_alt_std, 1),
+            cruise_alt_std_ft=round(alt_rms, 1),  # airborne path RMS
             pts_accuracy=round(pts_acc, 1),
             pts_speed=round(pts_spd, 1),
             pts_time=round(pts_time, 1),

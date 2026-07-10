@@ -1249,7 +1249,12 @@ class Autopilot:
 
                 # Update scorer every tick during flight
                 if self._scorer is not None:
-                    self._scorer.update(phase, telemetry.altitude_ft)
+                    self._scorer.update(
+                        phase, telemetry.altitude_ft,
+                        vs_fpm=telemetry.vs_fpm,
+                        target_alt_ft=(targets.altitude_ft
+                                       if targets is not None else None),
+                    )
 
                 # Update accuracy tracker every tick
                 if targets is not None:
