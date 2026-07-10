@@ -781,7 +781,11 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         # Advance when clear of obstacles — agl ≥ 50 ft.
         Keyframe(
             name="CLIMB_ROTATE", phase="CLIMB",
-            throttle_mode="explicit", throttle=0.95,
+            # Closed-loop climb power (user doctrine: nothing pinned). The
+            # walk seeds from takeoff's full power and eases on its own
+            # as speed passes climb speed; pitch holds the climb RATE.
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_rotate * 1.1,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="dep_runway",
             gear_down=True, flap_ratio=0.5,
@@ -795,7 +799,11 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         # altitude — agl ≥ 300 ft.
         Keyframe(
             name="CLIMB_GEAR_UP", phase="CLIMB",
-            throttle_mode="explicit", throttle=0.95,
+            # Closed-loop climb power (user doctrine: nothing pinned). The
+            # walk seeds from takeoff's full power and eases on its own
+            # as speed passes climb speed; pitch holds the climb RATE.
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_rotate * 1.1,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="dep_runway",
             gear_down=False, flap_ratio=0.5,
@@ -813,7 +821,11 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         # keyframe (TRANSITION) handles speed accel at cruise alt.
         Keyframe(
             name="CLIMB_CLEAN", phase="CLIMB",
-            throttle_mode="explicit", throttle=0.95,
+            # Closed-loop climb power (user doctrine: nothing pinned). The
+            # walk seeds from takeoff's full power and eases on its own
+            # as speed passes climb speed; pitch holds the climb RATE.
+            throttle_mode="speed_pid",
+            target_speed_kts=g.v_rotate * 1.1,
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
             aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
