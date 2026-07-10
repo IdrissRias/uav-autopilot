@@ -798,6 +798,11 @@ class FlightEngine:
             throttle_for_alt=(kf.throttle_for_alt
                               and not cruise_hold and not glide_decouple),
             throttle_base=throttle_base,
+            # Cap cruise throttle so the speed capture is gentle: full
+            # power to accelerate from the slow level-off speed to cruise
+            # climbs the plane faster than pitch can hold (1300 ft
+            # overshoot). 0.75 still reaches 175 kt (level needs ~0.55).
+            throttle_max=0.75 if cruise_hold else None,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
         )

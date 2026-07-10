@@ -82,6 +82,13 @@ class Targets:
     # an on-slope plane (alt_error ≈ 0) isn't carrying 55%+ power down
     # a steep slope.
     throttle_base: float | None = None
+    # Throttle ceiling (0–1). Caps the closed-loop throttle so it can't
+    # floor. In cruise the plane arrives slow and the autothrottle would
+    # slam full power to reach cruise speed — but full power CLIMBS the
+    # plane faster than pitch can hold it down (1300 ft level-off
+    # overshoot). Capping makes the speed capture gentle: pitch keeps the
+    # altitude while the plane accelerates under a bounded power.
+    throttle_max: float | None = None
     # Sink-rate command (ft/min, negative = descending). When set, pitch
     # tracks this INSTEAD of altitude/speed — used by the flare, where
     # what matters is arresting sink, not holding an altitude.

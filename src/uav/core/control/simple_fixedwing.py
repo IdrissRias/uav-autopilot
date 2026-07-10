@@ -398,6 +398,12 @@ class SimpleFixedWingController(Controller):
             throttle_cmd = max(self._prev_throttle - max_step,
                                min(self._prev_throttle + max_step, throttle_cmd))
 
+        # Commander-issued throttle ceiling (cruise gentle-accel). Applied
+        # AFTER the slew so the cap is hard; the stall floor below still
+        # overrides for genuine low-and-slow danger.
+        if targets.throttle_max is not None:
+            throttle_cmd = min(throttle_cmd, targets.throttle_max)
+
         # ── STALL FLOOR — LOW and slow only ──────────────────────────
         # Low and slow is the one corner of the energy matrix where
         # throttle is the ONLY fix (flight 20260706_135230 mushed to
