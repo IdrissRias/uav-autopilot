@@ -751,10 +751,16 @@ class FlightEngine:
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
-            # Cruise: pitch (vs cascade) holds altitude precisely, and
-            # throttle_for_alt makes the throttle REACTIVE to altitude
-            # (above → ease off, below → add) as slow energy support.
-            throttle_for_alt=kf.throttle_for_alt,
+            # Cruise DECOUPLING: pitch (vs cascade) owns ALTITUDE, and the
+            # throttle owns SPEED (throttle_for_alt cleared → speed PID).
+            # Throttle-on-ALTITUDE drove a violent phugoid: the engine's
+            # lag turned its VS-damping into a driver, both loops fought
+            # over altitude, and the plane rang ±200 ft the whole cruise
+            # (flight abf5d1fa). Throttle-on-SPEED is classic autothrottle
+            # and DAMPS the phugoid (balloon up → speed bleeds → power
+            # comes in → pulled back). Reachable speed target required, or
+            # the throttle floors and climbs away.
+            throttle_for_alt=kf.throttle_for_alt and not cruise_hold,
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,

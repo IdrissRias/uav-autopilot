@@ -10,7 +10,7 @@ speeds_kts:
   v_rotate: 100
   v_takeoff: 100
   v_climb: 120
-  v_cruise: 185
+  v_cruise: 155
   v_approach: 110
   v_land: 100
   v_never_exceed: 226
