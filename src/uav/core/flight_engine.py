@@ -486,6 +486,23 @@ class FlightEngine:
         else:
             throttle = prev.throttle if prev else None
 
+        # ── ALTITUDE CAPTURE (climb → cruise) ────────────────────────
+        # The climb held FULL power right up to cruise altitude, so the
+        # plane arrived with ~2000 fpm of momentum and blasted 875 ft
+        # through it before pitch could arrest it (the "initial bump").
+        # Bleed the climb power over the last CAPTURE_FT so it eases onto
+        # the target: full climb power at the band edge, cruise power at
+        # the target. Pitch (the alt PID) flattens in step, so the plane
+        # rounds off onto cruise alt instead of rocketing past.
+        if (kf.phase == "CLIMB" and kf.alt_mode == "target"
+                and kf.target_alt_ft is not None and throttle is not None):
+            CAPTURE_FT = 700.0
+            CRUISE_PWR = 0.60
+            remaining = kf.target_alt_ft - t.altitude_ft
+            if 0.0 < remaining < CAPTURE_FT and throttle > CRUISE_PWR:
+                frac = remaining / CAPTURE_FT   # 1 at edge → 0 at target
+                throttle = CRUISE_PWR + (throttle - CRUISE_PWR) * frac
+
         pitch_cap = kf.pitch_limit
         pitch_down_cap = kf.pitch_down_limit
         # ── Sink-rate commands (pitch flies the path) ────────────────
