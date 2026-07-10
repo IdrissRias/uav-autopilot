@@ -154,6 +154,11 @@ class SimpleFixedWingController(Controller):
         # closed-loop phase begins (continuity). None while the ribbon
         # commands throttle explicitly.
         self._thr_walk: float | None = None
+        # Config feed-forward state: flaps/gear are drag events WE
+        # schedule — spool the walk against them the instant they deploy
+        # instead of letting speed sag and chasing it (12 kt sag observed).
+        self._ff_flap_prev: float | None = None
+        self._ff_gear_prev: bool | None = None
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -353,6 +358,10 @@ class SimpleFixedWingController(Controller):
             # Explicit throttle from ribbon (e.g. CLIMB full, FLARE idle)
             self._alt_thr_integral = 0.0
             self._thr_walk = None   # next closed-loop phase re-seeds
+            if targets.flap_ratio is not None:
+                self._ff_flap_prev = targets.flap_ratio
+            if targets.gear_down is not None:
+                self._ff_gear_prev = bool(targets.gear_down)
             throttle_cmd = targets.throttle
         elif targets.throttle_for_alt:
             # Alt → Throttle: GENTLE proportional + a slow TRIM INTEGRAL
@@ -405,6 +414,21 @@ class SimpleFixedWingController(Controller):
             #     eases off as the climb develops instead of overshooting.
             if self._thr_walk is None:
                 self._thr_walk = self._prev_throttle
+            # Disturbance feed-forward: the commander KNOWS when it adds
+            # drag. Full flaps ≈ +0.22 of power to hold speed, gear ≈
+            # +0.08 — applied the tick they deploy, so the walk starts
+            # from roughly the right band and only has to trim, instead
+            # of letting the speed sag 12 kts and surging after it.
+            if targets.flap_ratio is not None:
+                if (self._ff_flap_prev is not None
+                        and targets.flap_ratio > self._ff_flap_prev):
+                    self._thr_walk = min(1.0, self._thr_walk + 0.22 * (
+                        targets.flap_ratio - self._ff_flap_prev))
+                self._ff_flap_prev = targets.flap_ratio
+            if targets.gear_down is not None:
+                if self._ff_gear_prev is False and targets.gear_down:
+                    self._thr_walk = min(1.0, self._thr_walk + 0.08)
+                self._ff_gear_prev = bool(targets.gear_down)
             if targets.airspeed_kts is not None:
                 drive = spd_error * 0.004          # /s per knot
             else:
