@@ -511,11 +511,14 @@ class SimpleFixedWingController(Controller):
         else:
             # Danger cleared: release the boost smoothly (no chop).
             self._stall_boost = max(0.0, self._stall_boost - 0.3 * dt)
+        # Slew reference stays PRE-boost: otherwise the boost leaks into
+        # prev and the slew chases the boosted value while the boost adds
+        # again — compounding growth (0.13/tick observed in test). The
+        # boost is a clean additive term on top of the walked command.
+        throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+        self._prev_throttle = throttle_cmd
         if self._stall_boost > 0.0:
             throttle_cmd = min(1.0, throttle_cmd + self._stall_boost)
-
-        throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth
-        self._prev_throttle = throttle_cmd
 
         # ── Yaw (ribbon-driven yaw-hold only; no standalone yaw PID) ─
         yaw_cmd = 0.0
