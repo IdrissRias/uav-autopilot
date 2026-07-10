@@ -461,7 +461,18 @@ class FlightEngine:
                           and kf.phase != "FLARE")
 
         # ── Throttle ─────────────────────────────────────────────────
-        if kf.throttle_mode == "alt_scaled":
+        if cruise_hold:
+            # ALTITUDE IS RELIGION (the user's rule, taken literally):
+            # NEVER add throttle to a plane that is ABOVE its target
+            # altitude. Cut power and let it descend. This is proportional
+            # and clamped so it idles once ~100 ft high, sustains ~0.50 at
+            # the target, and adds more the lower it is. Pitch (the cascade)
+            # holds the altitude; the throttle only enforces "no power when
+            # high" so the plane can never dome up with the engine running,
+            # and it does NOT chase a speed — speed is whatever results.
+            alt_err_c = alt - t.altitude_ft   # + = below target → add
+            throttle = max(0.0, min(0.78, 0.50 + alt_err_c * 0.005))
+        elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
             # 20kft → 0.85.  Capped so we never float above 85% at cruise.
