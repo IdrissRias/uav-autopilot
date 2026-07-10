@@ -461,20 +461,7 @@ class FlightEngine:
                           and kf.phase != "FLARE")
 
         # ── Throttle ─────────────────────────────────────────────────
-        if cruise_hold:
-            # Cruise power = a base + a VERY SLOW self-trim that finds the
-            # level-flight power on its own. Pitch owns altitude; the trim
-            # only nudges the mean power so pitch isn't left fighting a
-            # standing climb (0.60 fixed was too much power — the plane
-            # kept climbing 375 ft after level-off and pitch had to haul
-            # it back). The trim's time constant (~60 s) is far slower
-            # than the ~24 s phugoid, so it settles the mean without
-            # exciting the oscillation the fast reactive laws did.
-            alt_err_c = alt - t.altitude_ft   # + = below target → add power
-            self._cruise_thr_trim += alt_err_c * 0.00003 * ramp_dt
-            self._cruise_thr_trim = max(-0.18, min(0.18, self._cruise_thr_trim))
-            throttle = max(0.30, min(0.85, 0.52 + self._cruise_thr_trim))
-        elif kf.throttle_mode == "alt_scaled":
+        if kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
             # 20kft → 0.85.  Capped so we never float above 85% at cruise.
