@@ -19,6 +19,17 @@ rates_fpm:
   climb: 2000
   descent: 800
 
+# Altitude → throttle law (level flight). THE tunable formula:
+#   throttle = cruise_power + kp*alt_error + ki*∫alt_error - kd*vertical_speed
+# alt_error > 0 = below target (add power). kp is "throttle per foot":
+# gentle by design so a small error nudges a few %, not a lunge to 95%.
+# Edit + restart to retune. Delete the block to fall back to defaults.
+alt_throttle:
+  kp: 0.0008      # throttle per foot low   (100 ft → +0.08)
+  ki: 0.00016     # trim integrator (finds the one steady power)
+  kd: 0.00030     # throttle per fpm of sink (damping; anti-porpoise)
+  p_clamp: 0.15   # max immediate P kick (anti-lunge)
+
 throttle:
   takeoff: 1.0
   climb: 0.95

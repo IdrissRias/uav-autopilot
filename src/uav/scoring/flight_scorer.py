@@ -114,6 +114,12 @@ class FlightScorer:
         self._vs_reversals: int = 0
         self._vs_prev_sign: int = 0
         self._airborne_ticks: int = 0
+        # Pitch-command thrash: the elevator railing ±full is the clearest
+        # wobble signal (a porpoising descent slams the stick; the VS
+        # reversal count alone missed it, diluted by smooth climb/cruise).
+        self._pitch_reversals: int = 0
+        self._pitch_prev: Optional[float] = None
+        self._pitch_dir: int = 0
 
     # Phases that are NOT airborne flying — excluded from adherence/wobble.
     _GROUND_PHASES = {"GROUND", "TAKEOFF", "TAKEOFF_ROLL", "ROLLOUT", "STOP"}
@@ -124,6 +130,7 @@ class FlightScorer:
         altitude_ft: float,
         vs_fpm: float | None = None,
         target_alt_ft: float | None = None,
+        pitch_cmd: float | None = None,
     ) -> None:
         """Call every autopilot tick. Accumulates whole-flight quality:
         altitude error vs the planned target, and vertical-speed reversals
@@ -151,6 +158,19 @@ class FlightScorer:
                     self._vs_reversals += 1
                 self._vs_prev_sign = sign
 
+        # Pitch-command thrash: count direction reversals of the elevator
+        # command larger than a deadband. A porpoising descent reverses
+        # constantly (the ±full railing we see); a smooth one holds.
+        if pitch_cmd is not None and not math.isnan(pitch_cmd):
+            if self._pitch_prev is not None:
+                delta = pitch_cmd - self._pitch_prev
+                if abs(delta) > 0.08:
+                    d = 1 if delta > 0 else -1
+                    if self._pitch_dir != 0 and d != self._pitch_dir:
+                        self._pitch_reversals += 1
+                    self._pitch_dir = d
+            self._pitch_prev = pitch_cmd
+
     def _quality_points(self) -> tuple:
         """(pts_adherence 0–30, pts_smoothness 0–25, alt_rms_ft, vs_rev_rate).
         Shared by finalize() and finalize_partial()."""
@@ -164,8 +184,16 @@ class FlightScorer:
 
         # Reversals per second of airborne time (tick rate independent).
         secs = max(1.0, time.time() - self._start_ts)
-        rev_rate = self._vs_reversals / secs
-        pts_smooth = max(0.0, 25.0 * (1.0 - max(0.0, rev_rate - 0.04) / 0.24))
+        vs_rate = self._vs_reversals / secs
+        pitch_rate = self._pitch_reversals / secs
+        # Smoothness is the WORSE of the two signals: a flight that rails
+        # the elevator (pitch thrash) is wobbly even if the resulting VS
+        # swings are slow. Pitch thrash is faster, so its scale is tighter.
+        pts_vs = max(0.0, 25.0 * (1.0 - max(0.0, vs_rate - 0.04) / 0.24))
+        pts_pitch = max(0.0, 25.0 * (1.0 - max(0.0, pitch_rate - 0.15) / 0.85))
+        pts_smooth = min(pts_vs, pts_pitch)
+        # Report the dominant wobble rate for the notes.
+        rev_rate = max(vs_rate, pitch_rate)
         return pts_adh, pts_smooth, alt_rms, rev_rate
 
     def finalize(

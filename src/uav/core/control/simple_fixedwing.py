@@ -50,12 +50,37 @@ BANK_PER_HDG_ERROR = 1.5   # degrees bank commanded per degree heading error
 BANK_INNER_KP = 0.020      # aileron per degree of bank error
 BANK_INNER_KD = 0.010      # aileron damping per deg/s of bank rate
 
+# ── Altitude → Throttle law (TUNABLE) ────────────────────────────────
+# THE formula that decides how much power to add for how much altitude
+# we need to gain/lose, in level throttle-defends-altitude flight:
+#
+#   throttle = cruise_power
+#            + KP · alt_error            (immediate: power per foot low)
+#            + KI · ∫ alt_error dt        (trim: settles on the ONE steady
+#                                          power the altitude needs)
+#            − KD · vertical_speed        (damping: back off before the
+#                                          error flips, so it can't porpoise)
+#
+# alt_error > 0 means BELOW target (add power); < 0 means above (reduce).
+# KP is the direct "throttle per foot" knob. It is deliberately GENTLE:
+# a big KP lunges to 95 % for a trim-sized error and porpoises. KI does
+# the settling. Override per-airframe from the yaml (alt_throttle:).
+ALT_THROTTLE_KP = 0.0008   # throttle per foot low  (100 ft → +0.08)
+ALT_THROTTLE_KI = 0.00016  # trim integrator rate
+ALT_THROTTLE_KD = 0.00030  # throttle per fpm of vertical speed (damping)
+ALT_THROTTLE_P_CLAMP = 0.15  # max |P| contribution (anti-lunge)
+
 
 @dataclass
 class ControlGains:
     bank_per_hdg_error: float = BANK_PER_HDG_ERROR
     bank_inner_kp: float = BANK_INNER_KP
     bank_inner_kd: float = BANK_INNER_KD
+    # Altitude → throttle law (see constants above). Tunable per-airframe.
+    alt_throttle_kp: float = ALT_THROTTLE_KP
+    alt_throttle_ki: float = ALT_THROTTLE_KI
+    alt_throttle_kd: float = ALT_THROTTLE_KD
+    alt_throttle_p_clamp: float = ALT_THROTTLE_P_CLAMP
 
 
 def derive_gains(envelope) -> ControlGains:
@@ -332,8 +357,9 @@ class SimpleFixedWingController(Controller):
             # +0.30 for a 100 ft error — that lunge was the up-and-down.
             #   alt_err > 0 (below target) → throttle UP  (gently)
             #   alt_err < 0 (above target) → throttle DOWN (gently)
-            ALT_TO_THROTTLE_KP = 0.0008   # 100 ft low → +0.08, not +0.30
-            ALT_TO_THROTTLE_KI = 0.00016  # the integral carries the trim
+            # Tunable gains (per-airframe via ControlGains / the yaml).
+            ALT_TO_THROTTLE_KP = self.gains.alt_throttle_kp
+            ALT_TO_THROTTLE_KI = self.gains.alt_throttle_ki
             base = (targets.throttle_base
                     if targets.throttle_base is not None
                     else self.cruise_throttle)
@@ -347,13 +373,14 @@ class SimpleFixedWingController(Controller):
             # VS damping: climbing through the target → back power off
             # EARLY, before the alt error flips. Damped vs the COMMANDED
             # sink when one exists, so a normal descent isn't fought.
-            ALT_TO_THROTTLE_VS_DAMP = 0.00030  # 1000 fpm → 0.30 throttle
+            ALT_TO_THROTTLE_VS_DAMP = self.gains.alt_throttle_kd  # per fpm
             vs_ref = targets.vs_target_fpm if targets.vs_target_fpm is not None else 0.0
             vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else vs_ref
             vs_thr = vs_now - vs_ref
             # Gentle P, tightly clamped: it provides only the immediate
             # nudge; the integral does the settling. No lunging.
-            p_term = max(-0.15, min(0.12, alt_error * ALT_TO_THROTTLE_KP))
+            _pc = self.gains.alt_throttle_p_clamp
+            p_term = max(-_pc, min(_pc * 0.8, alt_error * ALT_TO_THROTTLE_KP))
             throttle_cmd = (base + p_term
                             + self._alt_thr_integral
                             - vs_thr * ALT_TO_THROTTLE_VS_DAMP)

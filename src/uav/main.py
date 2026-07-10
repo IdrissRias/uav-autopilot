@@ -222,6 +222,28 @@ def main() -> None:
     else:
         print("[PEREGRINE] Using default control gains (uncalibrated)")
 
+    # ── Altitude→throttle law: tune per-airframe from the yaml ──
+    # airframes/<id>.yaml may carry an `alt_throttle:` block. Any key
+    # present overrides the ControlGains default; absent keys keep it.
+    at_cfg = airframe.get("alt_throttle") or {}
+    if at_cfg:
+        from uav.core.control.simple_fixedwing import ControlGains as _CG
+        base_g = control_gains or _CG()
+        control_gains = _CG(
+            bank_per_hdg_error=base_g.bank_per_hdg_error,
+            bank_inner_kp=base_g.bank_inner_kp,
+            bank_inner_kd=base_g.bank_inner_kd,
+            alt_throttle_kp=float(at_cfg.get("kp", base_g.alt_throttle_kp)),
+            alt_throttle_ki=float(at_cfg.get("ki", base_g.alt_throttle_ki)),
+            alt_throttle_kd=float(at_cfg.get("kd", base_g.alt_throttle_kd)),
+            alt_throttle_p_clamp=float(
+                at_cfg.get("p_clamp", base_g.alt_throttle_p_clamp)),
+        )
+        print(f"[PEREGRINE] Alt→throttle law from yaml: "
+              f"kp={control_gains.alt_throttle_kp} "
+              f"ki={control_gains.alt_throttle_ki} "
+              f"kd={control_gains.alt_throttle_kd}")
+
     throttle_cfg = airframe["throttle"]
     controller = SimpleFixedWingController(
         heading_pid=heading_pid,

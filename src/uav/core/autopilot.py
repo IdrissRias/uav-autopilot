@@ -1254,6 +1254,7 @@ class Autopilot:
                         vs_fpm=telemetry.vs_fpm,
                         target_alt_ft=(targets.altitude_ft
                                        if targets is not None else None),
+                        pitch_cmd=act.pitch,
                     )
 
                 # Update accuracy tracker every tick
