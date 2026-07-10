@@ -1664,9 +1664,14 @@ class Autopilot:
 
                 # Targets: prefer live guidance output, fall back to ctx targets
                 if targets:
-                    hb["target_alt_ft"] = round(targets.altitude_ft, 0) if hasattr(targets, "altitude_ft") else None
-                    hb["target_speed_kts"] = round(targets.airspeed_kts, 1) if hasattr(targets, "airspeed_kts") else None
-                    hb["target_heading_deg"] = round(targets.heading_deg, 1) if hasattr(targets, "heading_deg") else None
+                    # Every field can legitimately be None (speed is None
+                    # in emergent-speed cruise) — round(None) killed the
+                    # whole control loop ON THE RUNWAY at full power.
+                    def _r(v, nd):
+                        return round(v, nd) if isinstance(v, (int, float)) else None
+                    hb["target_alt_ft"] = _r(getattr(targets, "altitude_ft", None), 0)
+                    hb["target_speed_kts"] = _r(getattr(targets, "airspeed_kts", None), 1)
+                    hb["target_heading_deg"] = _r(getattr(targets, "heading_deg", None), 1)
                 else:
                     # During stale/reset phases, targets is None — read from ctx instead
                     ctx_targets = ctx.get("targets", {})
