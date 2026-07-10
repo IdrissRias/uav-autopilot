@@ -451,7 +451,13 @@ class SimpleFixedWingController(Controller):
             else:
                 vs_now = (telemetry.vs_fpm
                           if not math.isnan(telemetry.vs_fpm) else 0.0)
-                drive = alt_error * 0.0004 - vs_now * 0.00012
+                # 3x slower than the first cut: 0.0004/ft gave a full
+                # 0-1 sweep in ~20 s — right at the phugoid period, so
+                # the power PUMPED the swing (0.28→1.00→0.00 cycling,
+                # ±90 ft). Bit-by-bit means slower than the airplane:
+                # full sweep ~80 s, with the VS damping term dominant
+                # near equilibrium so the walk settles instead of chasing.
+                drive = alt_error * 0.00012 - vs_now * 0.00008
             self._thr_walk += drive * dt
             self._thr_walk = max(0.0, min(1.0, self._thr_walk))
             throttle_cmd = self._thr_walk
