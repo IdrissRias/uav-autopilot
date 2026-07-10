@@ -931,11 +931,16 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         # zero until we bleed through 115.
         Keyframe(
             name="DECELERATE", phase="CRUISE",
-            throttle_mode="idle",
-            # Never target ABOVE cruise: with learned speeds flap_safe
-            # (132.8) sat higher than v_cruise (129.6), so the
-            # "decelerate" phase commanded an acceleration step at
-            # entry. Phase targets must continue from the last phase.
+            # HOLD ALTITUDE, do not idle-sink. `idle` was for the fast
+            # SF50 that had to dump a lot of speed before the descent;
+            # the King Air (crash 374c35b5) can't hold altitude at idle
+            # and sank 1500 ft into terrain 10 nm out, before ever
+            # reaching the descent point. Emergent-speed cruise arrives
+            # here already near flap_safe, so no aggressive bleed is
+            # needed: throttle_mode "speed_pid" trips cruise_hold (pitch
+            # holds altitude, throttle reactive), the plane flies level
+            # to descent_start, and the DESCENT phase owns the descent.
+            throttle_mode="speed_pid",
             target_speed_kts=min(g.flap_safe_kts, g.v_cruise),
             alt_mode="target", target_alt_ft=g.cruise_alt_ft,
             heading_mode="aim_at",
