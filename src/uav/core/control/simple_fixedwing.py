@@ -324,49 +324,36 @@ class SimpleFixedWingController(Controller):
             self._alt_thr_integral = 0.0
             throttle_cmd = targets.throttle
         elif targets.throttle_for_alt:
-            # Alt → Throttle (P-only)
-            #   alt_err > 0 (below target) → throttle UP
-            #   alt_err < 0 (above target) → throttle DOWN
-            # Kp = 3 × the altitude_pid Kp (~0.003 per ft of alt error)
-            # so 100 ft below target = 0.3 throttle delta from baseline,
-            # 300 ft below = saturated to full. Within the throttle's
-            # 0–1 range this gives crisp recovery without integral
-            # windup carrying over from earlier phases.
-            ALT_TO_THROTTLE_KP = 0.003
-            ALT_TO_THROTTLE_KI = 0.0001   # 100 ft error → +0.01 throttle/s
-            # Baseline: commander-supplied (near idle on glideslope
-            # phases, where gravity provides the energy) or the default
-            # cruise setting for level flight.
+            # Alt → Throttle: GENTLE proportional + a slow TRIM INTEGRAL
+            # that settles onto the ONE steady power the altitude needs
+            # and holds it. (User doctrine: "a few dozen feet low should
+            # add a few percent, not lunge to 95%; slowly reach one
+            # constant permanent power.") The old P gain (0.003) dumped
+            # +0.30 for a 100 ft error — that lunge was the up-and-down.
+            #   alt_err > 0 (below target) → throttle UP  (gently)
+            #   alt_err < 0 (above target) → throttle DOWN (gently)
+            ALT_TO_THROTTLE_KP = 0.0008   # 100 ft low → +0.08, not +0.30
+            ALT_TO_THROTTLE_KI = 0.00016  # the integral carries the trim
             base = (targets.throttle_base
                     if targets.throttle_base is not None
                     else self.cruise_throttle)
-            # Leaky integral trims the standing error P-only leaves when
-            # level flight needs more/less than baseline throttle.
+            # The trim integral is now the PRIMARY term. Its leak is very
+            # slow (~0.9998/tick ≈ 200 s) so it HOLDS the steady power
+            # instead of decaying and forcing the error to keep feeding
+            # it — that decay-and-rebuild was part of the hunting.
             self._alt_thr_integral += alt_error * dt * ALT_TO_THROTTLE_KI
-            self._alt_thr_integral *= 0.999  # leak — self-limiting
-            # Clamp ±0.30: ±0.15 couldn't span the gap between the
-            # baseline and this airframe's true level-flight thrust, so
-            # cruise parked ~90 ft off target (flight 20260706_135230).
-            self._alt_thr_integral = max(-0.30, min(0.30, self._alt_thr_integral))
-            # VS damping: climbing through the target → cut power EARLY,
-            # before the alt error flips sign. Rate feedback = the D term
-            # the P-only law was missing (see phugoid note above).
-            # Damped relative to the COMMANDED sink rate when one exists:
-            # damping against zero would add +0.28 throttle in a normal
-            # 1900 fpm commanded descent — fighting the descent itself.
+            self._alt_thr_integral *= 0.9998
+            self._alt_thr_integral = max(-0.35, min(0.35, self._alt_thr_integral))
+            # VS damping: climbing through the target → back power off
+            # EARLY, before the alt error flips. Damped vs the COMMANDED
+            # sink when one exists, so a normal descent isn't fought.
             ALT_TO_THROTTLE_VS_DAMP = 0.00030  # 1000 fpm → 0.30 throttle
-            # (doubled from 0.00015 with the pitch VS damp — the King Air
-            # phugoid needs the throttle to back off EARLY as it climbs,
-            # not after the alt error flips.)
             vs_ref = targets.vs_target_fpm if targets.vs_target_fpm is not None else 0.0
             vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else vs_ref
             vs_thr = vs_now - vs_ref
-            # The P contribution is TAPERED (±0.25 up / −0.35 down):
-            # 140 ft below target used to command +0.42 → a ~97% power
-            # lunge for a trim-sized correction, then a hard chop at the
-            # crest ("rough transition"). Big deficits still get full
-            # power via the stall floor and the integrator.
-            p_term = max(-0.35, min(0.25, alt_error * ALT_TO_THROTTLE_KP))
+            # Gentle P, tightly clamped: it provides only the immediate
+            # nudge; the integral does the settling. No lunging.
+            p_term = max(-0.15, min(0.12, alt_error * ALT_TO_THROTTLE_KP))
             throttle_cmd = (base + p_term
                             + self._alt_thr_integral
                             - vs_thr * ALT_TO_THROTTLE_VS_DAMP)

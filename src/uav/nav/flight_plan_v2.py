@@ -865,7 +865,14 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             # 100% throttle. New 0.40 (~24° nose-down) lets the plane
             # actually descend when it needs to.
             pitch_limit=0.08, pitch_down_limit=0.40,
-            trigger=Trigger("speed_gte", value=g.v_cruise - 5.0),
+            # Advance on ALTITUDE CAPTURED, not speed. Cruise is now
+            # emergent-speed (throttle defends altitude, speed floats),
+            # so the plane never reaches v_cruise in level flight and a
+            # speed_gte trigger would trap it in TRANSITION forever,
+            # circling, never descending. alt_reached fires within 50 ft
+            # of cruise altitude — the real definition of "levelled off."
+            # Hands to CRUISE, which flies the same hold to the join.
+            trigger=Trigger("alt_reached", value=g.cruise_alt_ft),
         ),
 
         # ── 5. CRUISE ────────────────────────────────────────────────
