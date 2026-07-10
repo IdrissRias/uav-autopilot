@@ -37,10 +37,18 @@ class TestStallFloor(unittest.TestCase):
         t = Telemetry(airspeed_kts=88.0, altitude_ft=2380.0, pitch_deg=5.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
                       vs_fpm=200.0, agl_m=350.0)
-        act = ctl.compute(t, tg, 0.05)
+        # New doctrine: URGENT but never ABRUPT — power RAMPS in fast
+        # (deficit-scaled), with no single-tick step. Tick 3 s of loop.
+        prev = None
+        for _ in range(60):
+            act = ctl.compute(t, tg, 0.05)
+            if prev is not None:
+                self.assertLess(act.throttle - prev, 0.12,
+                                "No step inputs in the delicate phase.")
+            prev = act.throttle
         self.assertGreaterEqual(
-            act.throttle, 0.9,
-            "10+ kts below the stall floor at/below target → full power."
+            act.throttle, 0.85,
+            "10+ kts below the floor → near-full power within ~3 s."
         )
 
     def test_no_power_when_slow_but_high(self):
@@ -69,9 +77,14 @@ class TestStallFloor(unittest.TestCase):
         t = Telemetry(airspeed_kts=72.0, altitude_ft=1750.0, pitch_deg=3.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
                       vs_fpm=-800.0, agl_m=120.0)  # ~400 ft AGL, above slope
-        act = ctl.compute(t, tg, 0.05)
-        self.assertGreaterEqual(act.throttle, 0.9,
-                                "Short final + slow → power, slope or not.")
+        prev = None
+        for _ in range(60):
+            act = ctl.compute(t, tg, 0.05)
+            if prev is not None:
+                self.assertLess(act.throttle - prev, 0.12)
+            prev = act.throttle
+        self.assertGreaterEqual(act.throttle, 0.85,
+                                "Short final + slow → power (ramped), slope or not.")
 
     def test_floor_overrides_explicit_idle(self):
         # DECELERATE commands idle explicitly; the floor still wins.
@@ -81,8 +94,10 @@ class TestStallFloor(unittest.TestCase):
         t = Telemetry(airspeed_kts=90.0, altitude_ft=5700.0, pitch_deg=2.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
                       vs_fpm=0.0, agl_m=1300.0)
-        act = ctl.compute(t, tg, 0.05)
-        self.assertGreaterEqual(act.throttle, 0.8)
+        for _ in range(60):
+            act = ctl.compute(t, tg, 0.05)
+        self.assertGreaterEqual(act.throttle, 0.7,
+                                "Floor overpowers explicit idle within ~3 s.")
 
     def test_no_floor_during_flare(self):
         # FLARE has stall_floor_kts=None — slow there is by design.

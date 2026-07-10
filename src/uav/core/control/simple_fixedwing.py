@@ -159,6 +159,10 @@ class SimpleFixedWingController(Controller):
         # instead of letting speed sag and chasing it (12 kt sag observed).
         self._ff_flap_prev: float | None = None
         self._ff_gear_prev: bool | None = None
+        # Stall-floor boost: a persistent, RAMPED emergency power term.
+        # Builds while the floor condition holds, releases smoothly when
+        # it clears — urgent, never a step.
+        self._stall_boost = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -430,7 +434,20 @@ class SimpleFixedWingController(Controller):
                     self._thr_walk = min(1.0, self._thr_walk + 0.08)
                 self._ff_gear_prev = bool(targets.gear_down)
             if targets.airspeed_kts is not None:
-                drive = spd_error * 0.004          # /s per knot
+                # Power for landing speed — but NEVER feed a balloon. At
+                # low speed with full flaps, surplus power converts to
+                # CLIMB, not airspeed (observed: full power at 95 kt
+                # ballooned +858 ft above the slope while the speed stayed
+                # low, which kept the power pinned — a trap). If the plane
+                # is climbing above its commanded path, back the walk off
+                # in proportion; the deficit is altitude to be traded
+                # down, not power to be added.
+                vs_ref = (targets.vs_target_fpm
+                          if targets.vs_target_fpm is not None else 0.0)
+                vs_now = (telemetry.vs_fpm
+                          if not math.isnan(telemetry.vs_fpm) else vs_ref)
+                balloon = max(0.0, vs_now - vs_ref)
+                drive = spd_error * 0.004 - balloon * 0.00008
             else:
                 vs_now = (telemetry.vs_fpm
                           if not math.isnan(telemetry.vs_fpm) else 0.0)
@@ -479,8 +496,23 @@ class SimpleFixedWingController(Controller):
                 and not math.isnan(telemetry.airspeed_kts)
                 and telemetry.airspeed_kts < targets.stall_floor_kts
                 and (alt_error >= -50.0 or low_final)):
+            # URGENT but not ABRUPT. The old law stepped the throttle to
+            # deficit×0.1 instantly (7 kt low → 70% slam) — and on short
+            # final that slam pitched the nose up and BALLOONED the plane
+            # (flight 234919: +858 ft above the slope at full power). The
+            # floor sits ~20 kt above the true full-flap stall, so there
+            # is time to bring power in fast-but-continuously: a
+            # deficit-scaled RAMP (~8x the normal walk rate) instead of a
+            # step. The most delicate phase gets no step inputs, ever —
+            # the emergency just walks faster.
             deficit_kts = targets.stall_floor_kts - telemetry.airspeed_kts
-            throttle_cmd = max(throttle_cmd, min(1.0, deficit_kts * 0.1))
+            self._stall_boost = min(
+                1.0, self._stall_boost + deficit_kts * 0.03 * dt)
+        else:
+            # Danger cleared: release the boost smoothly (no chop).
+            self._stall_boost = max(0.0, self._stall_boost - 0.3 * dt)
+        if self._stall_boost > 0.0:
+            throttle_cmd = min(1.0, throttle_cmd + self._stall_boost)
 
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))  # hardware truth
         self._prev_throttle = throttle_cmd
