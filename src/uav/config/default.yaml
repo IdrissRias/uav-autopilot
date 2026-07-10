@@ -9,7 +9,7 @@ airframe:
   icao_type: "BE9L"
 
 loop:
-  rate_hz: 15
+  rate_hz: 25
 
 # Safety limits — these are structural, not aircraft-specific.
 # They cap the raw actuator commands regardless of what the controller asks for.

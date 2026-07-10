@@ -409,24 +409,25 @@ class FlightEngine:
         # retargeting — superseded by configure-early + pitch-down.
         speed = kf.target_speed_kts  # None = no speed regulation
 
-        # ── Cruise = EMERGENT SPEED ──────────────────────────────────
+        # ── Cruise = ALTITUDE-COORDINATED, EMERGENT SPEED ────────────
         # In every level CRUISE-phase keyframe, don't chase a speed
-        # number. Chasing an unreachable target (King Air can't make
-        # 185 kt level) floors the throttle forever and the excess power
-        # CLIMBS the plane 10,000 ft past its altitude. Instead: pitch
-        # holds altitude (vs cascade below), throttle is a FIXED cruise
-        # power, and speed is whatever that power sustains at altitude.
-        # "Hold alt, go as fast as the power allows." DECELERATE keeps
-        # its idle (it wants to slow down); everything else that was
-        # speed_pid gets fixed power.
+        # number (chasing an unreachable target floored the King Air's
+        # throttle and it climbed 10,000 ft). Instead, BOTH controls
+        # defend altitude, coordinated:
+        #   • PITCH holds altitude precisely (vs cascade below) — fast,
+        #     tight, so the altitude error stays small.
+        #   • THROTTLE is REACTIVE to altitude (throttle_for_alt): above
+        #     target → ease off (slow down / sink), below → add power.
+        #     Slower energy support; because pitch keeps the error small
+        #     it mostly just trims, so the two don't fight into a phugoid.
+        # Speed is emergent: whatever that power holds at altitude.
+        # DECELERATE keeps its idle (it wants to slow down).
         cruise_hold = (kf.phase == "CRUISE" and kf.alt_mode == "target"
                        and kf.target_alt_ft is not None
                        and kf.throttle_mode != "idle")
 
         # ── Throttle ─────────────────────────────────────────────────
-        if cruise_hold:
-            throttle = 0.62  # fixed cruise power; pitch holds altitude
-        elif kf.throttle_mode == "alt_scaled":
+        if kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
             # 20kft → 0.85.  Capped so we never float above 85% at cruise.
@@ -732,10 +733,10 @@ class FlightEngine:
             yaw_hold=kf.yaw_hold,
             yaw_kp=kf.yaw_kp,
             yaw_limit=kf.yaw_limit,
-            # cruise_hold: pitch (vs cascade) owns altitude, throttle is
-            # fixed, speed floats. Clear throttle_for_alt so it does not
-            # also try to drive the (fixed) throttle off alt error.
-            throttle_for_alt=kf.throttle_for_alt and not cruise_hold,
+            # Cruise: pitch (vs cascade) holds altitude precisely, and
+            # throttle_for_alt makes the throttle REACTIVE to altitude
+            # (above → ease off, below → add) as slow energy support.
+            throttle_for_alt=kf.throttle_for_alt,
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,

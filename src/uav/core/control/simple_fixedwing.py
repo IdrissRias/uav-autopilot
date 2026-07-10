@@ -196,28 +196,29 @@ class SimpleFixedWingController(Controller):
                     self._vs_target_smooth - down_step,
                     min(self._vs_target_smooth + up_step,
                         targets.vs_target_fpm))
-            # HOLD the attitude; correct in MICRO-adjustments driven by
-            # descent-rate error (user doctrine). Three guards keep the
-            # attitude target from dancing:
-            #   • the raw vs telemetry is LOW-PASSED (τ≈0.4 s) before it
-            #     steers anything — X-Plane's vs is noisy at 20 Hz
-            #   • a ±50 fpm DEADBAND: close enough = touch nothing
-            #   • the target may only CREEP (≤1.5°/s), never jump
+            # HOLD the attitude via a TRIM INTEGRAL. The trim ref
+            # accumulates the exact steady attitude the airplane needs
+            # and just keeps holding it — that IS "keep the current
+            # inputs, never let go." The old ±50 fpm deadband ("close
+            # enough = touch nothing") was the catch-and-release: near
+            # target it stopped correcting, the plane drifted, the loop
+            # woke up and grabbed again. Removed. A tiny 10 fpm noise
+            # floor is all that survives. Integral gain roughly doubled
+            # so the trim converges instead of creeping forever.
             if self._vs_filt is None:
                 self._vs_filt = vs_now_fpm
             else:
                 a_vs = min(1.0, dt / 0.4)
                 self._vs_filt += a_vs * (vs_now_fpm - self._vs_filt)
             vs_err = self._vs_target_smooth - self._vs_filt  # fpm, + = pull
-            if abs(vs_err) < 50.0:
+            if abs(vs_err) < 10.0:      # noise floor only, not a hold gap
                 vs_err = 0.0
 
-            # OUTER: attitude target. Trim ref initialises to the
-            # CURRENT attitude (continuity — no entry step) and creeps
-            # toward whatever attitude actually holds the target.
+            # OUTER: attitude target = trim integral + proportional lead.
+            # The integral holds; the P term gives it immediate authority.
             if self._theta_ref_deg is None:
                 self._theta_ref_deg = telemetry.pitch_deg
-            self._theta_ref_deg += vs_err * 0.0012 * dt  # 300 fpm → 0.36°/s
+            self._theta_ref_deg += vs_err * 0.0025 * dt  # 300 fpm → 0.75°/s
             self._theta_ref_deg = max(-10.0, min(12.0, self._theta_ref_deg))
             theta_raw = self._theta_ref_deg + vs_err * 0.0015  # 500 fpm → 0.75°
             theta_raw = max(-10.0, min(14.0, theta_raw))
