@@ -1084,7 +1084,14 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             throttle_for_alt=True,  # power for altitude on final approach
             target_speed_kts=g.v_approach,
             alt_mode="glideslope",
-            heading_mode="aim_at",
+            # Track the RUNWAY CENTERLINE directly on final, not the L1
+            # ribbon follower. The follower left a lateral offset the weak
+            # flare-only correction couldn't fix in time (landed in the
+            # grass, then the ground steering hauled it onto the pavement).
+            # dest_runway drives the meter-scale cross-track correction
+            # through the whole approach, so the plane is ON the centerline
+            # before the wheels come down.
+            heading_mode="dest_runway",
             aim_lat=g.touchdown_lat, aim_lon=g.touchdown_lon,
             pitch_limit=0.25,
             # APPROACH stays tighter than outer DESCENT keyframes (0.20)

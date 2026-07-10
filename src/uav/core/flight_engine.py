@@ -68,6 +68,8 @@ class FlightEngine:
         # lands parallel to the runway, beside it. Slow integral trims
         # the residual to zero. Degrees; clamped ±5.
         self._cl_int_deg = 0.0
+        self._cl_cross_prev = None
+        self._cl_cross_rate = 0.0
         self._td_ticks = 0
         # Tangential-capture state (see glideslope vs block).
         self._off_slope_prev: Optional[float] = None
@@ -103,6 +105,8 @@ class FlightEngine:
         self._cmd_spd_smooth = None
         self._ramp_ts = None
         self._cl_int_deg = 0.0
+        self._cl_cross_prev = None
+        self._cl_cross_rate = 0.0
         self._td_ticks = 0
         self._off_slope_prev = None
         self._off_rate_filt = 0.0
@@ -329,16 +333,30 @@ class FlightEngine:
                 # landing parallel to the runway, beside it.
                 self._cl_int_deg += cross_nm * 10.0 * ramp_dt
                 self._cl_int_deg = max(-5.0, min(5.0, self._cl_int_deg))
+                cross_m = cross_nm * 1852.0
                 on_ground = (not math.isnan(t.agl_m)) and t.agl_m < 5.0
                 if on_ground:
                     # Rollout: meter-scale, assertive (0.8°/m, cap 15°) —
                     # nm-scale gains are whispers at runway width.
-                    cross_m = cross_nm * 1852.0
                     p_term = max(-15.0, min(15.0, cross_m * 0.8))
+                    correction = p_term + self._cl_int_deg
                 else:
-                    # Airborne final: gain 60/nm, cap 12°.
-                    p_term = max(-12.0, min(12.0, cross_nm * 60.0))
-                correction = p_term + self._cl_int_deg
+                    # Airborne final: METER-scale, damped. The old 60/nm
+                    # was 0.032°/m — 25 m off the centerline (in the grass)
+                    # bought <1° of correction, so the plane touched down
+                    # off the pavement and the ground steering hauled it
+                    # over. New gain ~0.18°/m gives a heading offset that
+                    # closes the lateral gap on a ~6 s time constant at
+                    # approach speed; the cross-track RATE damper stops it
+                    # overshooting into an S-turn. Cap 15°.
+                    if self._cl_cross_prev is not None and ramp_dt > 0:
+                        rate = (cross_m - self._cl_cross_prev) / ramp_dt
+                        self._cl_cross_rate = (0.4 * rate
+                                               + 0.6 * self._cl_cross_rate)
+                    self._cl_cross_prev = cross_m
+                    p_term = max(-15.0, min(15.0, cross_m * 0.18))
+                    d_term = max(-6.0, min(6.0, self._cl_cross_rate * 1.2))
+                    correction = p_term + d_term + self._cl_int_deg
                 hdg = (g.rwy_heading + correction) % 360.0
         elif kf.heading_mode == "aim_at" and t.has_position() and self._follower is not None:
             track = self._follower.update(t)
