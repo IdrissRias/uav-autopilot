@@ -444,6 +444,20 @@ class FlightEngine:
                        and kf.target_alt_ft is not None
                        and kf.throttle_mode != "idle")
 
+        # DESCENT DECOUPLING (same cure as cruise). On the glideslope,
+        # PITCH flies the slope (vs_target below) and THROTTLE must hold
+        # APPROACH SPEED, not chase altitude. Throttle-on-altitude here
+        # slammed full power below the slope and the plane arrived HIGH
+        # AND SLOW — the worst corner — where the stall floor then fired
+        # full power and ballooned it (flight 193023: 231 ft high at 90 kt,
+        # throttle 1.0). Holding speed makes it arrive at v_approach, so
+        # the stall floor never trips and it can actually come down. The
+        # low side is still covered: pitch sinks slower than the slope to
+        # catch it, and the stall floor remains for genuine danger. FLARE
+        # keeps its own idle + arrest.
+        glide_decouple = (kf.alt_mode == "glideslope"
+                          and kf.phase != "FLARE")
+
         # ── Throttle ─────────────────────────────────────────────────
         if kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
@@ -560,8 +574,10 @@ class FlightEngine:
         # the slope's needs and the engine works against it, giving the
         # alt law authority in BOTH directions (old near-idle base could
         # only fix "too low"; "too high" hit the idle stop).
+        # (No spooled baseline when decoupled — throttle holds speed.)
         throttle_base = 0.30 if (kf.throttle_for_alt
-                                 and kf.alt_mode == "glideslope") else None
+                                 and kf.alt_mode == "glideslope"
+                                 and not glide_decouple) else None
 
         # ── Levers (None inherits) ───────────────────────────────────
         gear = (kf.gear_down if kf.gear_down is not None
@@ -760,7 +776,8 @@ class FlightEngine:
             # and DAMPS the phugoid (balloon up → speed bleeds → power
             # comes in → pulled back). Reachable speed target required, or
             # the throttle floors and climbs away.
-            throttle_for_alt=kf.throttle_for_alt and not cruise_hold,
+            throttle_for_alt=(kf.throttle_for_alt
+                              and not cruise_hold and not glide_decouple),
             throttle_base=throttle_base,
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
