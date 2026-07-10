@@ -459,7 +459,18 @@ class FlightEngine:
                           and kf.phase != "FLARE")
 
         # ── Throttle ─────────────────────────────────────────────────
-        if kf.throttle_mode == "alt_scaled":
+        if cruise_hold:
+            # FIXED cruise power; pitch owns altitude. We tried reactive
+            # power both ways and both diverged because we don't yet know
+            # the King Air's true level-cruise operating point: reactive-
+            # to-altitude drove a phugoid, reactive-to-speed climbed away
+            # (155 kt still needed more than level power, so the excess
+            # climbed the plane 900 ft). Fixed power can't get the point
+            # wrong — pitch pins the altitude and speed settles wherever
+            # this power sustains. Once the observer learns the real
+            # cruise speed, throttle can react to THAT safely.
+            throttle = 0.60
+        elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
             # 20kft → 0.85.  Capped so we never float above 85% at cruise.
