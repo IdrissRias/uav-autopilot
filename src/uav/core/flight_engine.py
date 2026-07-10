@@ -461,17 +461,22 @@ class FlightEngine:
                           and kf.phase != "FLARE")
 
         # ── Throttle ─────────────────────────────────────────────────
-        if cruise_hold:
-            # ALTITUDE IS RELIGION (the user's rule, taken literally):
+        if cruise_hold or glide_decouple:
+            # ALTITUDE IS RELIGION (the user's rule), and it is UNIVERSAL:
             # NEVER add throttle to a plane that is ABOVE its target
-            # altitude. Cut power and let it descend. This is proportional
-            # and clamped so it idles once ~100 ft high, sustains ~0.50 at
-            # the target, and adds more the lower it is. Pitch (the cascade)
-            # holds the altitude; the throttle only enforces "no power when
-            # high" so the plane can never dome up with the engine running,
-            # and it does NOT chase a speed — speed is whatever results.
+            # altitude — in cruise OR on the glideslope. Cut power and let
+            # it come down. Proportional, clamped: idles ~100 ft high,
+            # sustains at the target, adds more the lower it is. On the
+            # glideslope the target IS the sloping altitude (`alt`), so the
+            # engine dies whenever the plane is above the slope (it was
+            # sitting at 52% while high before — the bug the user caught).
+            # The glideslope sustains LOWER (0.30) because a configured
+            # descent needs little power. Pitch flies the path; the
+            # throttle only guarantees no power when high. Stall floor
+            # still overrides for genuine low-and-slow near the ground.
+            base_pwr = 0.50 if cruise_hold else 0.30
             alt_err_c = alt - t.altitude_ft   # + = below target → add
-            throttle = max(0.0, min(0.78, 0.50 + alt_err_c * 0.005))
+            throttle = max(0.0, min(0.78, base_pwr + alt_err_c * 0.005))
         elif kf.throttle_mode == "alt_scaled":
             # Dense air at low alt needs less thrust for cruise; thinner
             # air at high alt needs more.  At 2.6kft → 0.59, 10kft → 0.70,
