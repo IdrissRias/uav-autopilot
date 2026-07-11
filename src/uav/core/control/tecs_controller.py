@@ -184,10 +184,15 @@ class TECSController(Controller):
             vs_ref = (targets.vs_target_fpm
                       if targets.vs_target_fpm is not None else -500.0)
             vs_err = vs_ref - self._gs_vs_filt
-            self._gs_theta_ref += vs_err * 0.0018 * dt
+            # Trim gain halved (0.0018 -> 0.0008) alongside the flight_engine
+            # conv_gain cut — the trim was winding up past what the
+            # pitch_limit=0.25 nose-up cap can actually deliver, and
+            # unwinding slowly enough to overshoot on the way back. Gentler
+            # trim + a gentler upstream demand together, not either alone.
+            self._gs_theta_ref += vs_err * 0.0008 * dt
             self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
             pitch_dmd_deg = max(-10.0, min(8.0,
-                                self._gs_theta_ref + vs_err * 0.0008))
+                                self._gs_theta_ref + vs_err * 0.00035))
             self.tecs.reset()
 
         elif targets.airspeed_kts is not None and targets.altitude_ft is not None:

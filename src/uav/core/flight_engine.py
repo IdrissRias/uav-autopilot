@@ -606,8 +606,20 @@ class FlightEngine:
                 self._off_rate_filt = (0.3 * raw_rate
                                        + 0.7 * self._off_rate_filt)
             self._off_slope_prev = off_slope_ft
-            CLOSURE_DAMP = 30.0   # fpm of easing per ft/s of closure
-            conv_gain = 1.5 if off_slope_ft >= 0.0 else 2.5
+            # GENTLED (Idriss, after flight 162820: 8 sign-crossings, +-150 to
+            # 194 ft swings, the ENTIRE descent — not a converging approach,
+            # a sustained oscillation that happened to touch down near a
+            # zero-crossing, which is what made it LOOK clean in a sparse
+            # sample). Root issue: pitch was independently correcting the
+            # SAME off-slope error that throttle ALSO corrects (per the
+            # 'altitude only' doctrine) — two controls fighting one axis,
+            # the exact disease this project fought all day in other forms.
+            # Pitch now mostly just flies the baseline required sink rate;
+            # THROTTLE (already gentled to 0.0008) owns the position
+            # correction. conv_gain cut ~10x (1.5/2.5 -> 0.15/0.20);
+            # CLOSURE_DAMP raised (30 -> 45) for more genuine rate damping.
+            CLOSURE_DAMP = 45.0   # fpm of easing per ft/s of closure
+            conv_gain = 0.15 if off_slope_ft >= 0.0 else 0.20
             vs_raw = (required_fpm
                       - off_slope_ft * conv_gain
                       - self._off_rate_filt * CLOSURE_DAMP)
