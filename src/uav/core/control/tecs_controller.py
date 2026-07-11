@@ -135,21 +135,27 @@ class TECSController(Controller):
 
         elif getattr(targets, "on_glideslope", False) and targets.airspeed_kts is not None:
             # ── GLIDESLOPE: ALTITUDE ONLY. SPEED PLAYS NO ROLE, EVER. ────
-            # (Idriss, 2026-07-11, after a stall-guard chatter crashed it
-            # into the runway.) Throttle serves TARGET ALTITUDE and NOTHING
-            # ELSE — no speed target, no stall guard, no re-engagement of
-            # any kind. Above the glideslope → power comes OFF, period,
-            # proportional to how far above. At/below it → idle; power never
-            # adds back because of speed. Speed is a RESULT of pitch +
-            # configuration, never a goal, never a reason to add power. A
-            # prior version re-added power below ~100 kt "for safety" — that
-            # guard fired near the ground, oscillated pitch +0.25/-1.0, and
-            # chattered the plane into the runway short of a clean landing.
-            # Removed outright, not tuned.
+            # (Idriss, 2026-07-11.) Throttle serves TARGET ALTITUDE and
+            # NOTHING ELSE — no speed target, no stall guard. Speed is a
+            # RESULT of pitch + configuration, never a goal, never a reason
+            # to add or remove power.
+            #
+            # SYMMETRIC on purpose (fixed after it landed short, flight
+            # c677d781): a one-sided version that could only CUT power
+            # (never restore it below the line) meant that any dip under
+            # the glideslope was permanent — nothing pulled it back onto
+            # the path, and it sank into the ground before the runway.
+            # "Accurate as fuck on altitude — that's what guarantees a
+            # landing" (Idriss). Above the line → power off, firmly. Below
+            # the line → power returns, gently, to climb back onto it. Both
+            # directions are pure altitude error; neither looks at speed.
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
             if self._gs_thr is None:
                 self._gs_thr = self._prev_throttle
-            drive = min(0.0, alt_err_ft) * 0.006   # only ever pulls power OUT
+            if alt_err_ft < 0.0:
+                drive = alt_err_ft * 0.006    # above the line: firm cut
+            else:
+                drive = alt_err_ft * 0.0020   # below the line: gentle add-back
             self._gs_thr += drive * dt
             self._gs_thr = max(0.0, min(1.0, self._gs_thr))
             throttle_cmd = self._gs_thr
