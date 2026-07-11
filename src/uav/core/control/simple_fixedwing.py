@@ -432,37 +432,38 @@ class SimpleFixedWingController(Controller):
                 if self._ff_gear_prev is False and targets.gear_down:
                     self._thr_walk = min(1.0, self._thr_walk + 0.08)
                 self._ff_gear_prev = bool(targets.gear_down)
-            if targets.airspeed_kts is not None:
-                # Power follows ALTITUDE, never speed. (Idriss, 2026-07-11.)
-                # Above the commanded line, power is zero — always, no
-                # exceptions. A slow airplane up here is SINKING, and
-                # sinking toward the path is the goal, not a danger: let it
-                # come down and trade the height back into speed. Below the
-                # line, walk power up bit by bit, in proportion to how far
-                # below we are — never a step, no fixed setpoint. A slow,
-                # sinking airplane drops below the line and THIS is what
-                # arrests it, gently and self-scaling. Speed is the nose's
-                # job, not the engine's. (This replaced a speed-error walk +
-                # stall floor that pinned 0.76-1.00 power the whole approach
-                # while parked 200-600 ft high and slow — 20260711_004213.)
-                if alt_error < 0.0:
-                    # ABOVE: firm walk to idle. Slew-limited below so it's
-                    # smooth; pulling power OFF is never the dangerous way.
-                    drive = alt_error * 0.008
-                else:
-                    # BELOW: gradual add. Climb (thousands low) pegs power
-                    # to hold the climb; a shallow sag on final trims gently.
-                    drive = alt_error * 0.00015
-            else:
-                vs_now = (telemetry.vs_fpm
-                          if not math.isnan(telemetry.vs_fpm) else 0.0)
-                # 3x slower than the first cut: 0.0004/ft gave a full
-                # 0-1 sweep in ~20 s — right at the phugoid period, so
-                # the power PUMPED the swing (0.28→1.00→0.00 cycling,
-                # ±90 ft). Bit-by-bit means slower than the airplane:
-                # full sweep ~80 s, with the VS damping term dominant
-                # near equilibrium so the walk settles instead of chasing.
-                drive = alt_error * 0.00012 - vs_now * 0.00008
+            # REACTIVE altitude hold via a RATE demand (Idriss, 2026-07-11:
+            # "power down → falls, up → rises; highly reactive"). The naive
+            # way — drive power straight off altitude error — is reactive
+            # but PUMPS the phugoid: the engine spools slowly, so the power
+            # ordered while low arrives after the airplane has already swung
+            # back up, and shoves it higher (the ±90 ft cruise sawtooth).
+            #
+            # Instead, DEMAND a vertical RATE proportional to how far off we
+            # are, and drive power to CHASE that rate:
+            #   200 ft low  → demand +800 fpm → power comes up HARD
+            #   …as she accelerates through the demanded rate, the error
+            #     collapses and power EASES on its own
+            #   …nearing the line the demanded rate shrinks to 0, so she
+            #     ROUNDS onto altitude instead of blowing through it.
+            # Reactive on the way, gentle at capture. The rate feedback is
+            # the phugoid killer: the loop backs off the instant the
+            # airplane does what it was asked, not after it's already home
+            # and overshooting. Also catches a balloon the tick it starts
+            # rising, instead of ramping to full and launching it.
+            vs_now = (telemetry.vs_fpm
+                      if not math.isnan(telemetry.vs_fpm) else 0.0)
+            K_ALT = 4.0        # fpm demanded per ft of error (250 ft→1000)
+            K_VS = 0.0008      # throttle/s per fpm of rate error
+            vs_demand = max(-1000.0, min(1000.0, alt_error * K_ALT))
+            drive = (vs_demand - vs_now) * K_VS
+            # Keep the "never feed a high airplane" rule: above the line the
+            # demand is already negative so power falls away, but if she is
+            # ALSO sinking faster than demanded the rate error would call
+            # for power — up here we don't want it (sinking toward the line
+            # is the goal). Above the line, power may only fall, never rise.
+            if alt_error < -20.0:
+                drive = min(drive, 0.0)
             self._thr_walk += drive * dt
             self._thr_walk = max(0.0, min(1.0, self._thr_walk))
             throttle_cmd = self._thr_walk
