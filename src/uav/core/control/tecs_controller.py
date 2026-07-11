@@ -244,7 +244,19 @@ class TECSController(Controller):
             pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
         pitch_cmd = _clamp(pitch_cmd, 1.0)
 
-        # ── YAW (ribbon-driven yaw-hold, unchanged) ─────────────────────
+        # ── YAW (ribbon-driven yaw-hold), SPEED-SCALED ───────────────────
+        # (Idriss, 2026-07-11.) The rudder is an aerodynamic surface — the
+        # SAME deflection produces LESS actual turning force as airspeed
+        # drops (dynamic pressure falls with V^2). The old law used one
+        # fixed gain across the WHOLE yaw_hold speed range (TAKEOFF_ROLL:
+        # 0->~105kt; ROLLOUT: touchdown ~85-108kt down to a stop) with no
+        # awareness of that. X-Plane holds whatever we send (a persistent
+        # DataRef write, not a pulse) — the bottleneck was never "can we
+        # hold it," it was that we never asked for MORE as authority
+        # weakened. Scale by (V/Vref)^2, same pattern as attitude.py's
+        # pitch/roll axes: floored/capped so it can't blow up near a stop
+        # or get suppressed to nothing at speed.
+        YAW_REF_KTS = 60.0     # mid-range of the takeoff-roll/rollout envelope
         yaw_cmd = 0.0
         if targets.yaw_hold:
             yaw_kp = targets.yaw_kp if targets.yaw_kp is not None else 0.02
@@ -254,7 +266,13 @@ class TECSController(Controller):
             else:
                 hdg_rate = _wrap_deg(telemetry.heading_deg - self._prev_hdg_deg) / dt
             self._prev_hdg_deg = telemetry.heading_deg
-            yaw_cmd = _clamp(yaw_kp * hdg_error - 0.008 * hdg_rate, yaw_limit)
+            gs = (telemetry.groundspeed_kts
+                  if not math.isnan(telemetry.groundspeed_kts) and telemetry.groundspeed_kts > 0
+                  else telemetry.airspeed_kts)
+            gs = gs if not math.isnan(gs) else YAW_REF_KTS
+            q_ratio = max(0.35, min(2.5, (max(gs, 15.0) / YAW_REF_KTS) ** 2))
+            yaw_cmd = _clamp((yaw_kp * hdg_error - 0.008 * hdg_rate) / q_ratio,
+                             yaw_limit)
         else:
             self._prev_hdg_deg = telemetry.heading_deg
 
