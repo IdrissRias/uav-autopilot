@@ -110,6 +110,7 @@ class TECSController(Controller):
         self._prev_V_ms = V
 
         pitch_dmd_deg = 0.0
+        throttle_self_limited = False  # True = the branch below already rate-limited itself
         # Clear glideslope trim state whenever we're not on the slope, so it
         # re-seeds cleanly the next approach.
         if not getattr(targets, "on_glideslope", False):
@@ -176,14 +177,30 @@ class TECSController(Controller):
             # check would just be re-judging a change that hasn't landed
             # yet, the same "loop faster than the airplane" mistake that
             # phugoided cruise earlier today.
-            # Revised finer (Idriss, 2026-07-11): step 0.05->0.01, check
-            # 3.0s->1.0s. Full 0-100% now takes >=100s if a deficit
-            # persisted the whole time (was >=20s) — much gentler, closer
-            # to true idle-trim behaviour than an emergency response.
-            THROTTLE_STEP = 0.01
+            # TIERED step size (Idriss, 2026-07-11, final correction): the
+            # step now scales with how far off the line we are — fine near
+            # the target, urgent far from it. A flat 0.01 step would take
+            # 1000+ seconds to correct a genuine 1000 ft deficit (too slow
+            # for a ~1-3 min descent); a flat 0.05 was too hot once close
+            # (part of what caused the windup/balloon incident). Checked
+            # every THROTTLE_CHECK_S (1 s), same as before — enough time for
+            # the engine + aerodynamic response to actually show up before
+            # judging again. The decision is ALWAYS re-based on the CURRENT
+            # observed altitude error at each check, never a blind
+            # continuation — "not empty increasing" — which is also what
+            # keeps this immune to the theta_ref-style windup that caused
+            # the earlier +217 ft balloon: there is no accumulator, just a
+            # bounded step taken periodically off what's true right now.
             THROTTLE_CHECK_S = 1.0
-            THROTTLE_DEADBAND_FT = 20.0
+            THROTTLE_DEADBAND_FT = 5.0   # noise floor only, not a "close enough" zone
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
+            abs_err = abs(alt_err_ft)
+            if abs_err <= 100.0:
+                THROTTLE_STEP = 0.01
+            elif abs_err <= 500.0:
+                THROTTLE_STEP = 0.05
+            else:   # <=1000 ft and beyond — no band defined past 1000, so
+                THROTTLE_STEP = 0.2   # hold at the outermost step rather than leave it undefined
             if self._gs_thr is None:
                 self._gs_thr = self._prev_throttle
                 self._gs_thr_wait = 0.0
@@ -194,8 +211,14 @@ class TECSController(Controller):
                     self._gs_thr = min(1.0, self._gs_thr + THROTTLE_STEP)
                 elif alt_err_ft < -THROTTLE_DEADBAND_FT:
                     self._gs_thr = max(0.0, self._gs_thr - THROTTLE_STEP)
-                # else: within the deadband — hold, no step.
+                # else: within the noise-floor deadband — hold, no step.
             throttle_cmd = self._gs_thr
+            throttle_self_limited = True   # the step-and-check IS the rate limit;
+            # the generic 0.05/s outer slew below would otherwise silently
+            # cap the 0.05/0.2 tiers down to its own rate, defeating the
+            # whole point of having bigger steps for bigger errors (found
+            # on the bench: tier2/tier3/beyond ALL measured +0.025 instead
+            # of +0.05/+0.2/+0.2 — the outer slew was the true bottleneck).
 
             # PITCH: unchanged — the damped attitude-trim that killed the
             # 987d1262 PIO (filtered VS, slow trim, rate-damped inner loop).
@@ -246,8 +269,11 @@ class TECSController(Controller):
         # source of a large dt, not just the ones already found. Explicit
         # orders (takeoff full, flare idle) are exempt — those are meant to
         # be immediate. Full 0-100% now takes >=20 s in closed-loop phases
-        # (cruise/glideslope only — doesn't touch takeoff/flare response).
-        if targets.throttle is None and dt > 0:
+        # (cruise only now — glideslope is exempt, see throttle_self_limited
+        # above: its own tiered step-and-check already rate-limits it, and
+        # a second flat 0.05/s cap on top of that was silently defeating
+        # the whole point of the bigger tiers for bigger errors).
+        if targets.throttle is None and dt > 0 and not throttle_self_limited:
             step = 0.05 * dt
             throttle_cmd = max(self._prev_throttle - step,
                                min(self._prev_throttle + step, throttle_cmd))
