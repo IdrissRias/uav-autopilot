@@ -13,6 +13,7 @@ from importlib import resources
 from uav.core.autopilot import Autopilot
 from uav.core.control.pid import PID
 from uav.core.control.simple_fixedwing import SimpleFixedWingController, derive_gains
+from uav.core.control.tecs_controller import TECSController
 from uav.core.guidance import PassthroughGuidance
 from uav.core.flight_engine import FlightEngine
 from uav.core.safety.limits import SafetyLimits, abort_actuators
@@ -245,7 +246,9 @@ def main() -> None:
               f"kd={control_gains.alt_throttle_kd}")
 
     throttle_cfg = airframe["throttle"]
-    controller = SimpleFixedWingController(
+    # TECS-based controller (energy control + attitude inner loop). Longitudinal
+    # is one law for every phase; lateral/yaw kept from the proven cascade.
+    controller = TECSController(
         heading_pid=heading_pid,
         altitude_pid=altitude_pid,
         airspeed_pid=airspeed_pid,

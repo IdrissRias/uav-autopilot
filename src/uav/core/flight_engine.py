@@ -461,8 +461,8 @@ class FlightEngine:
         # keeps its own idle + arrest.
         glide_decouple = (kf.alt_mode == "glideslope"
                           and kf.phase != "FLARE")
-        if cruise_hold:
-            speed = None   # speed is emergent in cruise (power ↔ altitude)
+        # (Under TECS every phase commands a speed — cruise no longer runs
+        # "emergent speed"; TECS holds v_cruise while power/pitch trade energy.)
 
         # ── Throttle ─────────────────────────────────────────────────
         # No fixed cruise law and NO fixed bases/caps anywhere (user
