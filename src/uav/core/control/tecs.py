@@ -42,7 +42,7 @@ class TECSParams:
     thr_min: float = 0.0
     thr_max: float = 1.0
     kff_thr: float = 0.030      # feedforward: throttle per (m^2/s^3) of demanded energy rate
-    kp_thr: float = 0.020       # proportional on total-energy-rate error
+    kp_thr: float = 0.010       # proportional on total-energy-rate error (gentled for real-plane noise)
     ki_thr: float = 0.0012      # integral on total-energy error (trims the offset)
     thr_integ_limit: float = 0.30
 
@@ -95,8 +95,12 @@ class TECS:
         thr_trim = p.thr_cruise if thr_cruise is None else thr_cruise
         V = max(V, 1.0)  # guard the divisions
 
-        # Light filtering of the measured rates (0.4 s).
-        a = min(1.0, dt / 0.4)
+        # Heavier filtering of the measured rates (0.9 s): on the real plane
+        # the finite-difference acceleration is noisy, and it feeds the
+        # total-energy-RATE term that drives throttle — unfiltered it made
+        # the power bang full↔idle. Filter hard; the feedforward + integral
+        # carry the response, the P term just trims.
+        a = min(1.0, dt / 0.9)
         self._hdot_filt += a * (hdot - self._hdot_filt)
         self._vdot_filt += a * (vdot - self._vdot_filt)
         hdot_f, vdot_f = self._hdot_filt, self._vdot_filt

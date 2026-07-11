@@ -136,6 +136,14 @@ class TECSController(Controller):
             pitch_dmd_deg = 2.0
 
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+        # THE ENGINE IS NOT A SWITCH. TECS on the real (noisy) plane wanted to
+        # slam full↔idle every frame; slew-limit to 0.5/s so power moves like
+        # a throttle lever, not a light switch. Explicit orders (takeoff full,
+        # flare idle) are exempt — those are meant to be immediate.
+        if targets.throttle is None and dt > 0:
+            step = 0.5 * dt
+            throttle_cmd = max(self._prev_throttle - step,
+                               min(self._prev_throttle + step, throttle_cmd))
         self._prev_throttle = throttle_cmd
 
         # Pitch attitude inner loop — hold the TECS-demanded degree. Soft
