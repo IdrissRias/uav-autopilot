@@ -27,6 +27,12 @@ FT_TO_M = 0.3048
 MS_TO_KT = 1.94384
 FPM_TO_MS = 0.00508   # ft/min → m/s
 
+# Flare = hold ONE gentle nose-up attitude and let her settle, idle power.
+# NOT a sink-rate chase — that PIO'd on the real plane's noisy VS (ballooned
+# 6→46 ft, bled to the stall, dropped in). A fixed held degree is stable.
+# Tune this one number if the flare is too firm (lower) or floats (higher).
+FLARE_PITCH_DEG = 5.0
+
 
 class TECSController(Controller):
     def __init__(
@@ -97,13 +103,13 @@ class TECSController(Controller):
         pitch_dmd_deg = 0.0
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
-            # FLARE: throttle is an explicit order (idle); the nose arrests the
-            # commanded sink. Pitch UP in proportion to how much faster than
-            # the target we're sinking. Speed is deliberately unmanaged here.
+            # FLARE: idle power (explicit), and hold ONE steady nose-up flare
+            # attitude — the proven inner loop eases the nose up to it and
+            # keeps it there. She decelerates and settles onto the mains
+            # instead of hunting. (Replaced the sink-rate chase that PIO'd on
+            # the real plane's noisy VS and ballooned into a stall-drop.)
             throttle_cmd = targets.throttle
-            vs_err = targets.vs_target_fpm - (
-                telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0)
-            pitch_dmd_deg = max(-2.0, min(10.0, vs_err * 0.010))
+            pitch_dmd_deg = FLARE_PITCH_DEG
             self.tecs.reset()
 
         elif targets.throttle is not None:
