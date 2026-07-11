@@ -214,7 +214,43 @@ class SimpleFixedWingController(Controller):
         # windup, so we use a PROPORTIONAL-ONLY response for the
         # swapped paths (gains picked to match the original PID's
         # full-strength response at typical errors).
-        if targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
+        if (targets.pitch_for_speed
+                and targets.airspeed_kts is not None
+                and not math.isnan(telemetry.airspeed_kts)):
+            # ── GLIDESLOPE: PITCH FLIES SPEED (throttle owns the path) ──
+            # Idriss doctrine, 2026-07-11. Nose DOWN when slow (steepen,
+            # gain speed), UP when fast (shallow, bleed it) — "speed on the
+            # elevator", the standard stabilised-approach split, and the one
+            # that fits power=altitude: the throttle holds the slope, the
+            # nose holds v_approach so speed stops bleeding. Before this,
+            # pitch AND throttle both flew the vertical and fought, and
+            # nobody flew speed — she mushed down slow. One job each now.
+            #
+            # Pitch-RATE damping (not VS damping — that opposes the very
+            # descent we want) tames the double integrator that railed
+            # every proportional VS loop this week.
+            spd_err = targets.airspeed_kts - telemetry.airspeed_kts  # +=slow
+            if self._prev_pitch_deg is not None and dt > 0:
+                raw_rate = (telemetry.pitch_deg - self._prev_pitch_deg) / dt
+                self._pitch_rate_filt = (0.5 * raw_rate
+                                         + 0.5 * self._pitch_rate_filt)
+            self._prev_pitch_deg = telemetry.pitch_deg
+            # KP 0.02: 10 kt slow → 0.20 nose-down demand (then bounded by
+            # the keyframe's pitch_down_limit so it can't dive at the dirt).
+            pitch_cmd = -spd_err * 0.02 - self._pitch_rate_filt * 0.05
+            # Universal dive floor: no matter how slow, never bunt harder
+            # than this for speed — the throttle is holding the path and the
+            # flare will catch the bottom. Keyframes tighten it further near
+            # the ground (APPROACH). Nose-UP is free (bleed speed / flare).
+            pitch_cmd = max(pitch_cmd, -0.30)
+            # Clear the VS-cascade state so the flare re-enters it clean.
+            self._vs_target_smooth = None
+            self._prev_vs = None
+            self._vs_rate_filt = 0.0
+            self._theta_ref_deg = None
+            self._vs_filt = None
+            self._theta_cmd_prev = None
+        elif targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
             # Sink-rate tracking via an ATTITUDE CASCADE. Stick position
             # is physically a pitch RATE: between stick and vertical
             # speed sit TWO integrations plus 1–2 s of aero lag, and

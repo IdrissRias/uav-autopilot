@@ -1106,10 +1106,12 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="dest_runway",
             aim_lat=g.touchdown_lat, aim_lon=g.touchdown_lon,
             pitch_limit=0.25,
-            # APPROACH stays tighter than outer DESCENT keyframes (0.20)
-            # because we're short final: a big dive here would smash the
-            # gear. Still relaxed from 0.15 so we can catch a
-            # behind-schedule glideslope without the previous failure mode.
+            # Short final: the nose now flies SPEED (pitch_for_speed), so it
+            # WILL bunt to hold v_approach — but cap that dive tight here so
+            # a slow moment can't drop the gear into the ground. 0.15 gives
+            # enough authority to hold speed while the throttle catches the
+            # path; the flare arrests the last few feet.
+            pitch_down_limit=0.15,
             gear_down=True, flap_ratio=1.0,
             trigger=Trigger("agl_lte", value=_FLARE_ALT_AGL_FT),
         ),
