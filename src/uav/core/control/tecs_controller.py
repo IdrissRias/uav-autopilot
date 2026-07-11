@@ -44,7 +44,13 @@ class TECSController(Controller):
         params = tecs_params or TECSParams()
         params.thr_cruise = cruise_throttle
         self.tecs = TECS(params)
-        self.pitch_axis = default_pitch_axis()
+        # Pitch attitude inner loop: the PROVEN X-Plane-tuned one from the old
+        # controller (soft 0.05/deg spring + 0.055 rate damper with filtering),
+        # NOT the sim-tuned attitude.py — that railed at rotation on the real
+        # plane (flight after f3594a7) because X-Plane's elevator bites harder
+        # than my sim modelled. This loop flew every takeoff today.
+        self._prev_pitch_deg: float | None = None
+        self._pitch_rate_filt = 0.0
         # lateral state
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
@@ -132,12 +138,16 @@ class TECSController(Controller):
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
         self._prev_throttle = throttle_cmd
 
-        # Pitch attitude inner loop: fly the demanded degree → elevator.
-        pitch_cmd = self.pitch_axis.update(
-            pitch_dmd_deg,
-            telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0,
-            telemetry.airspeed_kts if not math.isnan(telemetry.airspeed_kts) else 60.0,
-            dt)
+        # Pitch attitude inner loop — hold the TECS-demanded degree. Soft
+        # spring + timely rate damper (the old controller's X-Plane-proven
+        # gains). This is deliberately GENTLE so it can't rail on the real
+        # elevator the way the sim-tuned loop did.
+        pdeg = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
+        if self._prev_pitch_deg is not None and dt > 0:
+            raw = (pdeg - self._prev_pitch_deg) / dt
+            self._pitch_rate_filt = 0.5 * raw + 0.5 * self._pitch_rate_filt
+        self._prev_pitch_deg = pdeg
+        pitch_cmd = 0.05 * (pitch_dmd_deg - pdeg) - 0.055 * self._pitch_rate_filt
         # Commander surface clamps (hardware orders).
         if targets.pitch_limit is not None:
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
