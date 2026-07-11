@@ -989,7 +989,13 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             name="DESCENT", phase="DESCENT",
             throttle_mode="speed_pid",
             throttle_for_alt=True,  # throttle defends the glideslope alt
-            target_speed_kts=g.flap_safe_kts,  # hold ~115 kts during clean descent
+            # SOFT reference only — on the glideslope the controller flies
+            # altitude-priority (throttle→idle, speed emergent). Capped to a
+            # sane descent speed: flap_safe is a stall RATIO off v_land (108)
+            # and ballooned to ~146-162 when the real stall speeds went in,
+            # which the old speed-holding law chased at 0.9-1.0 power — the
+            # plane sat at 2600 ft and never descended (flight c269d01f).
+            target_speed_kts=min(g.flap_safe_kts, 130.0),
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
@@ -1028,7 +1034,8 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             name="DESCENT_FLAP", phase="DESCENT",
             throttle_mode="speed_pid",
             throttle_for_alt=True,
-            target_speed_kts=g.gear_safe_kts,  # bleed from ~115 to ~100 kts
+            # Soft reference (altitude-priority descent; see DESCENT above).
+            target_speed_kts=min(g.gear_safe_kts, 120.0),
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
@@ -1072,7 +1079,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             name="DESCENT_GEAR", phase="DESCENT",
             throttle_mode="speed_pid",
             throttle_for_alt=True,
-            target_speed_kts=g.v_approach,  # stabilise at ~83 kts before flare
+            target_speed_kts=g.v_approach,  # soft ref (~120); alt-priority descent
             alt_mode="glideslope",
             heading_mode="aim_at",
             aim_lat=g.flare_start_lat, aim_lon=g.flare_start_lon,

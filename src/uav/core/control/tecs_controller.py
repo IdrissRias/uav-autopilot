@@ -134,14 +134,18 @@ class TECSController(Controller):
             self.tecs.reset()
 
         elif getattr(targets, "on_glideslope", False) and targets.airspeed_kts is not None:
-            # ── GLIDESLOPE: pitch flies the SLOPE, throttle holds SPEED ──
-            # (Idriss fix, flight 987d1262.) TECS's energy-balance pitch PIO'd
-            # here on the real plane's noisy VS/accel — porpoised ±150 ft down
-            # the slope, pitch slamming +0.25↔−1.0, and a down-swing flew it
-            # into the ground short of the runway. The proven split is stable:
-            # one control on the path, one on speed, neither chasing a noisy
-            # energy estimate. Deliberately GENTLE — a slow attitude trim
-            # finds the slope, the inner loop's rate damping does the rest.
+            # ── GLIDESLOPE: ALTITUDE PRIORITY (Idriss doctrine, 2026-07-11) ──
+            # The controlled variable on the descent is TARGET ALTITUDE, not
+            # speed. The job is to get DOWN: throttle walks to IDLE and stays
+            # there, pitch tracks the slope's commanded sink rate, and speed
+            # is EMERGENT — whatever the slope gives. Holding a speed target
+            # with power pinned the throttle at 0.9–1.0 and the plane sat at
+            # 2600 ft refusing to descend (flight c269d01f). Power returns
+            # ONLY for a genuine near-stall (approaching Vso 90), gently,
+            # and falls away again the moment the margin is back.
+            # (Pitch stays the damped attitude-trim that killed the PIO of
+            # flight 987d1262 — filtered VS, slow trim, rate-damped inner
+            # loop. Only the throttle law changes here.)
             vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
             pnow = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
             if self._gs_theta_ref is None:   # seed on entry
@@ -153,18 +157,29 @@ class TECSController(Controller):
             vs_ref = (targets.vs_target_fpm
                       if targets.vs_target_fpm is not None else -500.0)
             vs_err = vs_ref - self._gs_vs_filt   # + = sinking too fast → nose up
-            # PITCH: slow attitude trim toward the slope + a tiny lead term.
-            self._gs_theta_ref += vs_err * 0.0009 * dt
+            # PITCH: slow attitude trim toward the slope + a small lead term.
+            # Trim doubled from 0.0009 (which was too timid to establish the
+            # descent); still an order slower than the PIO'd energy law, and
+            # the heavy VS filter + inner-loop damping remain the guards.
+            self._gs_theta_ref += vs_err * 0.0018 * dt
             self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
             pitch_dmd_deg = max(-10.0, min(8.0,
-                                self._gs_theta_ref + vs_err * 0.0006))
-            # THROTTLE: hold the approach speed with a gentle walk (the slew
-            # limiter below smooths it further).
-            spd_err_kt = (targets.airspeed_kts - telemetry.airspeed_kts
-                          if not math.isnan(telemetry.airspeed_kts) else 0.0)
-            self._gs_thr += spd_err_kt * 0.010 * dt
+                                self._gs_theta_ref + vs_err * 0.0008))
+            # THROTTLE: idle by default — walk down steadily so the plane
+            # actually descends. Stall guard only: below ~Vso+10 the walk
+            # reverses, proportional to the deficit (bit by bit, no slam);
+            # above the guard it resumes falling. Speed is not otherwise
+            # controlled here.
+            STALL_GUARD_KTS = 100.0   # Vso 90 + margin
+            spd_now = (telemetry.airspeed_kts
+                       if not math.isnan(telemetry.airspeed_kts) else STALL_GUARD_KTS)
+            deficit = STALL_GUARD_KTS - spd_now
+            if deficit > 0.0:
+                self._gs_thr += deficit * 0.020 * dt
+            else:
+                self._gs_thr -= 0.12 * dt
             self._gs_thr = max(0.0, min(1.0, self._gs_thr))
-            throttle_cmd = max(0.0, min(1.0, self._gs_thr + spd_err_kt * 0.004))
+            throttle_cmd = self._gs_thr
             self.tecs.reset()
 
         elif targets.airspeed_kts is not None and targets.altitude_ft is not None:
