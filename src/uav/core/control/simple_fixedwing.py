@@ -432,38 +432,34 @@ class SimpleFixedWingController(Controller):
                 if self._ff_gear_prev is False and targets.gear_down:
                     self._thr_walk = min(1.0, self._thr_walk + 0.08)
                 self._ff_gear_prev = bool(targets.gear_down)
-            # REACTIVE altitude hold via a RATE demand (Idriss, 2026-07-11:
-            # "power down → falls, up → rises; highly reactive"). The naive
-            # way — drive power straight off altitude error — is reactive
-            # but PUMPS the phugoid: the engine spools slowly, so the power
-            # ordered while low arrives after the airplane has already swung
-            # back up, and shoves it higher (the ±90 ft cruise sawtooth).
+            # GENTLE altitude hold — the power-band doctrine, one law for
+            # level flight AND the glideslope (Idriss, 2026-07-11: "let the
+            # throttle control the alt during cruise", bit by bit, never
+            # abused). Power trims the altitude error slowly, with a
+            # vertical-speed damper to kill the phugoid.
             #
-            # Instead, DEMAND a vertical RATE proportional to how far off we
-            # are, and drive power to CHASE that rate:
-            #   200 ft low  → demand +800 fpm → power comes up HARD
-            #   …as she accelerates through the demanded rate, the error
-            #     collapses and power EASES on its own
-            #   …nearing the line the demanded rate shrinks to 0, so she
-            #     ROUNDS onto altitude instead of blowing through it.
-            # Reactive on the way, gentle at capture. The rate feedback is
-            # the phugoid killer: the loop backs off the instant the
-            # airplane does what it was asked, not after it's already home
-            # and overshooting. Also catches a balloon the tick it starts
-            # rising, instead of ramping to full and launching it.
+            # The one subtlety that makes it work on a DESCENDING target:
+            # the damper opposes deviation from the COMMANDED rate, not all
+            # vertical motion. In cruise the commanded rate is 0, so it
+            # holds level. On the glideslope vs_ref is the slope's own sink,
+            # so the damper does NOT fight the intended descent — it only
+            # resists departing from the slope's rate. That was the flaw in
+            # the "reactive" law: it demanded vs→0 (hold still) on a target
+            # that is walking down, read the plane as "low" the whole way,
+            # and slammed power to full (0.00↔1.00 abuse, the porpoise).
             vs_now = (telemetry.vs_fpm
                       if not math.isnan(telemetry.vs_fpm) else 0.0)
-            K_ALT = 4.0        # fpm demanded per ft of error (250 ft→1000)
-            K_VS = 0.0008      # throttle/s per fpm of rate error
-            vs_demand = max(-1000.0, min(1000.0, alt_error * K_ALT))
-            drive = (vs_demand - vs_now) * K_VS
-            # Keep the "never feed a high airplane" rule: above the line the
-            # demand is already negative so power falls away, but if she is
-            # ALSO sinking faster than demanded the rate error would call
-            # for power — up here we don't want it (sinking toward the line
-            # is the goal). Above the line, power may only fall, never rise.
+            vs_ref = (targets.vs_target_fpm
+                      if targets.vs_target_fpm is not None else 0.0)
+            drive = alt_error * 0.00012 - (vs_now - vs_ref) * 0.00008
+            # Asymmetric on purpose: ADDING power is gentle (bit by bit, no
+            # abuse); PULLING it off when high is firm. Above the line power
+            # walks to idle at alt_error×0.004 — fast when well high, gentle
+            # near the line — because reducing power is never the dangerous
+            # direction and "0% above the line" is the rule. min() only ever
+            # makes the walk fall faster, never adds.
             if alt_error < -20.0:
-                drive = min(drive, 0.0)
+                drive = min(drive, alt_error * 0.004)
             self._thr_walk += drive * dt
             self._thr_walk = max(0.0, min(1.0, self._thr_walk))
             throttle_cmd = self._thr_walk
