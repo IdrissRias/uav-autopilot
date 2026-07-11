@@ -1094,7 +1094,14 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             name="APPROACH", phase="APPROACH",
             throttle_mode="speed_pid",
             throttle_for_alt=True,  # power for altitude on final approach
-            target_speed_kts=g.v_approach,
+            # Fly SHORT FINAL at the landing speed, not v_approach. Crossing
+            # the threshold at v_approach (120, held ~116) carried too much
+            # energy into the flare — the roundout ballooned it long and it
+            # bounced (Idriss report 2026-07-11, flight 143847). v_land (108,
+            # still 1.2× the 90-kt flap stall) crosses slow so the flare
+            # settles on the aim point. Deceleration from the descent speed
+            # happens over the final, before the flare.
+            target_speed_kts=g.v_land,
             alt_mode="glideslope",
             # Track the RUNWAY CENTERLINE directly on final, not the L1
             # ribbon follower. The follower left a lateral offset the weak
