@@ -100,14 +100,6 @@ class Targets:
     # plane was above the slope and the alt law refused power. None on
     # phases where slow is by design (flare/rollout).
     stall_floor_kts: float | None = None
-    # ATTITUDE HOLD (Idriss, 2026-07-11 — smoothness-first architecture).
-    # When set, PITCH simply holds this nose attitude in DEGREES and does
-    # nothing else — no rate chase, no altitude chase (those are what make
-    # it bumpy). The nose sits still; the THROTTLE owns altitude (gentle
-    # power walk). Used by climb (a held nose-up degree, eased toward level
-    # near the top) and cruise (held level). Takes priority over every
-    # other pitch law when present.
-    pitch_hold_deg: float | None = None
 
 
 class Mode(str, Enum):
