@@ -856,12 +856,6 @@ class FlightEngine:
             throttle_max=None,  # full 0–100% range in every phase
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
-            # Glideslope: pitch flies SPEED, throttle owns the path. The nose
-            # holds v_approach so speed stops bleeding; the throttle (its own
-            # gentle alt-hold, damped against vs_target) keeps her on the
-            # slope. Each control one job. FLARE is excluded (glide_decouple
-            # already excludes it) so it keeps its sink-rate arrest.
-            pitch_for_speed=glide_decouple,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────

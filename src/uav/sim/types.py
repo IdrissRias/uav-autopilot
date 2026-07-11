@@ -100,13 +100,6 @@ class Targets:
     # plane was above the slope and the alt law refused power. None on
     # phases where slow is by design (flare/rollout).
     stall_floor_kts: float | None = None
-    # Glideslope role split (Idriss, 2026-07-11): when True, PITCH flies
-    # SPEED (nose down when slow, up when fast) and THROTTLE owns the path.
-    # vs_target_fpm is still handed over — but as the THROTTLE's damping
-    # reference (the slope's own sink), not as a pitch target. Set on the
-    # descent/approach glideslope; cleared for the flare, which flies its
-    # own sink-rate arrest via vs_target_fpm.
-    pitch_for_speed: bool = False
 
 
 class Mode(str, Enum):
