@@ -116,14 +116,19 @@ class TECSController(Controller):
 
         pitch_dmd_deg = 0.0
         throttle_self_limited = False  # True = the branch below already rate-limited itself
-        pitch_trim_hold = False        # True = use the held-elevator PI (glideslope only)
-        # Clear glideslope trim state whenever we're not on the slope, so it
-        # re-seeds cleanly the next approach.
+        pitch_trim_hold = False        # True = use the held-elevator PI (climb/cruise/descent)
+        # Clear the glideslope-SPECIFIC state whenever we're not on the slope
+        # so it re-seeds cleanly next approach. NOTE: _elev_trim is deliberately
+        # NOT reset here (Idriss, 2026-07-11: "no reset, especially on cruise
+        # and descent"). The elevator NEVER lets go — its held trim persists
+        # through climb/cruise/descent and across phase boundaries; only a
+        # fresh controller (new flight) starts it at 0. Resetting it every tick
+        # would also make the cruise hold impossible (cruise is off-glideslope,
+        # so this block runs every cruise tick).
         if not getattr(targets, "on_glideslope", False):
             self._gs_theta_ref = None
             self._gs_thr = None
             self._gs_thr_wait = 0.0
-            self._elev_trim = 0.0
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
             # FLARE: idle power (explicit), and hold ONE steady nose-up flare
@@ -283,6 +288,13 @@ class TECSController(Controller):
             sw = 1.7 if getattr(targets, "pitch_for_speed", False) else 1.0
             throttle_cmd, pitch_dmd_deg = self.tecs.update(
                 h, V, hdot, vdot, h_dmd, V_dmd, dt, spdweight=sw)
+            pitch_trim_hold = True   # elevator HOLDS its trim in cruise/climb too
+            # (Idriss, 2026-07-11: "on for cruise"). TECS sets the demanded
+            # attitude; the held trim parks the elevator at the deflection that
+            # maintains it, instead of relaxing to neutral each time the plane
+            # reaches the demand. The trim is a SLOW inner-loop hold (gain 0.02,
+            # bounded, anti-windup), so it trims around TECS's demand rather
+            # than fighting TECS's own pitch integral.
         else:
             # No speed target (shouldn't happen with the TECS ribbon) — hold
             # the last throttle and a level attitude rather than do anything
