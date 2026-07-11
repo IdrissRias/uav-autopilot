@@ -134,52 +134,43 @@ class TECSController(Controller):
             self.tecs.reset()
 
         elif getattr(targets, "on_glideslope", False) and targets.airspeed_kts is not None:
-            # ── GLIDESLOPE: ALTITUDE PRIORITY (Idriss doctrine, 2026-07-11) ──
-            # The controlled variable on the descent is TARGET ALTITUDE, not
-            # speed. The job is to get DOWN: throttle walks to IDLE and stays
-            # there, pitch tracks the slope's commanded sink rate, and speed
-            # is EMERGENT — whatever the slope gives. Holding a speed target
-            # with power pinned the throttle at 0.9–1.0 and the plane sat at
-            # 2600 ft refusing to descend (flight c269d01f). Power returns
-            # ONLY for a genuine near-stall (approaching Vso 90), gently,
-            # and falls away again the moment the margin is back.
-            # (Pitch stays the damped attitude-trim that killed the PIO of
-            # flight 987d1262 — filtered VS, slow trim, rate-damped inner
-            # loop. Only the throttle law changes here.)
+            # ── GLIDESLOPE: ALTITUDE ONLY. SPEED PLAYS NO ROLE, EVER. ────
+            # (Idriss, 2026-07-11, after a stall-guard chatter crashed it
+            # into the runway.) Throttle serves TARGET ALTITUDE and NOTHING
+            # ELSE — no speed target, no stall guard, no re-engagement of
+            # any kind. Above the glideslope → power comes OFF, period,
+            # proportional to how far above. At/below it → idle; power never
+            # adds back because of speed. Speed is a RESULT of pitch +
+            # configuration, never a goal, never a reason to add power. A
+            # prior version re-added power below ~100 kt "for safety" — that
+            # guard fired near the ground, oscillated pitch +0.25/-1.0, and
+            # chattered the plane into the runway short of a clean landing.
+            # Removed outright, not tuned.
+            alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
+            if self._gs_thr is None:
+                self._gs_thr = self._prev_throttle
+            drive = min(0.0, alt_err_ft) * 0.006   # only ever pulls power OUT
+            self._gs_thr += drive * dt
+            self._gs_thr = max(0.0, min(1.0, self._gs_thr))
+            throttle_cmd = self._gs_thr
+
+            # PITCH: unchanged — the damped attitude-trim that killed the
+            # 987d1262 PIO (filtered VS, slow trim, rate-damped inner loop).
+            # Flies the commanded sink rate down; nothing here reacts to
+            # speed either.
             vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
             pnow = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
             if self._gs_theta_ref is None:   # seed on entry
                 self._gs_theta_ref = pnow
                 self._gs_vs_filt = vs_now
-            if self._gs_thr is None:
-                self._gs_thr = self._prev_throttle
             self._gs_vs_filt += min(1.0, dt / 0.6) * (vs_now - self._gs_vs_filt)
             vs_ref = (targets.vs_target_fpm
                       if targets.vs_target_fpm is not None else -500.0)
-            vs_err = vs_ref - self._gs_vs_filt   # + = sinking too fast → nose up
-            # PITCH: slow attitude trim toward the slope + a small lead term.
-            # Trim doubled from 0.0009 (which was too timid to establish the
-            # descent); still an order slower than the PIO'd energy law, and
-            # the heavy VS filter + inner-loop damping remain the guards.
+            vs_err = vs_ref - self._gs_vs_filt
             self._gs_theta_ref += vs_err * 0.0018 * dt
             self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
             pitch_dmd_deg = max(-10.0, min(8.0,
                                 self._gs_theta_ref + vs_err * 0.0008))
-            # THROTTLE: idle by default — walk down steadily so the plane
-            # actually descends. Stall guard only: below ~Vso+10 the walk
-            # reverses, proportional to the deficit (bit by bit, no slam);
-            # above the guard it resumes falling. Speed is not otherwise
-            # controlled here.
-            STALL_GUARD_KTS = 100.0   # Vso 90 + margin
-            spd_now = (telemetry.airspeed_kts
-                       if not math.isnan(telemetry.airspeed_kts) else STALL_GUARD_KTS)
-            deficit = STALL_GUARD_KTS - spd_now
-            if deficit > 0.0:
-                self._gs_thr += deficit * 0.020 * dt
-            else:
-                self._gs_thr -= 0.12 * dt
-            self._gs_thr = max(0.0, min(1.0, self._gs_thr))
-            throttle_cmd = self._gs_thr
             self.tecs.reset()
 
         elif targets.airspeed_kts is not None and targets.altitude_ft is not None:
