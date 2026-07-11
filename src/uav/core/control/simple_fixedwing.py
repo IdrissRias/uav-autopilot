@@ -448,6 +448,20 @@ class SimpleFixedWingController(Controller):
                           if not math.isnan(telemetry.vs_fpm) else vs_ref)
                 balloon = max(0.0, vs_now - vs_ref)
                 drive = spd_error * 0.004 - balloon * 0.00008
+                # POSITION gate, not just the rate gate above. The balloon
+                # term only catches an ACTIVE climb; a plane parked 400 ft
+                # high and slow isn't climbing, yet the speed-hungry drive
+                # still pours power in — which becomes altitude, holds it
+                # high, and keeps the power pinned (flight 20260711_004213:
+                # 0.76-1.00 throttle held the WHOLE approach while +200 to
+                # +600 ft above the slope at 95 kt). Above the commanded
+                # line, a speed deficit is spare altitude to trade DOWN with
+                # the nose, never power to add: let the walk fall, never
+                # rise. Power returns the instant we're back on/below the
+                # path (gate releases) — the same threshold the stall floor
+                # below arms at, so low-and-slow is still caught.
+                if alt_error < -50.0:
+                    drive = min(drive, 0.0)
             else:
                 vs_now = (telemetry.vs_fpm
                           if not math.isnan(telemetry.vs_fpm) else 0.0)
