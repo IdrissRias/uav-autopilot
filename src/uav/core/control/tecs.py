@@ -34,17 +34,23 @@ class TECSParams:
 
     # Outer error → demanded-rate gains (how hard we chase the setpoint).
     kh: float = 0.30            # 1/s : height error → climb-rate demand
-    kv: float = 0.30            # 1/s : speed error → accel demand
-    ax_max: float = 2.0         # m/s^2 : accel demand clamp
+    kv: float = 0.12            # 1/s : speed error → accel demand (gentled: a
+                                #       hard accel demand saturated the throttle
+                                #       to full and set up the engine limit cycle)
+    ax_max: float = 1.0         # m/s^2 : accel demand clamp (was 2.0)
 
-    # THROTTLE loop (total specific energy).
+    # THROTTLE loop (total specific energy). INTEGRAL-DOMINANT on purpose: the
+    # feedforward + P were slamming full↔idle on the real plane (engine spool
+    # lag + airspeed noise → a limit cycle the sim can't show). Lean on the
+    # slow trim integral to find and HOLD the one cruise power; the ff/P only
+    # nudge. This is the old power-band doctrine, re-derived.
     thr_cruise: float = 0.45    # trim power that holds level cruise
     thr_min: float = 0.0
     thr_max: float = 1.0
-    kff_thr: float = 0.030      # feedforward: throttle per (m^2/s^3) of demanded energy rate
-    kp_thr: float = 0.010       # proportional on total-energy-rate error (gentled for real-plane noise)
-    ki_thr: float = 0.0012      # integral on total-energy error (trims the offset)
-    thr_integ_limit: float = 0.30
+    kff_thr: float = 0.010      # feedforward (cut from 0.030 — it was the slammer)
+    kp_thr: float = 0.004       # proportional on total-energy-rate error (nearly off)
+    ki_thr: float = 0.0018      # integral on total-energy error — the PRIMARY term now
+    thr_integ_limit: float = 0.45
 
     # PITCH loop (energy balance). Output is a pitch-ANGLE demand.
     kp_pitch: float = 0.55      # on balance-energy error
