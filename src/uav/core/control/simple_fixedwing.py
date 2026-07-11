@@ -214,7 +214,33 @@ class SimpleFixedWingController(Controller):
         # windup, so we use a PROPORTIONAL-ONLY response for the
         # swapped paths (gains picked to match the original PID's
         # full-strength response at typical errors).
-        if targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
+        if targets.pitch_hold_deg is not None:
+            # ── ATTITUDE HOLD: just hold the nose degree (smoothness-first)
+            # (Idriss, 2026-07-11). No rate chase, no altitude chase — those
+            # two integrations downstream of the stick are what oscillated
+            # every loop this week. Hold the commanded ATTITUDE with a soft
+            # spring and a timely rate damper, and leave it there. The nose
+            # sits still; the throttle owns altitude. This IS "fix a nose
+            # degree and fly."
+            if self._prev_pitch_deg is not None and dt > 0:
+                raw_rate = (telemetry.pitch_deg - self._prev_pitch_deg) / dt
+                self._pitch_rate_filt = (0.5 * raw_rate
+                                         + 0.5 * self._pitch_rate_filt)
+            self._prev_pitch_deg = telemetry.pitch_deg
+            # 0.05/deg spring, 0.055/(deg/s) damper — the inner-loop gains
+            # that held attitude in the old cascade, now driven straight
+            # off the commanded degree instead of a VS-derived target.
+            pitch_cmd = (0.05 * (targets.pitch_hold_deg - telemetry.pitch_deg)
+                         - 0.055 * self._pitch_rate_filt)
+            # Clear the VS-cascade smoothing state so any later VS/flare
+            # phase re-enters clean.
+            self._vs_target_smooth = None
+            self._prev_vs = None
+            self._vs_rate_filt = 0.0
+            self._theta_ref_deg = None
+            self._vs_filt = None
+            self._theta_cmd_prev = None
+        elif targets.vs_target_fpm is not None and not math.isnan(telemetry.vs_fpm):
             # Sink-rate tracking via an ATTITUDE CASCADE. Stick position
             # is physically a pitch RATE: between stick and vertical
             # speed sit TWO integrations plus 1–2 s of aero lag, and

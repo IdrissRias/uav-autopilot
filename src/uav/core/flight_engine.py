@@ -37,6 +37,13 @@ from uav.core.guidance.track_follower import TrackFollower, TrackState
 # _resolve): all drag comes out at the top of the descent, the
 # VS-tracking pitch counters the lift spike, and nothing deploys low.
 
+# Attitude-hold degrees (smoothness-first architecture, Idriss 2026-07-11).
+# The nose HOLDS one of these and doesn't chase anything; the throttle owns
+# altitude. CLIMB sits nose-up and eases toward CRUISE (level) near the top.
+# Tune these two numbers if the climb is too steep/shallow or cruise drifts.
+CLIMB_PITCH_DEG = 8.0     # held nose-up attitude during the climb
+CRUISE_PITCH_DEG = 2.0    # held (near-level) attitude at cruise
+
 
 class FlightEngine:
     def __init__(self, ctx: dict) -> None:
@@ -523,6 +530,7 @@ class FlightEngine:
         # gaining 50 ft while a speed-error law wakes up. Never commands
         # a climb (throttle owns the low side).
         vs_target = None
+        pitch_hold = None   # attitude-hold degree (climb/cruise); None = off
         if kf.phase == "FLARE":
             # Deepened arrest (was 120 + 10/ft): touchdowns were firm.
             # -80 fpm at the pavement, gentler slope so the hold starts
@@ -607,37 +615,24 @@ class FlightEngine:
             # a descent only).
             vs_target = max(-1500.0, min(250.0, vs_raw))
         elif cruise_hold:
-            # POWER FOR ALTITUDE, PITCH FOR ATTITUDE (user doctrine). The
-            # yoke holds a STEADY, near-level attitude — it does NOT chase
-            # altitude with big VS demands (that was the twitchy, constant
-            # stick). Just a whisper of VS toward the target (±90 fpm) so
-            # the plane doesn't drift, but mostly it holds level. THROTTLE
-            # walks the altitude to the target (see the cruise throttle
-            # block: power up → the plane rises, power down → it falls) and
-            # settles into the power band that holds it. Steady stick,
-            # slow power, speed emergent.
-            alt_err_ft = alt - t.altitude_ft   # + = below target
-            vs_target = max(-90.0, min(90.0, alt_err_ft * 0.6))
+            # ATTITUDE HOLD (smoothness-first, Idriss 2026-07-11). The nose
+            # just SITS at the level cruise degree — no VS chase, which was
+            # the cruise sawtooth. The THROTTLE owns altitude (gentle power
+            # walk: power up → rise, down → fall). Speed emergent.
+            pitch_hold = CRUISE_PITCH_DEG
         elif (kf.phase == "CLIMB" and kf.alt_mode == "target"
                 and kf.target_alt_ft is not None
                 and kf.name != "CLIMB_ROTATE"):
-            # STEADY CLIMB (user doctrine): pitch holds ONE climb rate all
-            # the way up — the yoke does not chase the altitude error. The
-            # commanded rate tapers over the last 600 ft so the plane
-            # rounds onto cruise altitude (in step with the throttle
-            # capture taper below), then cruise_hold's steady-level law
-            # takes over. Rate comes from the airframe (rates_fpm.climb).
-            # CLIMB_ROTATE keeps the alt-PID: rotation needs the nose
-            # yanked up, not a rate hold.
-            rates_af = self.ctx.get("airframe", {}).get("rates_fpm", {})
-            climb_fpm = float(rates_af.get("climb", 1500.0) or 1500.0)
-            climb_fpm = max(500.0, min(2200.0, climb_fpm))
+            # ATTITUDE HOLD climb: hold ONE nose-up degree the whole way up
+            # (no rate chase — that swung the nose and made it bumpy). Ease
+            # the held degree from the climb attitude toward level over the
+            # last 600 ft so the nose is already flat as she reaches cruise,
+            # in step with the throttle capture taper below. CLIMB_ROTATE
+            # is excluded — rotation still yanks the nose up via the alt PID.
             remaining_c = kf.target_alt_ft - t.altitude_ft
-            if remaining_c > 0:
-                vs_target = max(150.0,
-                                climb_fpm * min(1.0, remaining_c / 600.0))
-            else:
-                vs_target = 0.0   # at/above target: level, wait for trigger
+            frac = max(0.0, min(1.0, remaining_c / 600.0))
+            pitch_hold = (CRUISE_PITCH_DEG
+                          + (CLIMB_PITCH_DEG - CRUISE_PITCH_DEG) * frac)
 
         # ── Throttle baseline for throttle_for_alt ───────────────────
         # Glideslope descents now fly CONFIGURED (gear + flaps out from
@@ -856,6 +851,7 @@ class FlightEngine:
             throttle_max=None,  # full 0–100% range in every phase
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
+            pitch_hold_deg=pitch_hold,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────
