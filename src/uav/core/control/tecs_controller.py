@@ -57,6 +57,10 @@ class TECSController(Controller):
         # than my sim modelled. This loop flew every takeoff today.
         self._prev_pitch_deg: float | None = None
         self._pitch_rate_filt = 0.0
+        # glideslope-split state (pitch=slope, throttle=speed); re-seeded on entry
+        self._gs_theta_ref: float | None = None
+        self._gs_vs_filt = 0.0
+        self._gs_thr: float | None = None
         # lateral state
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
@@ -101,6 +105,11 @@ class TECSController(Controller):
         self._prev_V_ms = V
 
         pitch_dmd_deg = 0.0
+        # Clear glideslope trim state whenever we're not on the slope, so it
+        # re-seeds cleanly the next approach.
+        if not getattr(targets, "on_glideslope", False):
+            self._gs_theta_ref = None
+            self._gs_thr = None
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
             # FLARE: idle power (explicit), and hold ONE steady nose-up flare
@@ -124,13 +133,44 @@ class TECSController(Controller):
                 pitch_dmd_deg = max(0.0, min(8.0, below * 0.004))
             self.tecs.reset()
 
+        elif getattr(targets, "on_glideslope", False) and targets.airspeed_kts is not None:
+            # ── GLIDESLOPE: pitch flies the SLOPE, throttle holds SPEED ──
+            # (Idriss fix, flight 987d1262.) TECS's energy-balance pitch PIO'd
+            # here on the real plane's noisy VS/accel — porpoised ±150 ft down
+            # the slope, pitch slamming +0.25↔−1.0, and a down-swing flew it
+            # into the ground short of the runway. The proven split is stable:
+            # one control on the path, one on speed, neither chasing a noisy
+            # energy estimate. Deliberately GENTLE — a slow attitude trim
+            # finds the slope, the inner loop's rate damping does the rest.
+            vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
+            pnow = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
+            if self._gs_theta_ref is None:   # seed on entry
+                self._gs_theta_ref = pnow
+                self._gs_vs_filt = vs_now
+            if self._gs_thr is None:
+                self._gs_thr = self._prev_throttle
+            self._gs_vs_filt += min(1.0, dt / 0.6) * (vs_now - self._gs_vs_filt)
+            vs_ref = (targets.vs_target_fpm
+                      if targets.vs_target_fpm is not None else -500.0)
+            vs_err = vs_ref - self._gs_vs_filt   # + = sinking too fast → nose up
+            # PITCH: slow attitude trim toward the slope + a tiny lead term.
+            self._gs_theta_ref += vs_err * 0.0009 * dt
+            self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
+            pitch_dmd_deg = max(-10.0, min(8.0,
+                                self._gs_theta_ref + vs_err * 0.0006))
+            # THROTTLE: hold the approach speed with a gentle walk (the slew
+            # limiter below smooths it further).
+            spd_err_kt = (targets.airspeed_kts - telemetry.airspeed_kts
+                          if not math.isnan(telemetry.airspeed_kts) else 0.0)
+            self._gs_thr += spd_err_kt * 0.010 * dt
+            self._gs_thr = max(0.0, min(1.0, self._gs_thr))
+            throttle_cmd = max(0.0, min(1.0, self._gs_thr + spd_err_kt * 0.004))
+            self.tecs.reset()
+
         elif targets.airspeed_kts is not None and targets.altitude_ft is not None:
-            # TECS — the main path for climb / cruise / descent / approach /
-            # decelerate. One law, fed two numbers.
+            # TECS — climb / cruise / decelerate (level-ish energy phases).
             h_dmd = targets.altitude_ft * FT_TO_M
             V_dmd = targets.airspeed_kts / MS_TO_KT
-            # On the glideslope bias pitch toward SPEED (the nose flies
-            # v_approach); elsewhere balanced.
             sw = 1.7 if getattr(targets, "pitch_for_speed", False) else 1.0
             throttle_cmd, pitch_dmd_deg = self.tecs.update(
                 h, V, hdot, vdot, h_dmd, V_dmd, dt, spdweight=sw)

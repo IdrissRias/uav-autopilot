@@ -856,6 +856,7 @@ class FlightEngine:
             throttle_max=None,  # full 0–100% range in every phase
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
+            on_glideslope=glide_decouple,
         )
 
     # ── Phase mapping ────────────────────────────────────────────────

@@ -100,6 +100,12 @@ class Targets:
     # plane was above the slope and the alt law refused power. None on
     # phases where slow is by design (flare/rollout).
     stall_floor_kts: float | None = None
+    # True on the descent/approach glideslope (not flare). Tells the
+    # controller to fly the slope with the proven pitch=sink-rate /
+    # throttle=speed split instead of TECS energy control — TECS's
+    # energy-balance pitch PIO'd on the real plane's noisy signals and
+    # porpoised into the ground short of the runway (flight 987d1262).
+    on_glideslope: bool = False
 
 
 class Mode(str, Enum):
