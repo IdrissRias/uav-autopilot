@@ -61,6 +61,11 @@ class TECSController(Controller):
         self._gs_theta_ref: float | None = None
         self._gs_vs_filt = 0.0
         self._gs_thr: float | None = None
+        # step-and-check timer for the glideslope throttle loop (below)
+        self._gs_thr_wait = 0.0
+        # step-and-check state for yaw (below)
+        self._yaw_cmd_held = 0.0
+        self._yaw_wait = 0.0
         # lateral state
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
@@ -110,6 +115,7 @@ class TECSController(Controller):
         if not getattr(targets, "on_glideslope", False):
             self._gs_theta_ref = None
             self._gs_thr = None
+            self._gs_thr_wait = 0.0
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
             # FLARE: idle power (explicit), and hold ONE steady nose-up flare
@@ -150,25 +156,41 @@ class TECSController(Controller):
             # the line → power eases back in. Both directions are pure
             # altitude error; neither looks at speed.
             #
-            # SLOW WALK, not a slam (Idriss, again: "don't increase power
-            # by 100% — gradually, slowly, till it stabilises on the glide
-            # path — you're like 100% or nothing"). 0.006 was still hot
-            # enough to saturate to a rail in ~2 s and just sit there
-            # instead of settling at whatever intermediate power actually
-            # holds the path. 0.0008 is the same gentle order as the
-            # power-band doctrine used everywhere else in this autopilot —
-            # it takes real error over real time to move the throttle, so
-            # it has room to find and PARK at a steady trim power instead
-            # of bouncing off 0% and 100%. The glideslope fix (matching the
-            # slope to what the plane can fly) already keeps the error
-            # small most of the time; this gain is what lets the throttle
-            # respond to that smallness with a steady value, not a slam.
+            # STEP-AND-CHECK, not a continuous formula (Idriss, 2026-07-11:
+            # "the alt needs to be increased by 0.05, check alt again, if
+            # still below increase again, if not don't, if up decrease").
+            # This replaces the continuous proportional walk entirely. Every
+            # THROTTLE_CHECK_S seconds: look at the altitude error, take ONE
+            # fixed +-THROTTLE_STEP nudge in the direction that helps, then
+            # go quiet and let the airplane's own inertia show the result
+            # BEFORE judging again. This is also why the earlier windup
+            # incident (theta_ref accumulating during a 36 s deficit, then
+            # ballooning +217 ft on the way back — see the Notion audit)
+            # can't happen to the throttle side any more: there is no
+            # accumulator to wind up, just a bounded step taken periodically
+            # off the CURRENT observed error. A small deadband (+-20 ft)
+            # means it holds once close instead of chattering by 0.05 every
+            # cycle forever. Checking THROTTLE_CHECK_S (3 s) apart, not
+            # every tick, gives the engine + aerodynamic response time to
+            # actually show up before the next decision — a tick-by-tick
+            # check would just be re-judging a change that hasn't landed
+            # yet, the same "loop faster than the airplane" mistake that
+            # phugoided cruise earlier today.
+            THROTTLE_STEP = 0.05
+            THROTTLE_CHECK_S = 3.0
+            THROTTLE_DEADBAND_FT = 20.0
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
             if self._gs_thr is None:
                 self._gs_thr = self._prev_throttle
-            drive = alt_err_ft * 0.0008
-            self._gs_thr += drive * dt
-            self._gs_thr = max(0.0, min(1.0, self._gs_thr))
+                self._gs_thr_wait = 0.0
+            self._gs_thr_wait += dt
+            if self._gs_thr_wait >= THROTTLE_CHECK_S:
+                self._gs_thr_wait = 0.0
+                if alt_err_ft > THROTTLE_DEADBAND_FT:
+                    self._gs_thr = min(1.0, self._gs_thr + THROTTLE_STEP)
+                elif alt_err_ft < -THROTTLE_DEADBAND_FT:
+                    self._gs_thr = max(0.0, self._gs_thr - THROTTLE_STEP)
+                # else: within the deadband — hold, no step.
             throttle_cmd = self._gs_thr
 
             # PITCH: unchanged — the damped attitude-trim that killed the
@@ -244,37 +266,55 @@ class TECSController(Controller):
             pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
         pitch_cmd = _clamp(pitch_cmd, 1.0)
 
-        # ── YAW (ribbon-driven yaw-hold), SPEED-SCALED ───────────────────
-        # (Idriss, 2026-07-11.) The rudder is an aerodynamic surface — the
+        # ── YAW (ribbon-driven yaw-hold): STEP-AND-CHECK, SPEED-SCALED ───
+        # (Idriss, 2026-07-11.) Same philosophy as the throttle loop above —
+        # a fixed nudge, then wait and observe, rather than a continuous
+        # formula reacting every tick — but with YAW's own, much faster
+        # physics: the nose starts responding to rudder within about a
+        # second, nothing like altitude's multi-second lag, so this checks
+        # far more often than the throttle loop (YAW_CHECK_S vs
+        # THROTTLE_CHECK_S) — same structure, different timing, because the
+        # two controls are not the same speed of animal.
+        #
+        # Still speed-scaled: the rudder is an aerodynamic surface — the
         # SAME deflection produces LESS actual turning force as airspeed
-        # drops (dynamic pressure falls with V^2). The old law used one
-        # fixed gain across the WHOLE yaw_hold speed range (TAKEOFF_ROLL:
-        # 0->~105kt; ROLLOUT: touchdown ~85-108kt down to a stop) with no
+        # drops (dynamic pressure falls with V^2), and the old law used one
+        # fixed step across the WHOLE yaw_hold speed range (TAKEOFF_ROLL
+        # 0->~105kt; ROLLOUT touchdown ~85-108kt down to a stop) with no
         # awareness of that. X-Plane holds whatever we send (a persistent
         # DataRef write, not a pulse) — the bottleneck was never "can we
         # hold it," it was that we never asked for MORE as authority
-        # weakened. Scale by (V/Vref)^2, same pattern as attitude.py's
-        # pitch/roll axes: floored/capped so it can't blow up near a stop
-        # or get suppressed to nothing at speed.
-        YAW_REF_KTS = 60.0     # mid-range of the takeoff-roll/rollout envelope
+        # weakened. The step itself (not a continuous gain now) is scaled
+        # by (V/Vref)^2, same pattern as attitude.py's pitch/roll axes:
+        # floored/capped so it can't blow up near a stop or get suppressed
+        # to nothing at speed.
+        YAW_REF_KTS = 60.0      # mid-range of the takeoff-roll/rollout envelope
+        YAW_STEP = 0.05
+        YAW_CHECK_S = 0.75
+        YAW_DEADBAND_DEG = 2.0
         yaw_cmd = 0.0
         if targets.yaw_hold:
-            yaw_kp = targets.yaw_kp if targets.yaw_kp is not None else 0.02
             yaw_limit = targets.yaw_limit if targets.yaw_limit is not None else 0.5
-            if self._prev_hdg_deg is None or dt <= 0:
-                hdg_rate = 0.0
-            else:
-                hdg_rate = _wrap_deg(telemetry.heading_deg - self._prev_hdg_deg) / dt
             self._prev_hdg_deg = telemetry.heading_deg
             gs = (telemetry.groundspeed_kts
                   if not math.isnan(telemetry.groundspeed_kts) and telemetry.groundspeed_kts > 0
                   else telemetry.airspeed_kts)
             gs = gs if not math.isnan(gs) else YAW_REF_KTS
             q_ratio = max(0.35, min(2.5, (max(gs, 15.0) / YAW_REF_KTS) ** 2))
-            yaw_cmd = _clamp((yaw_kp * hdg_error - 0.008 * hdg_rate) / q_ratio,
-                             yaw_limit)
+            self._yaw_wait += dt
+            if self._yaw_wait >= YAW_CHECK_S:
+                self._yaw_wait = 0.0
+                step = YAW_STEP / q_ratio   # bigger nudge at low speed, smaller at high
+                if hdg_error > YAW_DEADBAND_DEG:
+                    self._yaw_cmd_held = min(yaw_limit, self._yaw_cmd_held + step)
+                elif hdg_error < -YAW_DEADBAND_DEG:
+                    self._yaw_cmd_held = max(-yaw_limit, self._yaw_cmd_held - step)
+                # else: within the deadband — hold, no step.
+            yaw_cmd = _clamp(self._yaw_cmd_held, yaw_limit)
         else:
             self._prev_hdg_deg = telemetry.heading_deg
+            self._yaw_cmd_held = 0.0
+            self._yaw_wait = 0.0
 
         brake_ratio = max(0.0, min(1.0, targets.brake_ratio
                                    if targets.brake_ratio is not None else 0.0))
