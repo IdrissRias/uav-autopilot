@@ -1,12 +1,16 @@
-"""Low-and-slow is the corner of the energy matrix where throttle is
-the ONLY fix. Flight 20260706_135230 mushed 113 → 68 kts at idle
-because the plane was above the slope and the alt-priority law refused
-power. These tests pin the three guards that prevent it:
+"""Power is an ALTITUDE servo, nothing else (Idriss doctrine, 2026-07-11).
 
-  1. stall floor forces throttle when LOW and slow (high-and-slow is
-     a pitch-down problem — altitude has authority)
-  2. pitch never dives for speed while at/below target altitude
-  3. above the slope the commanded sink rate steepens (VS convergence)
+  - ABOVE the commanded line → power is 0, always. A slow airplane up
+    there is sinking, and sinking toward the path is the goal — there is
+    nothing to rescue. There is no stall FLOOR and no power JUMP: the old
+    deficit-scaled slam WAS the abrupt surge on final we chased out.
+  - BELOW the line → power walks up gradually, in proportion to the sag.
+    A low-and-slow airplane sinks below the line and the walk answers,
+    bit by bit — never a step, never a fixed setpoint.
+  - Explicit idle (FLARE/ROLLOUT) is absolute; nothing adds power back.
+
+Plus: pitch never dives for speed while at/below target altitude, and
+above the slope the commanded sink rate steepens (VS convergence).
 """
 from __future__ import annotations
 
@@ -27,67 +31,65 @@ def _ctl():
 
 
 class TestStallFloor(unittest.TestCase):
-    def test_power_forced_when_low_and_slow(self):
-        # The one corner where throttle is the ONLY fix: at/below the
-        # target line with speed collapsing.
+    def test_power_walks_up_when_below_line(self):
+        # BELOW the commanded line: power comes up gradually, in
+        # proportion to the sag — bit by bit, never a step.
         ctl = _ctl()
-        tg = Targets(heading_deg=90.0, altitude_ft=2400.0, airspeed_kts=106.0,
-                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
-                     stall_floor_kts=98.4)
-        t = Telemetry(airspeed_kts=88.0, altitude_ft=2380.0, pitch_deg=5.0,
+        ctl._prev_throttle = 0.20
+        ctl._thr_walk = 0.20
+        tg = Targets(heading_deg=90.0, altitude_ft=2600.0, airspeed_kts=106.0,
+                     throttle=None, stall_floor_kts=98.4)
+        t = Telemetry(airspeed_kts=88.0, altitude_ft=2200.0, pitch_deg=5.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
-                      vs_fpm=200.0, agl_m=350.0)
-        # New doctrine: URGENT but never ABRUPT — power RAMPS in fast
-        # (deficit-scaled), with no single-tick step. Tick 3 s of loop.
+                      vs_fpm=-400.0, agl_m=350.0)  # 400 ft below the line
         prev = None
         for _ in range(60):
             act = ctl.compute(t, tg, 0.05)
             if prev is not None:
-                self.assertLess(act.throttle - prev, 0.12,
-                                "No step inputs in the delicate phase.")
+                self.assertGreaterEqual(act.throttle, prev - 1e-9,
+                                        "Below the line, power only rises.")
+                self.assertLess(act.throttle - prev, 0.06,
+                                "Gradual — no step inputs, ever.")
             prev = act.throttle
-        self.assertGreaterEqual(
-            act.throttle, 0.85,
-            "10+ kts below the floor → near-full power within ~3 s."
-        )
+        self.assertGreater(act.throttle, 0.30,
+                           "3 s below the line → power has walked up.")
 
     def test_no_power_when_slow_but_high(self):
-        # HIGH and slow is a split problem: pitch down, never power.
-        # Flight e9398f14 surged 0.77 throttle at 160 AGL above the
-        # slope — energy INTO a plane trying to land.
+        # ABOVE the line, slow is not a danger — it is a sink toward the
+        # path, which is the goal. Power → idle regardless of speed.
         ctl = _ctl()
+        ctl._prev_throttle = 0.45
+        ctl._thr_walk = 0.45
         tg = Targets(heading_deg=90.0, altitude_ft=2000.0, airspeed_kts=106.0,
-                     throttle=None, throttle_for_alt=True, throttle_base=0.12,
-                     stall_floor_kts=98.4)
+                     throttle=None, stall_floor_kts=98.4)
         t = Telemetry(airspeed_kts=90.0, altitude_ft=2400.0, pitch_deg=5.0,
                       roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
-                      vs_fpm=-300.0, agl_m=350.0)  # 1150 ft AGL: doctrine holds
-        act = ctl.compute(t, tg, 0.05)
-        self.assertLess(act.throttle, 0.2,
-                        "400 ft above target: the nose owns the recovery.")
-
-    def test_short_final_slow_gets_power_even_when_high(self):
-        # Below 600 ft AGL, airspeed IS the flare: at 70 kts full flaps
-        # the elevator stalls out and no amount of nose-down fixes the
-        # arrival (flight 946a68cb bounced from exactly this).
-        ctl = _ctl()
-        tg = Targets(heading_deg=90.0, altitude_ft=1500.0, airspeed_kts=103.0,
-                     throttle=None, throttle_for_alt=True, throttle_base=0.30,
-                     stall_floor_kts=98.4)
-        t = Telemetry(airspeed_kts=72.0, altitude_ft=1750.0, pitch_deg=3.0,
-                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
-                      vs_fpm=-800.0, agl_m=120.0)  # ~400 ft AGL, above slope
-        prev = None
+                      vs_fpm=-300.0, agl_m=350.0)  # 400 ft above target
         for _ in range(60):
             act = ctl.compute(t, tg, 0.05)
-            if prev is not None:
-                self.assertLess(act.throttle - prev, 0.12)
-            prev = act.throttle
-        self.assertGreaterEqual(act.throttle, 0.85,
-                                "Short final + slow → power (ramped), slope or not.")
+        self.assertLess(act.throttle, 0.05,
+                        "400 ft above target: power is zero, let it sink.")
 
-    def test_floor_overrides_explicit_idle(self):
-        # DECELERATE commands idle explicitly; the floor still wins.
+    def test_no_power_when_high_even_stalling_on_short_final(self):
+        # The corrected doctrine (Idriss, 2026-07-11): being near the
+        # ground does NOT buy power when we are ABOVE the line. A stall
+        # up here means we are going down — exactly what we want.
+        ctl = _ctl()
+        ctl._prev_throttle = 0.40
+        ctl._thr_walk = 0.40
+        tg = Targets(heading_deg=90.0, altitude_ft=1500.0, airspeed_kts=103.0,
+                     throttle=None, stall_floor_kts=98.4)
+        t = Telemetry(airspeed_kts=72.0, altitude_ft=1750.0, pitch_deg=3.0,
+                      roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                      vs_fpm=-800.0, agl_m=120.0)  # ~400 ft AGL, above line
+        for _ in range(60):
+            act = ctl.compute(t, tg, 0.05)
+        self.assertLess(act.throttle, 0.05,
+                        "Above the line, short final or not: no rescue power.")
+
+    def test_explicit_idle_is_absolute(self):
+        # DECELERATE/FLARE command idle explicitly; nothing overrides it
+        # anymore — the floor that used to is gone.
         ctl = _ctl()
         tg = Targets(heading_deg=90.0, altitude_ft=5700.0, airspeed_kts=133.0,
                      throttle=0.0, stall_floor_kts=98.4)
@@ -96,8 +98,8 @@ class TestStallFloor(unittest.TestCase):
                       vs_fpm=0.0, agl_m=1300.0)
         for _ in range(60):
             act = ctl.compute(t, tg, 0.05)
-        self.assertGreaterEqual(act.throttle, 0.7,
-                                "Floor overpowers explicit idle within ~3 s.")
+        self.assertEqual(act.throttle, 0.0,
+                         "Explicit idle stays idle, slow or not.")
 
     def test_no_floor_during_flare(self):
         # FLARE has stall_floor_kts=None — slow there is by design.

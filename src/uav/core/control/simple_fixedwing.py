@@ -162,7 +162,6 @@ class SimpleFixedWingController(Controller):
         # Stall-floor boost: a persistent, RAMPED emergency power term.
         # Builds while the floor condition holds, releases smoothly when
         # it clears — urgent, never a step.
-        self._stall_boost = 0.0
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         hdg_error = _wrap_deg(targets.heading_deg - telemetry.heading_deg)
@@ -434,34 +433,26 @@ class SimpleFixedWingController(Controller):
                     self._thr_walk = min(1.0, self._thr_walk + 0.08)
                 self._ff_gear_prev = bool(targets.gear_down)
             if targets.airspeed_kts is not None:
-                # Power for landing speed — but NEVER feed a balloon. At
-                # low speed with full flaps, surplus power converts to
-                # CLIMB, not airspeed (observed: full power at 95 kt
-                # ballooned +858 ft above the slope while the speed stayed
-                # low, which kept the power pinned — a trap). If the plane
-                # is climbing above its commanded path, back the walk off
-                # in proportion; the deficit is altitude to be traded
-                # down, not power to be added.
-                vs_ref = (targets.vs_target_fpm
-                          if targets.vs_target_fpm is not None else 0.0)
-                vs_now = (telemetry.vs_fpm
-                          if not math.isnan(telemetry.vs_fpm) else vs_ref)
-                balloon = max(0.0, vs_now - vs_ref)
-                drive = spd_error * 0.004 - balloon * 0.00008
-                # POSITION gate, not just the rate gate above. The balloon
-                # term only catches an ACTIVE climb; a plane parked 400 ft
-                # high and slow isn't climbing, yet the speed-hungry drive
-                # still pours power in — which becomes altitude, holds it
-                # high, and keeps the power pinned (flight 20260711_004213:
-                # 0.76-1.00 throttle held the WHOLE approach while +200 to
-                # +600 ft above the slope at 95 kt). Above the commanded
-                # line, a speed deficit is spare altitude to trade DOWN with
-                # the nose, never power to add: let the walk fall, never
-                # rise. Power returns the instant we're back on/below the
-                # path (gate releases) — the same threshold the stall floor
-                # below arms at, so low-and-slow is still caught.
-                if alt_error < -50.0:
-                    drive = min(drive, 0.0)
+                # Power follows ALTITUDE, never speed. (Idriss, 2026-07-11.)
+                # Above the commanded line, power is zero — always, no
+                # exceptions. A slow airplane up here is SINKING, and
+                # sinking toward the path is the goal, not a danger: let it
+                # come down and trade the height back into speed. Below the
+                # line, walk power up bit by bit, in proportion to how far
+                # below we are — never a step, no fixed setpoint. A slow,
+                # sinking airplane drops below the line and THIS is what
+                # arrests it, gently and self-scaling. Speed is the nose's
+                # job, not the engine's. (This replaced a speed-error walk +
+                # stall floor that pinned 0.76-1.00 power the whole approach
+                # while parked 200-600 ft high and slow — 20260711_004213.)
+                if alt_error < 0.0:
+                    # ABOVE: firm walk to idle. Slew-limited below so it's
+                    # smooth; pulling power OFF is never the dangerous way.
+                    drive = alt_error * 0.008
+                else:
+                    # BELOW: gradual add. Climb (thousands low) pegs power
+                    # to hold the climb; a shallow sag on final trims gently.
+                    drive = alt_error * 0.00015
             else:
                 vs_now = (telemetry.vs_fpm
                           if not math.isnan(telemetry.vs_fpm) else 0.0)
@@ -484,69 +475,25 @@ class SimpleFixedWingController(Controller):
             throttle_cmd = max(self._prev_throttle - max_step,
                                min(self._prev_throttle + max_step, throttle_cmd))
 
-        # Commander-issued throttle ceiling (cruise gentle-accel). Applied
-        # AFTER the slew so the cap is hard; the stall floor below still
-        # overrides for genuine low-and-slow danger.
+        # Commander-issued throttle ceiling (unused now — None everywhere;
+        # kept as a hard-cap hook). Applied after the slew.
         if targets.throttle_max is not None:
             throttle_cmd = min(throttle_cmd, targets.throttle_max)
 
-        # ── STALL FLOOR — LOW and slow only ──────────────────────────
-        # Low and slow is the one corner of the energy matrix where
-        # throttle is the ONLY fix (flight 20260706_135230 mushed to
-        # 68 kts at idle). But HIGH and slow is a SPLIT problem, not a
-        # total-energy problem: the fix is pitch DOWN (trade the spare
-        # altitude for the missing speed — free), never power. Flight
-        # e9398f14 surged to 0.77 throttle at 160 AGL while ABOVE the
-        # slope because this floor was altitude-blind — pumping energy
-        # into a plane trying to land. Gate: only force power when at
-        # or below the target line (alt_error ≥ −50 ft). Above it, the
-        # nose owns the recovery. No slew when it fires: stall recovery
-        # is the one case where the engine IS a switch.
-        # The alt-gate (only power when at/below the line) holds EXCEPT
-        # on short final: below 600 ft AGL, slow gets power regardless
-        # of the slope. Flight 946a68cb flew final at 70 kts because it
-        # was above the line — at that speed with full flaps the
-        # elevator ran out of authority (stick pinned +0.25, nose still
-        # falling), the plane dove to -1300 fpm, the commit gate rightly
-        # refused, and it bounced. Near the ground, airspeed IS the
-        # flare; the doctrine yields to physics there.
-        low_final = (not math.isnan(telemetry.agl_m)
-                     and telemetry.agl_m * 3.28084 < 600.0)
-        if (targets.stall_floor_kts is not None
-                and not math.isnan(telemetry.airspeed_kts)
-                and telemetry.airspeed_kts < targets.stall_floor_kts
-                and (alt_error >= -50.0 or low_final)):
-            # URGENT but not ABRUPT. The old law stepped the throttle to
-            # deficit×0.1 instantly (7 kt low → 70% slam) — and on short
-            # final that slam pitched the nose up and BALLOONED the plane
-            # (flight 234919: +858 ft above the slope at full power). The
-            # floor sits ~20 kt above the true full-flap stall, so there
-            # is time to bring power in fast-but-continuously: a
-            # deficit-scaled RAMP (~8x the normal walk rate) instead of a
-            # step. The most delicate phase gets no step inputs, ever —
-            # the emergency just walks faster.
-            deficit_kts = targets.stall_floor_kts - telemetry.airspeed_kts
-            self._stall_boost = min(
-                1.0, self._stall_boost + deficit_kts * 0.03 * dt)
-        else:
-            # Danger cleared: release the boost smoothly (no chop).
-            self._stall_boost = max(0.0, self._stall_boost - 0.3 * dt)
-        # The boost exists ONLY while a stall floor is armed. FLARE and
-        # ROLLOUT carry stall_floor_kts=None — slow there is by design
-        # and throttle=idle is a commander order. The smooth release
-        # leaked ~0.97 of emergency power INTO the flare and the plane
-        # hit the runway with the engine pushing (flight 73da8c44).
-        # Crossing into a floorless phase kills the boost outright.
-        if targets.stall_floor_kts is None:
-            self._stall_boost = 0.0
-        # Slew reference stays PRE-boost: otherwise the boost leaks into
-        # prev and the slew chases the boosted value while the boost adds
-        # again — compounding growth (0.13/tick observed in test). The
-        # boost is a clean additive term on top of the walked command.
+        # ── No stall FLOOR, no power JUMP ────────────────────────────
+        # (Idriss, 2026-07-11.) A stall is the airplane sinking. When we
+        # are ABOVE the path, sinking is exactly what we want — so there
+        # is nothing to protect against up there; the altitude walk has
+        # already pulled power to idle. When we are BELOW the path the
+        # same walk is already bringing power up, gradually and in
+        # proportion to the sag: a low-and-slow airplane sinks further
+        # below the line and the walk answers with more power, bit by
+        # bit. No deficit-scaled slam, no fixed floor to jump to — the
+        # old jump-to-full WAS the abrupt power surge on final we spent a
+        # week chasing out. FLARE/ROLLOUT (throttle=0 explicit) are
+        # untouched: nothing can add power back.
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
         self._prev_throttle = throttle_cmd
-        if self._stall_boost > 0.0:
-            throttle_cmd = min(1.0, throttle_cmd + self._stall_boost)
 
         # ── Yaw (ribbon-driven yaw-hold only; no standalone yaw PID) ─
         yaw_cmd = 0.0
