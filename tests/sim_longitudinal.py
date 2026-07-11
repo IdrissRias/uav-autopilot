@@ -27,16 +27,23 @@ class KingAir:
     """Point-mass longitudinal model. State: h, V, gamma (flight-path angle),
     theta (pitch attitude), q (pitch rate). Controls: throttle 0..1, elevator."""
 
-    # Airframe constants (King Air C90-ish), tuned so cruise ~90 m/s at ~0.45
-    # throttle and full power climbs ~10 m/s.
-    m = 4500.0          # kg
-    S = 27.0            # m^2 wing area
+    # Airframe constants — ANCHORED to the real X-Plane C90B.acf:
+    #   mass 10,100 lb MTOW (use ~9,500 lb typical), wing 279 ft², 2×550 shp,
+    #   Vs 100 / Vso 90 kt. Drag polar calibrated so cruise ~90 m/s (175 kt)
+    #   sits near half power and full power climbs ~2000 fpm — matches the
+    #   real aircraft. Final trim comes from actual flight telemetry.
+    m = 4310.0          # kg (~9,500 lb flight weight)
+    S = 25.9            # m^2 (279 ft² published wing area)
     rho = 1.05          # kg/m^3 (few-thousand-ft density)
     CD0 = 0.028         # parasite drag
-    k = 0.045           # induced drag factor
+    k = 0.050           # induced drag factor
     CL_alpha = 5.5      # per rad
-    CL0 = 0.20          # lift at zero alpha
-    T_max = 11000.0     # N at full throttle
+    CL0 = 0.25          # lift at zero alpha
+    # Turboprop thrust ≈ shaft-power / speed (NOT constant): strong at low
+    # speed (climb), tapering with speed. Capped at a static-thrust limit.
+    P_max = 820000.0    # W (2 × 550 shp)
+    eta_prop = 0.80     # propeller efficiency
+    T_static = 16000.0  # N low-speed static-thrust cap
     # Pitch dynamics: elevator → pitch angular accel, damped.
     elev_power = 6.0    # rad/s^2 per unit elevator at ref q-bar
     q_damp = 2.2        # pitch-rate damping (1/s)
@@ -58,7 +65,9 @@ class KingAir:
         CD = self.CD0 + self.k * CL * CL
         L = qbar * self.S * CL
         D = qbar * self.S * CD
-        T = throttle * self.T_max
+        # Turboprop: thrust = power/speed, capped at static thrust.
+        T = min(self.T_static,
+                throttle * self.P_max * self.eta_prop / max(self.V, 25.0))
 
         # Translational dynamics
         Vdot = (T - D) / self.m - g * math.sin(self.gamma)

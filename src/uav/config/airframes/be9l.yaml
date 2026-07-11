@@ -4,16 +4,24 @@ type: "twin_turboprop"
 
 # FALLBACK values only — used if the database is unreachable. In normal
 # operation all speeds come from the DB via load_aircraft() and are
-# refined by the observer flight by flight. Published book numbers.
+# refined by the observer flight by flight.
+#
+# CORRECTED to the real X-Plane C90B.acf (2026-07-11): the sim's King Air
+# stalls at Vs 100 clean / Vso 90 (flaps), NOT the 80 we had — so the old
+# v_approach 110 / v_land 100 were flirting with the real stall, and when
+# speed bled to the 80s on final the plane was genuinely stalled (the
+# mushing crashes). Margins now referenced to Vso 90. acf also gives:
+# Vfe 150 (flaps), Vle 185 (gear), Vno 169, Vne 226. Note v_cruise 175 sits
+# just above Vno 169 (smooth-air only) — flagged, left for now.
 speeds_kts:
-  v_stall: 80
-  v_rotate: 100
-  v_takeoff: 100
-  v_climb: 120
-  v_cruise: 175
-  v_approach: 110
-  v_land: 100
-  v_never_exceed: 226
+  v_stall: 90          # acf Vso (landing-config stall); Vs clean = 100
+  v_rotate: 110
+  v_takeoff: 105
+  v_climb: 130
+  v_cruise: 175        # above Vno 169 — reduce to ~165 if we want margin
+  v_approach: 120      # 1.33 × Vso — real margin above the 90-kt stall
+  v_land: 108          # 1.2 × Vso
+  v_never_exceed: 226  # acf Vne (matches)
 
 rates_fpm:
   climb: 2000
