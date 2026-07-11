@@ -817,11 +817,15 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
         # ── 4. CLIMB_CLEAN ───────────────────────────────────────────
         # Flaps retracted, turn toward the join point (where we meet the
         # extended runway centerline at a 30° intercept).  Pitch still
-        # capped.  roll_limit kept shallow (0.25 ≈ ~15° bank) because
-        # CLIMB_CLEAN begins at 300 AGL — a tight aim_at turn at
-        # saturation (flight 20260419_145024 drove R to -1.0 at ~500 AGL
-        # and hit terrain). Advance when we reach cruise altitude — next
-        # keyframe (TRANSITION) handles speed accel at cruise alt.
+        # capped.  roll_limit WIDENED 0.25->0.667 (~15°->60° bank), Idriss,
+        # 2026-07-11: explicit, informed override — the 0.25 cap traces to
+        # flight 20260419_145024 (tight aim_at turn at saturation drove R to
+        # -1.0 at ~500 AGL, hit terrain). Owner's call: the plane needs
+        # authority to roll itself OUT of a big unwanted bank, and a low
+        # roll_limit was judged too restrictive for that. Flagged, heard,
+        # deliberate; owner will revert if this next flight shows it's wrong.
+        # Advance when we reach cruise altitude — next keyframe (TRANSITION)
+        # handles speed accel at cruise alt.
         Keyframe(
             name="CLIMB_CLEAN", phase="CLIMB",
             # Closed-loop climb power (user doctrine: nothing pinned). The
@@ -833,7 +837,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
-            roll_limit=0.25,
+            roll_limit=0.667,
             pitch_limit=0.20,
             trigger=Trigger("alt_reached", value=g.cruise_alt_ft),
         ),
@@ -869,7 +873,12 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
-            roll_limit=0.25,
+            # roll_limit widened 0.25->0.667 (~15°->60° bank), Idriss,
+            # 2026-07-11: same explicit override as CLIMB_CLEAN — recovery
+            # authority from a big unwanted bank matters more here than the
+            # shallow-turn caution. No documented crash tied to this
+            # specific value (unlike CLIMB_CLEAN/CRUISE below).
+            roll_limit=0.667,
             # Pitch_down widened from 0.08 → 0.40. The previous 0.08 cap
             # meant when the plane was over-altitude (e.g. CLIMB
             # overshoot, classic decoupled-PID failure where speed PID
@@ -903,9 +912,14 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=cruise_aim_lat, aim_lon=cruise_aim_lon,
             gear_down=False, flap_ratio=0.0,
-            # Bank ≤ ~31° during intercept turn (observed 60° in flight
-            # 135940 caused 2g at cruise speed). Pitch ≤ ~14° nose-up cap.
-            roll_limit=0.35, pitch_limit=0.15,
+            # roll_limit widened 0.35->0.667 (~31°->60° bank), Idriss,
+            # 2026-07-11: EXPLICIT override of the 135940 incident this cap
+            # was built to prevent (60° bank at cruise speed caused 2g) —
+            # owner has heard this history and wants recovery authority
+            # from a big unwanted bank prioritized over that margin. Flagged
+            # directly before making this change; owner will revert if the
+            # next flight shows it's wrong. Pitch ≤ ~14° nose-up cap.
+            roll_limit=0.667, pitch_limit=0.15,
             trigger=Trigger("near_point", value=1.0,
                            lat=cruise_aim_lat, lon=cruise_aim_lon),
         ),
