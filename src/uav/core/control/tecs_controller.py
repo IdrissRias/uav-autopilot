@@ -57,6 +57,11 @@ class TECSController(Controller):
         # than my sim modelled. This loop flew every takeoff today.
         self._prev_pitch_deg: float | None = None
         self._pitch_rate_filt = 0.0
+        # Elevator trim-hold ("never let go") — a persistent held elevator
+        # deflection used ONLY on the glideslope, so the surface parks at the
+        # value that maintains the demanded attitude instead of relaxing to
+        # neutral when the error hits zero. Seeded/reset on glideslope exit.
+        self._elev_trim = 0.0
         # glideslope-split state (pitch=slope, throttle=speed); re-seeded on entry
         self._gs_theta_ref: float | None = None
         self._gs_vs_filt = 0.0
@@ -111,12 +116,14 @@ class TECSController(Controller):
 
         pitch_dmd_deg = 0.0
         throttle_self_limited = False  # True = the branch below already rate-limited itself
+        pitch_trim_hold = False        # True = use the held-elevator PI (glideslope only)
         # Clear glideslope trim state whenever we're not on the slope, so it
         # re-seeds cleanly the next approach.
         if not getattr(targets, "on_glideslope", False):
             self._gs_theta_ref = None
             self._gs_thr = None
             self._gs_thr_wait = 0.0
+            self._elev_trim = 0.0
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
             # FLARE: idle power (explicit), and hold ONE steady nose-up flare
@@ -169,10 +176,10 @@ class TECSController(Controller):
             # ballooning +217 ft on the way back — see the Notion audit)
             # can't happen to the throttle side any more: there is no
             # accumulator to wind up, just a bounded step taken periodically
-            # off the CURRENT observed error. A small deadband (+-20 ft)
-            # means it holds once close instead of chattering by 0.05 every
-            # cycle forever. Checking THROTTLE_CHECK_S (3 s) apart, not
-            # every tick, gives the engine + aerodynamic response time to
+            # off the CURRENT observed error. A small deadband (the 5 ft
+            # noise floor set below) means it holds once close instead of
+            # chattering every cycle. Checking THROTTLE_CHECK_S (1 s) apart,
+            # not every tick, gives the engine + aerodynamic response time to
             # actually show up before the next decision — a tick-by-tick
             # check would just be re-judging a change that hasn't landed
             # yet, the same "loop faster than the airplane" mistake that
@@ -191,16 +198,24 @@ class TECSController(Controller):
             # keeps this immune to the theta_ref-style windup that caused
             # the earlier +217 ft balloon: there is no accumulator, just a
             # bounded step taken periodically off what's true right now.
+            # Tier bands widened (Idriss, 2026-07-11): within 500 ft -> 0.01,
+            # within 1000 ft -> 0.05, within 2000 ft (and beyond) -> 0.2.
+            # (0.05 for the 1000 ft band, NOT 0.5 as first written — 0.5 would
+            # move half the throttle in one second, the slam that has crashed
+            # us; monotonic so a bigger miss gets a bigger nudge.) The throttle
+            # is a HOLD: even ON target it MAINTAINS its parked value and never
+            # returns to a default — see the deadband branch below, which holds
+            # rather than resetting.
             THROTTLE_CHECK_S = 1.0
             THROTTLE_DEADBAND_FT = 5.0   # noise floor only, not a "close enough" zone
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
             abs_err = abs(alt_err_ft)
-            if abs_err <= 100.0:
+            if abs_err <= 500.0:
                 THROTTLE_STEP = 0.01
-            elif abs_err <= 500.0:
+            elif abs_err <= 1000.0:
                 THROTTLE_STEP = 0.05
-            else:   # <=1000 ft and beyond — no band defined past 1000, so
-                THROTTLE_STEP = 0.2   # hold at the outermost step rather than leave it undefined
+            else:   # 2000 ft band and beyond — hold at the outermost step
+                THROTTLE_STEP = 0.2
             if self._gs_thr is None:
                 self._gs_thr = self._prev_throttle
                 self._gs_thr_wait = 0.0
@@ -232,6 +247,22 @@ class TECSController(Controller):
             self._gs_vs_filt += min(1.0, dt / 0.6) * (vs_now - self._gs_vs_filt)
             vs_ref = (targets.vs_target_fpm
                       if targets.vs_target_fpm is not None else -500.0)
+            # ── AGL SINK FLOOR — "regard for the ground" (Idriss, 2026-07-11:
+            # "it just plummeted down and crashed, no regard to the ground").
+            # Independent of the glideslope geometry and of any wound-up
+            # demand: the lower we are, the less sink we allow. Cap =
+            # -(AGL_ft * 8) fpm, never tighter than 100 fpm. A normal ~750 fpm
+            # approach is unaffected above ~95 ft; below that the cap arrests
+            # the sink into the flare. Deliberately steeper than the height
+            # itself demands so it bounds ACTUAL sink (the airframe lags the
+            # demand), so a bad target altitude or a runaway pitch demand can
+            # NEVER dive the aircraft into the terrain — something always
+            # watches true height. NaN AGL -> fail open to geometry.
+            agl_ft = (telemetry.agl_m * 3.28084
+                      if not math.isnan(telemetry.agl_m) else float('nan'))
+            if not math.isnan(agl_ft):
+                vs_floor_fpm = -max(100.0, agl_ft * 8.0)
+                vs_ref = max(vs_ref, vs_floor_fpm)   # vs is negative going down
             vs_err = vs_ref - self._gs_vs_filt
             # Trim gain halved (0.0018 -> 0.0008) alongside the flight_engine
             # conv_gain cut — the trim was winding up past what the
@@ -242,6 +273,7 @@ class TECSController(Controller):
             self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
             pitch_dmd_deg = max(-10.0, min(8.0,
                                 self._gs_theta_ref + vs_err * 0.00035))
+            pitch_trim_hold = True   # elevator HOLDS its trim on the slope
             self.tecs.reset()
 
         elif targets.airspeed_kts is not None and targets.altitude_ft is not None:
@@ -288,7 +320,30 @@ class TECSController(Controller):
             raw = (pdeg - self._prev_pitch_deg) / dt
             self._pitch_rate_filt = 0.5 * raw + 0.5 * self._pitch_rate_filt
         self._prev_pitch_deg = pdeg
-        pitch_cmd = 0.05 * (pitch_dmd_deg - pdeg) - 0.055 * self._pitch_rate_filt
+        p_d = 0.05 * (pitch_dmd_deg - pdeg) - 0.055 * self._pitch_rate_filt
+        if pitch_trim_hold:
+            # NEVER LET GO (Idriss, 2026-07-11): on the glideslope the elevator
+            # HOLDS a trim instead of relaxing to neutral when the attitude
+            # error reaches zero. The trim integral parks the surface at the
+            # deflection that MAINTAINS the demanded attitude; the P+D terms
+            # just correct around it. Slow gain + a bound + anti-windup (stop
+            # integrating while the command is already pinned at a limit) so
+            # the hold can't wind past the surface authority and balloon —
+            # the exact failure that a naive hold would reintroduce.
+            ELEV_TRIM_GAIN = 0.02
+            ELEV_TRIM_LIMIT = 0.25
+            err = pitch_dmd_deg - pdeg
+            provisional = self._elev_trim + p_d
+            up_cap = targets.pitch_limit is not None and provisional >= abs(targets.pitch_limit)
+            dn_cap = (targets.pitch_down_limit is not None
+                      and provisional <= -abs(targets.pitch_down_limit))
+            if not ((err > 0 and up_cap) or (err < 0 and dn_cap)):
+                self._elev_trim += ELEV_TRIM_GAIN * err * dt
+                self._elev_trim = max(-ELEV_TRIM_LIMIT,
+                                      min(ELEV_TRIM_LIMIT, self._elev_trim))
+            pitch_cmd = self._elev_trim + p_d
+        else:
+            pitch_cmd = p_d
         # Commander surface clamps (hardware orders).
         if targets.pitch_limit is not None:
             pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
