@@ -592,7 +592,16 @@ class FlightEngine:
             # the plane rounds off into the slope with nothing left to
             # release. Rate is low-passed against altimeter noise.
             off_slope_ft = t.altitude_ft - alt   # + above the line, - below
-            if self._off_slope_prev is not None and ramp_dt > 0:
+            # ramp_dt > 0.01 (not just > 0): two ticks a fraction of a
+            # millisecond apart (rapid successive calls, e.g. in a test)
+            # divide by a near-zero dt and the derivative blows up to a
+            # huge spurious value, which then swamps vs_raw and clamps it
+            # at the +250 ceiling regardless of the real off-slope state
+            # (surfaced as test_vs_target_steepens_when_above_slope going
+            # red after the slope constant shrank and stopped masking it).
+            # Real flight ticks at ~20 Hz (~50 ms) are always well above
+            # this floor, so production behavior is unaffected.
+            if self._off_slope_prev is not None and ramp_dt > 0.01:
                 raw_rate = (off_slope_ft - self._off_slope_prev) / ramp_dt
                 self._off_rate_filt = (0.3 * raw_rate
                                        + 0.7 * self._off_rate_filt)

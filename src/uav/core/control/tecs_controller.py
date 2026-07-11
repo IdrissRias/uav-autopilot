@@ -146,19 +146,27 @@ class TECSController(Controller):
             # the glideslope was permanent — nothing pulled it back onto
             # the path, and it sank into the ground before the runway.
             # "Accurate as fuck on altitude — that's what guarantees a
-            # landing" (Idriss). Above the line → power off, firmly. Below
-            # the line → power returns to climb back onto it. Both
-            # directions are pure altitude error; neither looks at speed.
-            # SAME gain both ways (0.006) — tight, symmetric tracking, not
-            # "firm above, gentle below." The real fix for the short landing
-            # was matching the glideslope angle to what the King Air can
-            # actually fly (see _GLIDE_FT_PER_NM); this symmetric gain is
-            # the safety margin on top, so any transient dip below the line
-            # is corrected with the same urgency as an excursion above it.
+            # landing" (Idriss). Above the line → power eases off. Below
+            # the line → power eases back in. Both directions are pure
+            # altitude error; neither looks at speed.
+            #
+            # SLOW WALK, not a slam (Idriss, again: "don't increase power
+            # by 100% — gradually, slowly, till it stabilises on the glide
+            # path — you're like 100% or nothing"). 0.006 was still hot
+            # enough to saturate to a rail in ~2 s and just sit there
+            # instead of settling at whatever intermediate power actually
+            # holds the path. 0.0008 is the same gentle order as the
+            # power-band doctrine used everywhere else in this autopilot —
+            # it takes real error over real time to move the throttle, so
+            # it has room to find and PARK at a steady trim power instead
+            # of bouncing off 0% and 100%. The glideslope fix (matching the
+            # slope to what the plane can fly) already keeps the error
+            # small most of the time; this gain is what lets the throttle
+            # respond to that smallness with a steady value, not a slam.
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
             if self._gs_thr is None:
                 self._gs_thr = self._prev_throttle
-            drive = alt_err_ft * 0.006
+            drive = alt_err_ft * 0.0008
             self._gs_thr += drive * dt
             self._gs_thr = max(0.0, min(1.0, self._gs_thr))
             throttle_cmd = self._gs_thr
