@@ -176,8 +176,12 @@ class TECSController(Controller):
             # check would just be re-judging a change that hasn't landed
             # yet, the same "loop faster than the airplane" mistake that
             # phugoided cruise earlier today.
-            THROTTLE_STEP = 0.05
-            THROTTLE_CHECK_S = 3.0
+            # Revised finer (Idriss, 2026-07-11): step 0.05->0.01, check
+            # 3.0s->1.0s. Full 0-100% now takes >=100s if a deficit
+            # persisted the whole time (was >=20s) — much gentler, closer
+            # to true idle-trim behaviour than an emergency response.
+            THROTTLE_STEP = 0.01
+            THROTTLE_CHECK_S = 1.0
             THROTTLE_DEADBAND_FT = 20.0
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
             if self._gs_thr is None:
@@ -289,8 +293,14 @@ class TECSController(Controller):
         # floored/capped so it can't blow up near a stop or get suppressed
         # to nothing at speed.
         YAW_REF_KTS = 60.0      # mid-range of the takeoff-roll/rollout envelope
-        YAW_STEP = 0.05
-        YAW_CHECK_S = 0.75
+        # Revised finer (Idriss, 2026-07-11): step 0.05->0.01, check
+        # 0.75s->1.0s (now uniform with the throttle loop's cadence). The
+        # step is still speed-scaled below (/q_ratio), so the EFFECTIVE
+        # step at low speed (0-60kt, where authority is weakest) is closer
+        # to ~0.029 — full rudder range in ~21s at the low-authority end,
+        # far slower (and less needed) at high speed.
+        YAW_STEP = 0.01
+        YAW_CHECK_S = 1.0
         YAW_DEADBAND_DEG = 2.0
         yaw_cmd = 0.0
         if targets.yaw_hold:
