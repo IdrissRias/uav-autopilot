@@ -147,15 +147,18 @@ class TECSController(Controller):
             # the path, and it sank into the ground before the runway.
             # "Accurate as fuck on altitude — that's what guarantees a
             # landing" (Idriss). Above the line → power off, firmly. Below
-            # the line → power returns, gently, to climb back onto it. Both
+            # the line → power returns to climb back onto it. Both
             # directions are pure altitude error; neither looks at speed.
+            # SAME gain both ways (0.006) — tight, symmetric tracking, not
+            # "firm above, gentle below." The real fix for the short landing
+            # was matching the glideslope angle to what the King Air can
+            # actually fly (see _GLIDE_FT_PER_NM); this symmetric gain is
+            # the safety margin on top, so any transient dip below the line
+            # is corrected with the same urgency as an excursion above it.
             alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
             if self._gs_thr is None:
                 self._gs_thr = self._prev_throttle
-            if alt_err_ft < 0.0:
-                drive = alt_err_ft * 0.006    # above the line: firm cut
-            else:
-                drive = alt_err_ft * 0.0020   # below the line: gentle add-back
+            drive = alt_err_ft * 0.006
             self._gs_thr += drive * dt
             self._gs_thr = max(0.0, min(1.0, self._gs_thr))
             throttle_cmd = self._gs_thr

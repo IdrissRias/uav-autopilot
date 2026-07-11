@@ -58,15 +58,18 @@ _RATIO_V_CRUISE = 1.5        # cruise target speed — was 2.0 which produced
 # the airframe's clean-config range and close to the envelope's
 # observed value.
 
-_GLIDE_FT_PER_NM = 1000.0   # ~9.4° glideslope — doubled from 500 ft/nm to
-# halve the descent footprint per user request. The SF50 can dive at this
-# rate cleanly with gear+full flaps deployed (~1700 fpm at 100 kts approach
-# speed). Earlier test of 1000 ft/nm was rejected when the controllers
-# couldn't track it; current build (yesterday's stable PIDs + wide pitch
-# authority) handles the steeper angle fine. Halving the descent length
-# matters most on short flights (9 nm KUBE↔KRPD): old 500 ft/nm spent
-# ~5 nm on descent+approach+decel out of 9 nm total. New 1000 ft/nm cuts
-# the descent portion in half, leaving more of the flight as actual cruise.
+_GLIDE_FT_PER_NM = 500.0    # ~4.7° glideslope. The 1000 ft/nm this replaced
+# was tuned for the SF50 jet ("can dive cleanly with gear+full flaps"), not
+# the King Air we actually fly now — physically unachievable for it at idle.
+# Measured in the calibrated offline sim (tests/sim_longitudinal.py's real
+# C90B mass/wing/thrust model): holding ANY sane nose attitude at idle power,
+# the King Air settles into 450-700 ft/nm depending on speed (453 ft/nm level
+# at 133 kt, up to 701 ft/nm at -6° nose / 195 kt). Commanding 1000 meant the
+# plane could never sink fast enough, floated 300-500 ft above the line for
+# the whole steep segment, then had to dive hard to catch up near the ground
+# and overshot through the line into a short landing (flight 2dc2cef9 —
+# Idriss: "we need to be right on the money in terms of alt"). 500 sits
+# comfortably inside the measured achievable range with margin.
 _FINAL_FT_PER_NM = 450.0    # final-approach slope (~4.2°), APPROACH keyframe
 # only. The 1000 ft/nm descent slope is fine up high but produces ~1700 fpm
 # of sink at flare height — no flare law can arrest that in the ~1 s
