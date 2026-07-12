@@ -11,6 +11,7 @@ from uav.scoring.flight_scorer import FlightScorer
 from uav.scoring.accuracy_tracker import AccuracyTracker
 from uav.learning.flight_observer import FlightObserver
 from uav.sim.adapter_base import SimAdapter
+from uav.comms import local_feed
 from uav.sim.types import Actuators, Telemetry
 from uav.comms import broadcast
 from uav.nav.runway_detect import detect_runway, RunwayDetection
@@ -575,6 +576,13 @@ class Autopilot:
             }
 
         broadcast.publish_telemetry(data)
+
+        # Local UDP target feed for the local dashboard (no cloud). Fire-and-forget.
+        if targets is not None:
+            local_feed.publish_targets(
+                getattr(targets, "altitude_ft", None),
+                getattr(targets, "airspeed_kts", None),
+                phase)
 
     def _build_and_broadcast_plan(self, telemetry, ctx, dest, ground_msl_ft, initial_target, dist_nm) -> None:
         """Build flight plan (V2 ribbon or V1 waypoints), create scorer, observer, flight record."""
