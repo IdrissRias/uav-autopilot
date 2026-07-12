@@ -59,15 +59,23 @@ BAND_TAPER_SLOPE = 0.5      # ft of band per ft of AGL above the taper floor
 # eases toward level only as a last resort (already at idle and still above the
 # band). This kills the dive-and-PIO by construction: pitch barely moves.
 # First-pass numbers, to be tuned from flight logs.
-GS_THETA_UP_HI = 1.5      # held nose-up attitude (deg), high/fast on descent
-GS_THETA_UP_LO = 4.5      # held nose-up attitude near the flare (slower, more AoA)
-GS_THETA_MIN_HI = -2.5    # lowest the nose may ease to, high up (last-resort sink)
-GS_THETA_MIN_LO = 0.0     # near the ground the nose may never point down
-GS_SCHED_HI_AGL = 800.0   # schedule endpoints (ft AGL): full nose-up-schedule
-GS_SCHED_LO_AGL = 80.0    #   blends between these
-GS_THR_TRIM = 0.22        # nominal power that holds the path inside the band
-GS_THR_KP = 0.004         # throttle per ft of altitude error (power = altitude)
-GS_PITCH_ASSIST = 0.006   # deg nose-down per ft ABOVE the band (last resort)
+# No blend (Idriss, 2026-07-12). ABOVE GS_LOW_AGL: a FLAT pitch window and a
+# FEEDBACK LOOP that walks the pitch demand inside it to track the glideslope —
+# check altitude vs target, nudge the nose DOWN if high / UP if low, hold if on
+# target, loop. Real −5° floor so it can actually come down when stuck high;
+# +1.5° cap so it can't balloon. BELOW GS_LOW_AGL (≤80 ft): the gentle nose-up
+# flare hold, unchanged.
+GS_LOW_AGL = 80.0            # boundary: feedback window above, flare hold below
+GS_THETA_ABOVE_MIN = -5.0   # nose-down floor above GS_LOW_AGL
+GS_THETA_ABOVE_MAX = 1.5    # nose-up cap above GS_LOW_AGL
+GS_PITCH_CHECK_S = 1.0      # feedback cadence: check → adjust → hold → loop
+GS_PITCH_STEP_DEG = 0.5     # pitch nudge per check
+GS_PITCH_DEADBAND_FT = 15.0 # "on target" hold zone (no nudge)
+GS_THETA_FLARE_UP = 4.5     # flare-region nose-up hold (AGL ≤ GS_LOW_AGL)
+GS_THETA_FLARE_MIN = 0.0    # flare region: nose may never point down
+GS_THR_TRIM = 0.22          # nominal power that holds the path inside the band
+GS_THR_KP = 0.004           # throttle per ft of altitude error (power = altitude)
+GS_PITCH_ASSIST = 0.006     # deg nose-down per ft above band (flare region only)
 
 # AoA envelope — defend ANGLE OF ATTACK at all times (the real stall variable;
 # stall is an AoA event, not a speed event). Above this, unload (nose down toward
@@ -146,6 +154,9 @@ class TECSController(Controller):
         self._pitch_rate_filt = 0.0
         self._pitch_integ = 0.0
         self._prev_pitch_cmd = 0.0   # for the elevator servo rate-limit
+        # glideslope pitch feedback-loop state (above GS_LOW_AGL)
+        self._gs_theta_hold: float | None = None
+        self._gs_pitch_wait = 0.0
         # lateral state
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
@@ -183,41 +194,50 @@ class TECSController(Controller):
             return h_ft
         return target_ft + band
 
-    def _sched_frac(self, agl_ft: float) -> float:
-        """0 high up → 1 near the ground: blends the descent attitude schedule."""
-        if math.isnan(agl_ft) or agl_ft >= GS_SCHED_HI_AGL:
-            return 0.0
-        if agl_ft <= GS_SCHED_LO_AGL:
-            return 1.0
-        return (GS_SCHED_HI_AGL - agl_ft) / (GS_SCHED_HI_AGL - GS_SCHED_LO_AGL)
-
     def _glideslope_law(self, tel: Telemetry, targets: Targets,
-                        agl_ft: float) -> tuple[float, float]:
-        """DESCENT / APPROACH: hold a gentle nose-up attitude, power for altitude,
-        flaps for drag, speed emergent. Returns (throttle_target, pitch_deg).
-        The throttle target is walked by the outer spool-rate limiter."""
+                        agl_ft: float, dt: float) -> tuple[float, float]:
+        """DESCENT / APPROACH. Throttle is the altitude servo (power = altitude).
+        Pitch: above GS_LOW_AGL a FEEDBACK LOOP walks the pitch demand inside a
+        flat window [-5°, +1.5°] to track the target — check altitude, nudge the
+        nose down if high / up if low, hold if on target, loop. Below GS_LOW_AGL,
+        the gentle nose-up flare hold. Pitch and throttle both read high→down,
+        low→up, so they cooperate. Returns (throttle_target, pitch_deg)."""
         alt = (tel.altitude_ft if not math.isnan(tel.altitude_ft)
                else targets.altitude_ft)
         target = targets.altitude_ft
         band = self._band_up_ft(agl_ft)
-        # altitude error against the band: + below target (add power / climb back),
-        # 0 inside the band, - above the band (idle / sink).
+        # THROTTLE = altitude servo: + below target (add power), 0 inside the
+        # band, - above the band (idle / sink).
         if alt < target:
             e = target - alt
         elif alt <= target + band:
             e = 0.0
         else:
-            e = (target + band) - alt   # negative
-        # THROTTLE is the altitude servo. Power = altitude.
+            e = (target + band) - alt
         thr = GS_THR_TRIM + GS_THR_KP * e
-        # PITCH holds a scheduled gentle nose-up attitude; it eases toward the
-        # (bounded) floor ONLY when above the band, and never dives.
-        frac = self._sched_frac(agl_ft)
-        theta_up = GS_THETA_UP_HI + (GS_THETA_UP_LO - GS_THETA_UP_HI) * frac
-        theta_min = GS_THETA_MIN_HI + (GS_THETA_MIN_LO - GS_THETA_MIN_HI) * frac
-        theta = theta_up
-        if e < 0.0:
-            theta = max(theta_min, theta_up + e * GS_PITCH_ASSIST)
+
+        if math.isnan(agl_ft) or agl_ft > GS_LOW_AGL:
+            # FEEDBACK LOOP in the flat window: check → adjust → hold → loop.
+            lo, hi = GS_THETA_ABOVE_MIN, GS_THETA_ABOVE_MAX
+            if self._gs_theta_hold is None:            # seed on entry
+                seed = tel.pitch_deg if not math.isnan(tel.pitch_deg) else 0.0
+                self._gs_theta_hold = max(lo, min(hi, seed))
+            self._gs_pitch_wait += dt
+            if self._gs_pitch_wait >= GS_PITCH_CHECK_S:
+                self._gs_pitch_wait = 0.0
+                if alt > target + GS_PITCH_DEADBAND_FT:      # high → nose down
+                    self._gs_theta_hold -= GS_PITCH_STEP_DEG
+                elif alt < target - GS_PITCH_DEADBAND_FT:    # low → nose up
+                    self._gs_theta_hold += GS_PITCH_STEP_DEG
+                # else on target → hold current
+                self._gs_theta_hold = max(lo, min(hi, self._gs_theta_hold))
+            theta = self._gs_theta_hold
+        else:
+            # Flare region: gentle nose-up hold, ease down only if above the band.
+            theta = GS_THETA_FLARE_UP
+            if e < 0.0:
+                theta = max(GS_THETA_FLARE_MIN,
+                            GS_THETA_FLARE_UP + e * GS_PITCH_ASSIST)
         return max(0.0, min(1.0, thr)), theta
 
     def _envelope_floors(self, thr: float, pitch_deg: float, V_kts: float,
@@ -299,6 +319,10 @@ class TECSController(Controller):
 
         pitch_dmd_deg = 0.0
         energy_phase = False
+        # Re-seed the glideslope pitch feedback loop each time we leave the slope.
+        if not getattr(targets, "on_glideslope", False):
+            self._gs_theta_hold = None
+            self._gs_pitch_wait = 0.0
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
             # FLARE / ROLLOUT: explicit idle, hold ONE steady flare attitude
@@ -324,7 +348,7 @@ class TECSController(Controller):
             # flaps are the drag brake, speed is emergent. The nose does not dive.
             energy_phase = True
             throttle_cmd, pitch_dmd_deg = self._glideslope_law(
-                telemetry, targets, agl_ft)
+                telemetry, targets, agl_ft, dt)
             self.tecs.reset()   # keep TECS integrators fresh for the next cruise
 
         elif targets.altitude_ft is not None and targets.airspeed_kts is not None:

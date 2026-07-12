@@ -295,39 +295,46 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
 
 
 class TestGlideslopeAttitudeLaw(unittest.TestCase):
-    """DESCENT / APPROACH: hold a gentle nose-up attitude, throttle for altitude,
-    never dive (Idriss, 2026-07-12)."""
+    """DESCENT / APPROACH: above 80 ft AGL a feedback loop walks pitch inside a
+    flat window [-5, +1.5] to track the target (check→adjust→hold→loop); below
+    80 ft, the gentle nose-up flare hold (Idriss, 2026-07-12)."""
 
-    def _law(self, *, actual_alt, target_alt, agl_ft):
+    def _law(self, *, actual_alt, target_alt, agl_ft, ticks=12):
         from uav.core.control.tecs_controller import TECSController
         ctl = TECSController()
-        tel = Telemetry(airspeed_kts=120.0, altitude_ft=actual_alt, pitch_deg=2.0,
+        tel = Telemetry(airspeed_kts=120.0, altitude_ft=actual_alt, pitch_deg=0.0,
                         roll_deg=0.0, heading_deg=270.0, timestamp=0.0,
                         agl_m=agl_ft * 0.3048, vs_fpm=-600.0, groundspeed_kts=120.0)
         tg = Targets(heading_deg=270.0, altitude_ft=target_alt, airspeed_kts=120.0,
-                     throttle=None, on_glideslope=True, gear_down=True, flap_ratio=1.0)
-        return ctl._glideslope_law(tel, tg, agl_ft)
+                     throttle=None, on_glideslope=True, gear_down=True, flap_ratio=0.5)
+        thr = theta = None
+        for _ in range(ticks):     # dt=1.0 so each tick is one feedback check
+            thr, theta = ctl._glideslope_law(tel, tg, agl_ft, 1.0)
+        return thr, theta
 
-    def test_on_band_holds_gentle_noseup(self):
-        # Tracking the slope: nose is gently UP (never down), power near trim.
-        thr, theta = self._law(actual_alt=2000.0, target_alt=2000.0, agl_ft=1000.0)
-        self.assertGreater(theta, 0.0, "nose must be up while descending on-path")
-        self.assertLessEqual(theta, 5.0)
-
-    def test_above_band_pulls_power_not_dive(self):
-        # 400 ft high: throttle drops toward idle; nose eases but does NOT dive.
+    def test_above_target_noses_down_within_window(self):
+        # 400 ft high: pitch walks DOWN to the -5 floor (room to come down),
+        # never below it; throttle idles.
         thr, theta = self._law(actual_alt=2400.0, target_alt=2000.0, agl_ft=1000.0)
-        self.assertLess(thr, 0.22, "above the band must reduce power (idle to sink)")
-        self.assertGreaterEqual(theta, -3.0, "must not dive; gentle at most")
+        self.assertLess(theta, 0.0, "high → nose down to descend")
+        self.assertGreaterEqual(theta, -5.0, "must not exceed the -5 window floor")
+        self.assertLess(thr, 0.22, "above the band → reduce power")
 
-    def test_below_target_adds_power(self):
-        # Below target: throttle up, nose held up (climb back on power).
+    def test_below_target_noses_up_and_powers(self):
+        # Below target: pitch walks UP to the +1.5 cap; throttle adds power.
         thr, theta = self._law(actual_alt=1900.0, target_alt=2000.0, agl_ft=1000.0)
-        self.assertGreater(thr, 0.22, "below target must add power")
-        self.assertGreater(theta, 0.0)
+        self.assertGreater(theta, 0.0, "low → nose up")
+        self.assertLessEqual(theta, 1.5, "must not exceed the +1.5 window cap")
+        self.assertGreater(thr, 0.22, "below target → add power")
 
-    def test_near_ground_never_points_down(self):
-        # Low AGL and above band: the nose floor is 0, it may not point down.
+    def test_on_target_holds(self):
+        # On target (within the deadband): pitch holds its seed, doesn't drift.
+        thr, theta = self._law(actual_alt=2000.0, target_alt=2000.0, agl_ft=1000.0)
+        self.assertGreaterEqual(theta, -5.0)
+        self.assertLessEqual(theta, 1.5)
+
+    def test_flare_region_never_points_down(self):
+        # Below 80 ft AGL, even 400 ft high: the flare hold keeps the nose up.
         thr, theta = self._law(actual_alt=2400.0, target_alt=2000.0, agl_ft=60.0)
         self.assertGreaterEqual(theta, 0.0, "near the ground the nose stays up")
 
