@@ -92,6 +92,9 @@ SPDWEIGHT = 0.25
 # the flap-stall (~90 kt) and below the normal approach speed (~115 kt) so it
 # catches a genuine slow-down without firing on a normal on-speed approach.
 STALL_FLOOR_ABS_KTS = 100.0
+STALL_SOFT_KTS = 10.0        # ramp the protection in over this band above the
+                            # floor (100-110 kt) so it doesn't SNAP the pitch cap
+                            # on and kick the pitch loop into a PIO
 TERRAIN_SINK_PER_FT = 8.0    # max allowed sink (fpm) per ft AGL (tight near ground)
 TERRAIN_SINK_MIN_FPM = 100.0 # never tighter than this
 GLOBAL_SINK_MAX_FPM = 1500.0 # absolute sink ceiling at any height — the floor
@@ -107,15 +110,19 @@ GLOBAL_SINK_MAX_FPM = 1500.0 # absolute sink ceiling at any height — the floor
 THROTTLE_SLEW_PER_S = 0.25
 
 # Pitch attitude inner loop (soft spring + rate damper + slow self-trim integral
-# with anti-windup). Detuned for X-Plane (2026-07-12): spring cut (KP 0.05->0.03)
-# so the elevator eases toward the demanded attitude instead of slamming to full
-# on a big error; damper (KD) kept, which raises the damping ratio and calms the
-# PIO. The pitch-rate signal is filtered harder below so KD stops chattering on
-# X-Plane's noisy 25 Hz rate.
+# with anti-windup). The rate damper now uses X-Plane's TRUE measured pitch rate
+# (dataref Q), not a finite-difference of pitch: differencing was noisy AND
+# lagged, so the damper term went out of phase and DROVE a ~2 Hz PIO, railing the
+# elevator ±1.0 (2026-07-12 approach investigation). With a clean, unlagged rate
+# the damper works with the motion; KD is also cut since the lag no longer needs
+# masking. Plus an elevator servo rate-limit (below) so it physically can't slam.
 PITCH_KP = 0.03
 PITCH_KI = 0.01
-PITCH_KD = 0.055
+PITCH_KD = 0.030   # cut from 0.055 — clean measured rate damps without railing
 PITCH_I_LIMIT = 0.5
+ELEVATOR_SLEW_PER_S = 4.0   # servo rate limit: elevator can't jump full-to-full
+                            # in a tick (real servos are rate-limited); breaks the
+                            # fast PIO. ~0.16 per 25 Hz tick, full travel in 0.5 s.
 
 
 class TECSController(Controller):
@@ -138,6 +145,7 @@ class TECSController(Controller):
         self._prev_pitch_deg: float | None = None
         self._pitch_rate_filt = 0.0
         self._pitch_integ = 0.0
+        self._prev_pitch_cmd = 0.0   # for the elevator servo rate-limit
         # lateral state
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
@@ -243,14 +251,17 @@ class TECSController(Controller):
         if sink > soft:
             pitch_deg = max(pitch_deg, min(14.0, (sink - soft) * 0.03))
 
-        # STALL SPEED PROTECTION (highest priority, applied last). Below the
-        # protected speed: full power and cap the nose at level so it can't pull
-        # UP into a deeper stall. It does NOT command nose-down — that is what
-        # plummeted a low, slow airplane into the ground (the AoA "unload" this
-        # replaces). Power is the recovery.
-        if V_kts < STALL_FLOOR_ABS_KTS:
-            pitch_deg = min(pitch_deg, 0.0)
-            thr = 1.0
+        # STALL SPEED PROTECTION (highest priority, applied last). Ramped over a
+        # soft band so it doesn't SNAP and kick the pitch loop. Full effect below
+        # the floor (full power, nose capped at level so it can't pull UP into a
+        # deeper stall); partial in the 100-110 kt band. It NEVER commands
+        # nose-down — diving a low, slow airplane is what plummeted it; power is
+        # the recovery.
+        if V_kts < STALL_FLOOR_ABS_KTS + STALL_SOFT_KTS:
+            x = min(1.0, max(0.0, (STALL_FLOOR_ABS_KTS + STALL_SOFT_KTS - V_kts)
+                             / STALL_SOFT_KTS))   # 0 at +10 kt, 1 at/below floor
+            pitch_deg = min(pitch_deg, (1.0 - x) * 5.0)   # nose-up cap: +5 -> 0
+            thr = max(thr, x)                             # power: trim -> full
 
         return max(0.0, min(1.0, thr)), pitch_deg
 
@@ -354,23 +365,34 @@ class TECSController(Controller):
         self._prev_throttle = throttle_cmd
 
         # ── PITCH ATTITUDE INNER LOOP (PI+D, self-trimming, anti-windup) ──
-        # Soft spring + rate damper (X-Plane-proven) plus a slow trim integral
-        # that holds the demanded attitude without the ad-hoc "never let go"
-        # hack. Anti-windup: stop integrating while the surface is saturated.
+        # Soft spring + rate damper + slow trim integral. The damper uses the
+        # TRUE measured pitch rate (dataref Q) — clean and unlagged — so it damps
+        # WITH the motion instead of driving a PIO. Falls back to a filtered
+        # finite-difference only if the measured rate is unavailable (NaN).
         pdeg = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
-        if self._prev_pitch_deg is not None and dt > 0:
-            raw = (pdeg - self._prev_pitch_deg) / dt
-            # Heavier filter (0.3/0.7) so the KD damper doesn't chatter on
-            # X-Plane's noisy 25 Hz pitch-rate.
-            self._pitch_rate_filt = 0.3 * raw + 0.7 * self._pitch_rate_filt
+        q = getattr(telemetry, "pitch_rate_deg_s", float('nan'))
+        if not math.isnan(q):
+            pitch_rate = q                       # true measured rate
+        else:
+            if self._prev_pitch_deg is not None and dt > 0:
+                raw = (pdeg - self._prev_pitch_deg) / dt
+                self._pitch_rate_filt = 0.3 * raw + 0.7 * self._pitch_rate_filt
+            pitch_rate = self._pitch_rate_filt
         self._prev_pitch_deg = pdeg
         err = pitch_dmd_deg - pdeg
         self._pitch_integ += PITCH_KI * err * dt
         self._pitch_integ = max(-PITCH_I_LIMIT, min(PITCH_I_LIMIT, self._pitch_integ))
-        pitch_cmd = PITCH_KP * err + self._pitch_integ - PITCH_KD * self._pitch_rate_filt
+        pitch_cmd = PITCH_KP * err + self._pitch_integ - PITCH_KD * pitch_rate
         if pitch_cmd > 1.0 or pitch_cmd < -1.0:
             self._pitch_integ -= PITCH_KI * err * dt   # unwind while saturated
         pitch_cmd = _clamp(pitch_cmd, 1.0)
+        # Elevator servo rate-limit: the surface can't slam full-to-full in a
+        # tick. Breaks the fast PIO (the elevator was reversing ±2.0 per sample).
+        if dt > 0:
+            e_step = ELEVATOR_SLEW_PER_S * min(dt, 0.1)
+            pitch_cmd = max(self._prev_pitch_cmd - e_step,
+                            min(self._prev_pitch_cmd + e_step, pitch_cmd))
+        self._prev_pitch_cmd = pitch_cmd
 
         # ── YAW (ribbon-driven ground-steering): STEP-AND-CHECK, SPEED-SCALED
         # Kept verbatim — this is takeoff-roll / rollout nosewheel steering, a

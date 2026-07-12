@@ -256,6 +256,31 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
         self.assertTrue(0.0 <= act.throttle <= 1.0)
         self.assertTrue(-1.0 <= act.pitch <= 1.0)
 
+    def test_elevator_cannot_slam_full_to_full(self):
+        # The servo rate-limit: consecutive elevator commands can't jump the full
+        # range in a tick (the PIO was reversing ±2.0 per sample). Drive a big
+        # pitch-demand swing and check the per-tick change stays bounded.
+        from uav.core.control.tecs_controller import TECSController, ELEVATOR_SLEW_PER_S
+        ctl = TECSController()
+        dt = 0.04
+        prev = 0.0
+        worst = 0.0
+        for i in range(60):
+            # alternate a wild demand to try to provoke a slam
+            tgt_alt = 2000.0 if i % 2 == 0 else 3000.0
+            tel = Telemetry(airspeed_kts=120.0, altitude_ft=2500.0,
+                            pitch_deg=(15.0 if i % 2 else -15.0), roll_deg=0.0,
+                            heading_deg=90.0, timestamp=0.0, agl_m=600.0,
+                            vs_fpm=0.0, groundspeed_kts=120.0)
+            tg = Targets(heading_deg=90.0, altitude_ft=tgt_alt, airspeed_kts=130.0,
+                         throttle=None, on_glideslope=True, gear_down=True, flap_ratio=0.5)
+            act = ctl.compute(tel, tg, dt)
+            worst = max(worst, abs(act.pitch - prev))
+            prev = act.pitch
+        cap = ELEVATOR_SLEW_PER_S * dt + 1e-6
+        self.assertLessEqual(worst, cap,
+                             f"elevator jumped {worst:.3f}/tick > slew cap {cap:.3f}")
+
     def test_stall_speed_protection_powers_up_never_dives(self):
         # Below the protected speed (100 kt): FULL power, nose capped at level
         # (no pull-up into a deeper stall), and crucially NEVER commanded

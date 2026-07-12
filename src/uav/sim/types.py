@@ -21,6 +21,9 @@ class Telemetry:
     alpha_deg: float = math.nan    # angle of attack (deg) — the real envelope
                                    # variable (stall is an AoA event). Measured
                                    # from X-Plane, or computed pitch - flightpath.
+    pitch_rate_deg_s: float = math.nan  # true measured pitch rate (deg/s), body
+                                        # axis — clean damper signal (differencing
+                                        # pitch is noisy+lagged and PIO'd).
 
     def is_valid(self) -> bool:
         # Valid attitude/airspeed/alt/heading telemetry (position optional).

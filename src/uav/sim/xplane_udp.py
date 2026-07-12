@@ -29,6 +29,10 @@ class XPlaneUDP(SimAdapter):
         10: "sim/flightmodel/position/alpha",  # angle of attack (deg) — the
                                                # real envelope variable (stall is
                                                # an AoA event, not a speed event)
+        11: "sim/flightmodel/position/Q",      # pitch RATE (deg/s), body axis —
+                                               # true measured rate for the pitch
+                                               # damper; finite-differencing pitch
+                                               # is noisy+lagged and drove a PIO
     }
 
     def __init__(
@@ -117,6 +121,7 @@ class XPlaneUDP(SimAdapter):
         gs_ms = self._last_values.get(9, math.nan)
         gs_kts = gs_ms * 1.94384 if not math.isnan(gs_ms) else math.nan  # m/s → kts
         alpha_deg = self._last_values.get(10, math.nan)   # measured AoA
+        pitch_rate = self._last_values.get(11, math.nan)  # measured pitch rate (deg/s)
         # Fallback: if X-Plane's alpha isn't flowing, compute it from geometry.
         # AoA = pitch - flight-path-angle, flight-path = asin(vertical / TAS).
         if math.isnan(alpha_deg) and not (math.isnan(pitch) or math.isnan(vs_fpm)
@@ -139,6 +144,7 @@ class XPlaneUDP(SimAdapter):
             vs_fpm=vs_fpm,
             groundspeed_kts=gs_kts,
             alpha_deg=alpha_deg,
+            pitch_rate_deg_s=pitch_rate,
         )
 
     def write_actuators(self, act: Actuators) -> None:
