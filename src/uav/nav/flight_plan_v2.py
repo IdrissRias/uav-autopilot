@@ -1030,7 +1030,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             # speed staging decides how much actually deploys (half
             # above v_app+10, full below), so the schedule is a cap,
             # not a command to slam them at cruise speed.
-            gear_down=True, flap_ratio=1.0,
+            gear_down=True, flap_ratio=0.5,
             trigger=Trigger(
                 "all",
                 subs=(
@@ -1057,7 +1057,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=g.approach_start_lat, aim_lon=g.approach_start_lon,
             pitch_limit=0.25,
-            gear_down=True, flap_ratio=1.0,
+            gear_down=True, flap_ratio=0.5,
             # Gear drop logic:
             #   (A) Normal: speed ≤ Vlo AND ≤ 1200 AGL  — clean config
             #       change while still high enough to stabilise.
@@ -1101,7 +1101,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=g.flare_start_lat, aim_lon=g.flare_start_lon,
             pitch_limit=0.25,
-            gear_down=True, flap_ratio=1.0,
+            gear_down=True, flap_ratio=0.5,
             trigger=Trigger("agl_lte", value=500.0),
         ),
 
@@ -1141,7 +1141,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             # because we're short final: a big dive here would smash the
             # gear. Still relaxed from 0.15 so we can catch a
             # behind-schedule glideslope without the previous failure mode.
-            gear_down=True, flap_ratio=1.0,
+            gear_down=True, flap_ratio=0.5,
             trigger=Trigger("agl_lte", value=_FLARE_ALT_AGL_FT),
         ),
 
@@ -1161,7 +1161,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             alt_mode="glideslope",
             heading_mode="dest_runway",
             pitch_limit=0.25, pitch_down_limit=0.05,
-            gear_down=True, flap_ratio=1.0,
+            gear_down=True, flap_ratio=0.5,
             trigger=Trigger("agl_lte", value=3.0),
         ),
 

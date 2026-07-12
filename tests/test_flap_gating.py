@@ -57,10 +57,13 @@ class TestConfigureEarlyFlaps(unittest.TestCase):
         self.assertEqual(out.flap_ratio, 0.5,
                          "Half flaps deploy immediately at descent entry.")
 
-    def test_full_flaps_once_bled_under_full_flap_speed(self):
+    def test_half_flaps_is_the_cap_on_the_approach(self):
+        # Config now uses HALF flaps on the glideslope (keyframe flap_ratio=0.5),
+        # so even below full-flap speed it holds at half, never full. (Idriss,
+        # 2026-07-12: the airframe floated on full flaps at approach speed.)
         out = self._resolve(spd=self.g.v_approach + 5.0, prev_flap=0.5)
-        self.assertEqual(out.flap_ratio, 1.0,
-                         "Full flaps once speed ≤ v_approach + 10.")
+        self.assertEqual(out.flap_ratio, 0.5,
+                         "Half flaps is the configured cap on the approach.")
 
     def test_nothing_new_deploys_when_fast(self):
         out = self._resolve(spd=self.g.flap_safe_kts + 10.0)
@@ -92,16 +95,18 @@ class TestConfigureEarlyFlaps(unittest.TestCase):
                              "Glideslope descent commands a sink rate.")
         self.assertLess(out.vs_target_fpm, -200.0)
 
-    def test_flare_keeps_full_flaps(self):
+    def test_flare_keeps_half_flaps(self):
+        # Half-flap config throughout the approach and flare (no lift spike from
+        # a 0.5 -> 1.0 deployment at the flare).
         kf_flare = next(k for k in self.ribbon.keyframes
                         if k.name == "FLARE")
         self.engine._prev_targets = Targets(
             heading_deg=270.0, altitude_ft=1420.0, airspeed_kts=100.0,
-            flap_ratio=1.0, gear_down=True,
+            flap_ratio=0.5, gear_down=True,
         )
         t = _telem(1410.0, 47.40, -94.7705, spd=100.0)
         out = self.engine._resolve(kf_flare, t, self.ribbon)
-        self.assertEqual(out.flap_ratio, 1.0)
+        self.assertEqual(out.flap_ratio, 0.5)
 
 
 if __name__ == "__main__":
