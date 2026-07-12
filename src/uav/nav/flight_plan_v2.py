@@ -936,7 +936,8 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=g.decel_start_lat, aim_lon=g.decel_start_lon,
             gear_down=False, flap_ratio=0.0,
-            roll_limit=0.25, pitch_limit=0.15,  # gentle roll-out, level flight
+            roll_limit=0.50, pitch_limit=0.15,  # 45° so the turn onto final
+            # actually comes around (was 0.25 = 22.5°, too tight to make the turn)
             trigger=Trigger("near_point", value=0.3,
                            lat=g.decel_start_lat, lon=g.decel_start_lon),
         ),
@@ -975,7 +976,7 @@ def _build_keyframes(g: Geometry) -> List[Keyframe]:
             heading_mode="aim_at",
             aim_lat=g.descent_start_lat, aim_lon=g.descent_start_lon,
             gear_down=False, flap_ratio=0.0,
-            roll_limit=0.25, pitch_limit=0.15,
+            roll_limit=0.50, pitch_limit=0.15,  # 45° (was 22.5°) for the lineup
             # POSITION-ONLY release: the descent begins where the
             # geometry says it begins. The old speed_lte condition
             # became degenerate once learned v_cruise (132.7) dropped
