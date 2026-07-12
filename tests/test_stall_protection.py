@@ -226,10 +226,9 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
             act = ctl.compute(tel, tg, 0.1)
         return act
 
-    def test_stall_floor_is_catastrophic_backstop_only(self):
-        # Fires only below 30 kts (an impossible normal-flight speed), and when
-        # it does: full power, no nose-up.
-        act = self._one(V=25.0)
+    def test_stall_floor_powers_up_when_slow(self):
+        # Below the protected speed (100 kt): full power, no nose-up.
+        act = self._one(V=90.0)
         self.assertAlmostEqual(act.throttle, 1.0, places=3)
         self.assertLessEqual(act.pitch, 0.05, "must not command nose-up near stall")
 
@@ -257,16 +256,17 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
         self.assertTrue(0.0 <= act.throttle <= 1.0)
         self.assertTrue(-1.0 <= act.pitch <= 1.0)
 
-    def test_aoa_backstop_unloads_and_powers(self):
-        # Above critical AoA (14° > 12° limit): the floor commands nose DOWN
-        # (relative to current pitch) and full power — defending AoA, not speed.
+    def test_stall_speed_protection_powers_up_never_dives(self):
+        # Below the protected speed (100 kt): FULL power, nose capped at level
+        # (no pull-up into a deeper stall), and crucially NEVER commanded
+        # nose-DOWN — diving a low, slow airplane is what plummeted it.
         from uav.core.control.tecs_controller import TECSController
         ctl = TECSController()
-        thr, pitch = ctl._envelope_floors(0.4, 5.0, V_kts=110.0, vs_fpm=-300.0,
-                                          agl_ft=1500.0, vmax_kts=250.0,
-                                          alpha_deg=14.0, pitch_now_deg=6.0)
-        self.assertAlmostEqual(thr, 1.0, places=3)
-        self.assertLess(pitch, 6.0, "must unload (nose down toward the AoA limit)")
+        thr, pitch = ctl._envelope_floors(0.3, 4.0, V_kts=90.0, vs_fpm=-300.0,
+                                          agl_ft=800.0, vmax_kts=250.0)
+        self.assertAlmostEqual(thr, 1.0, places=3, msg="must add full power")
+        self.assertLessEqual(pitch, 0.0, "cap nose-up, don't deepen the stall")
+        self.assertGreaterEqual(pitch, 0.0, "must NOT command nose-down (no dive)")
 
 
 class TestGlideslopeAttitudeLaw(unittest.TestCase):

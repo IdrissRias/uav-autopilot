@@ -84,16 +84,14 @@ ALPHA_MAX_DEG = 12.0      # margin below the ~15-16° critical AoA
 # of speed authority is safe.
 SPDWEIGHT = 0.25
 
-# Envelope floors (result-based safety). Stall floor is a CATASTROPHIC backstop
-# ONLY. The energy loop actively chases the ribbon's target speed (a safe
-# cruise/approach speed), so in normal flight the plane never approaches stall
-# and the floor would only FIGHT the loop — which is exactly what the old
-# v_land-based guard did, slamming full throttle through every on-speed approach
-# and shoving the plane up above the glideslope. So it fires only below an
-# absolute speed far under any real stall (flap-stall ~90 kt): a true last-ditch
-# net that never acts in normal flight. (Idriss, 2026-07-12: "the plane would
-# never let itself stall, it's on a control loop.")
-STALL_FLOOR_ABS_KTS = 30.0   # fire only below this — catastrophic backstop
+# Envelope floors (result-based safety). STALL SPEED PROTECTION: below this
+# airspeed, add full power and stop pulling the nose UP (which deepens the
+# stall). It NEVER commands nose-down — a low, slow airplane that pitches down
+# plummets into the ground; POWER is the recovery (Idriss, 2026-07-12: "we
+# plummeted because we lost speed, protect our stall speed"). Set ~10 kt above
+# the flap-stall (~90 kt) and below the normal approach speed (~115 kt) so it
+# catches a genuine slow-down without firing on a normal on-speed approach.
+STALL_FLOOR_ABS_KTS = 100.0
 TERRAIN_SINK_PER_FT = 8.0    # max allowed sink (fpm) per ft AGL (tight near ground)
 TERRAIN_SINK_MIN_FPM = 100.0 # never tighter than this
 GLOBAL_SINK_MAX_FPM = 1500.0 # absolute sink ceiling at any height — the floor
@@ -215,8 +213,7 @@ class TECSController(Controller):
         return max(0.0, min(1.0, thr)), theta
 
     def _envelope_floors(self, thr: float, pitch_deg: float, V_kts: float,
-                         vs_fpm: float, agl_ft: float, vmax_kts: float | None,
-                         alpha_deg: float, pitch_now_deg: float
+                         vs_fpm: float, agl_ft: float, vmax_kts: float | None
                          ) -> tuple[float, float]:
         """Result-based safety, applied in priority order (stall wins, so it is
         applied LAST). These only ever act at the edges of the envelope."""
@@ -246,17 +243,12 @@ class TECSController(Controller):
         if sink > soft:
             pitch_deg = max(pitch_deg, min(14.0, (sink - soft) * 0.03))
 
-        # STALL = ANGLE OF ATTACK, not speed (highest priority, applied last).
-        # Defend critical AoA at all times: above the limit, unload by commanding
-        # the nose down just enough to bring AoA back to the limit, and add full
-        # power. Works in any maneuver, not just 1g. A very-low speed backstop
-        # remains only for when AoA is unavailable (NaN).
-        if not math.isnan(alpha_deg):
-            if alpha_deg > ALPHA_MAX_DEG:
-                pitch_deg = min(pitch_deg,
-                                pitch_now_deg - (alpha_deg - ALPHA_MAX_DEG))
-                thr = 1.0
-        elif V_kts < STALL_FLOOR_ABS_KTS:
+        # STALL SPEED PROTECTION (highest priority, applied last). Below the
+        # protected speed: full power and cap the nose at level so it can't pull
+        # UP into a deeper stall. It does NOT command nose-down — that is what
+        # plummeted a low, slow airplane into the ground (the AoA "unload" this
+        # replaces). Power is the recovery.
+        if V_kts < STALL_FLOOR_ABS_KTS:
             pitch_deg = min(pitch_deg, 0.0)
             thr = 1.0
 
@@ -346,12 +338,9 @@ class TECSController(Controller):
 
         # ── ENVELOPE FLOORS (result-based safety; energy phases only) ────
         if energy_phase:
-            pitch_now = (telemetry.pitch_deg
-                         if not math.isnan(telemetry.pitch_deg) else 0.0)
             throttle_cmd, pitch_dmd_deg = self._envelope_floors(
                 throttle_cmd, pitch_dmd_deg, telemetry.airspeed_kts,
-                telemetry.vs_fpm, agl_ft, getattr(targets, "v_max_kts", None),
-                telemetry.alpha_deg, pitch_now)
+                telemetry.vs_fpm, agl_ft, getattr(targets, "v_max_kts", None))
 
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
         # Spool-rate walk (energy phases only; ground/takeoff/flare are explicit
