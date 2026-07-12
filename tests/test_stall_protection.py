@@ -209,7 +209,9 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
     override at the edges."""
 
     def _one(self, *, actual_alt=2000.0, target_alt=2000.0, V=120.0,
-             vs_fpm=-500.0, agl_ft=2000.0, stall=108.0, v_max=250.0):
+             vs_fpm=-500.0, agl_ft=2000.0, v_max=250.0, ticks=80):
+        # Run enough ticks for the throttle spool-walk to settle on the floor's
+        # target (a single tick only nudges toward it).
         from uav.core.control.tecs_controller import TECSController
         ctl = TECSController()
         ctl._prev_throttle = 0.4
@@ -218,15 +220,26 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
                         lat_deg=0.0, lon_deg=0.0, agl_m=agl_ft * 0.3048,
                         vs_fpm=vs_fpm, groundspeed_kts=V)
         tg = Targets(heading_deg=90.0, altitude_ft=target_alt, airspeed_kts=130.0,
-                     throttle=None, stall_floor_kts=stall, v_max_kts=v_max,
-                     gear_down=True, flap_ratio=1.0)
-        return ctl.compute(tel, tg, 0.1)
+                     throttle=None, v_max_kts=v_max, gear_down=True, flap_ratio=1.0)
+        act = None
+        for _ in range(ticks):
+            act = ctl.compute(tel, tg, 0.1)
+        return act
 
-    def test_stall_floor_forces_full_power_and_no_nose_up(self):
-        # Below the stall guard: throttle pinned full, elevator not nose-up.
-        act = self._one(V=100.0, stall=108.0)   # 100 < 1.1*108
+    def test_stall_floor_is_catastrophic_backstop_only(self):
+        # Fires only below 30 kts (an impossible normal-flight speed), and when
+        # it does: full power, no nose-up.
+        act = self._one(V=25.0)
         self.assertAlmostEqual(act.throttle, 1.0, places=3)
         self.assertLessEqual(act.pitch, 0.05, "must not command nose-up near stall")
+
+    def test_on_speed_approach_does_not_trip_stall_floor(self):
+        # A normal on-speed approach (114 kt) 480 ft high must NOT slam full
+        # throttle — the bug that fought the plane up above the glideslope. With
+        # the floor at 30 kts and throttle walking, power must not be pinned.
+        act = self._one(V=114.0, actual_alt=1720.0, target_alt=1244.0, agl_ft=480.0)
+        self.assertLess(act.throttle, 0.7,
+                        "on-speed and 480 ft high must not command full power")
 
     def test_overspeed_cuts_throttle(self):
         # Above v_max: throttle cut, nose not pushed down.

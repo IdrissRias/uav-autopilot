@@ -61,13 +61,29 @@ BAND_TAPER_SLOPE = 0.5      # ft of band per ft of AGL above the taper floor
 # of speed authority is safe.
 SPDWEIGHT = 0.25
 
-# Envelope floors (result-based safety, highest priority is stall).
-STALL_GUARD_FACTOR = 1.1     # fire the stall floor below factor × stall_floor_kts
+# Envelope floors (result-based safety). Stall floor is a CATASTROPHIC backstop
+# ONLY. The energy loop actively chases the ribbon's target speed (a safe
+# cruise/approach speed), so in normal flight the plane never approaches stall
+# and the floor would only FIGHT the loop — which is exactly what the old
+# v_land-based guard did, slamming full throttle through every on-speed approach
+# and shoving the plane up above the glideslope. So it fires only below an
+# absolute speed far under any real stall (flap-stall ~90 kt): a true last-ditch
+# net that never acts in normal flight. (Idriss, 2026-07-12: "the plane would
+# never let itself stall, it's on a control loop.")
+STALL_FLOOR_ABS_KTS = 30.0   # fire only below this — catastrophic backstop
 TERRAIN_SINK_PER_FT = 8.0    # max allowed sink (fpm) per ft AGL (tight near ground)
 TERRAIN_SINK_MIN_FPM = 100.0 # never tighter than this
 GLOBAL_SINK_MAX_FPM = 1500.0 # absolute sink ceiling at any height — the floor
                              # engages early (not only near the ground) so a bad
                              # target can't build an unarrestable dive up high
+
+# Throttle spool rate. The engine cannot (and should not) jump full-range in a
+# tick — a real turboprop spools over seconds. The command WALKS toward whatever
+# the energy law / floors ask for at this rate, which both models the physics and
+# kills the throttle slamming 0<->1 (power-band doctrine: "slow power walks, never
+# jockey"). 0.25/s ≈ 0.01 per 25 Hz tick — full range in ~4 s. dt-capped so a
+# stalled tick can't sneak a big jump through.
+THROTTLE_SLEW_PER_S = 0.25
 
 # Pitch attitude inner loop (the proven X-Plane-tuned soft spring + rate damper,
 # now with a slow trim INTEGRAL that auto-trims to hold the demanded attitude —
@@ -138,7 +154,6 @@ class TECSController(Controller):
 
     def _envelope_floors(self, thr: float, pitch_deg: float, V_kts: float,
                          vs_fpm: float, agl_ft: float,
-                         stall_kts: float | None,
                          vmax_kts: float | None) -> tuple[float, float]:
         """Result-based safety, applied in priority order (stall wins, so it is
         applied LAST). These only ever act at the edges of the envelope."""
@@ -168,9 +183,11 @@ class TECSController(Controller):
         if sink > soft:
             pitch_deg = max(pitch_deg, min(14.0, (sink - soft) * 0.03))
 
-        # Stall floor (HIGHEST priority — last so it overrides the terrain nose-up
-        # above): near stall, stop pulling up and go to full power. Alpha-floor.
-        if stall_kts is not None and V_kts < stall_kts * STALL_GUARD_FACTOR:
+        # Stall floor (catastrophic backstop only — see note at STALL_FLOOR_ABS_KTS):
+        # the loop holds a safe target speed, so this fires only in a genuine
+        # fall-out-of-the-sky slow-down, never in normal flight. Highest priority
+        # (applied last) so it overrides the terrain nose-up above.
+        if V_kts < STALL_FLOOR_ABS_KTS:
             pitch_deg = min(pitch_deg, 0.0)
             thr = 1.0
 
@@ -252,10 +269,17 @@ class TECSController(Controller):
         if energy_phase:
             throttle_cmd, pitch_dmd_deg = self._envelope_floors(
                 throttle_cmd, pitch_dmd_deg, telemetry.airspeed_kts,
-                telemetry.vs_fpm, agl_ft, targets.stall_floor_kts,
-                getattr(targets, "v_max_kts", None))
+                telemetry.vs_fpm, agl_ft, getattr(targets, "v_max_kts", None))
 
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+        # Spool-rate walk (energy phases only; ground/takeoff/flare are explicit
+        # immediate commands and pass through). The engine can't slam; power
+        # walks toward the demand at THROTTLE_SLEW_PER_S. dt-capped so a stalled
+        # tick can't jump.
+        if energy_phase and dt > 0:
+            step = THROTTLE_SLEW_PER_S * min(dt, 0.1)
+            throttle_cmd = max(self._prev_throttle - step,
+                               min(self._prev_throttle + step, throttle_cmd))
         self._prev_throttle = throttle_cmd
 
         # ── PITCH ATTITUDE INNER LOOP (PI+D, self-trimming, anti-windup) ──
