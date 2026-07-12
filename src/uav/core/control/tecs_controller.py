@@ -65,7 +65,10 @@ BAND_TAPER_SLOPE = 0.5      # ft of band per ft of AGL above the taper floor
 # target, loop. Real −5° floor so it can actually come down when stuck high;
 # +1.5° cap so it can't balloon. BELOW GS_LOW_AGL (≤80 ft): the gentle nose-up
 # flare hold, unchanged.
-GS_LOW_AGL = 80.0            # boundary: feedback window above, flare hold below
+GS_LOW_AGL = 10.0           # boundary: feedback window above, flare hold below.
+                            # Below this the plane is COMMITTED to land: idle
+                            # power, the gentle flare hold, and the stall floor
+                            # is disregarded so it can slow down and touch down.
 GS_THETA_ABOVE_MIN = -5.0   # nose-down floor above GS_LOW_AGL
 GS_THETA_ABOVE_MAX = 1.5    # nose-up cap above GS_LOW_AGL
 GS_PITCH_CHECK_S = 1.0      # feedback cadence: check → adjust → hold → loop
@@ -233,7 +236,10 @@ class TECSController(Controller):
                 self._gs_theta_hold = max(lo, min(hi, self._gs_theta_hold))
             theta = self._gs_theta_hold
         else:
-            # Flare region: gentle nose-up hold, ease down only if above the band.
+            # Flare region (AGL ≤ GS_LOW_AGL): committed to land. IDLE power so
+            # she can slow and settle; gentle nose-up hold (ease down only if
+            # above the band). The stall floor is disregarded here (see floors).
+            thr = 0.0
             theta = GS_THETA_FLARE_UP
             if e < 0.0:
                 theta = max(GS_THETA_FLARE_MIN,
@@ -276,8 +282,10 @@ class TECSController(Controller):
         # the floor (full power, nose capped at level so it can't pull UP into a
         # deeper stall); partial in the 100-110 kt band. It NEVER commands
         # nose-down — diving a low, slow airplane is what plummeted it; power is
-        # the recovery.
-        if V_kts < STALL_FLOOR_ABS_KTS + STALL_SOFT_KTS:
+        # the recovery. DISREGARDED below GS_LOW_AGL: committed to land, so we let
+        # it slow and touch down instead of firewalling the power (Idriss).
+        committed_to_land = (not math.isnan(agl_ft)) and agl_ft < GS_LOW_AGL
+        if not committed_to_land and V_kts < STALL_FLOOR_ABS_KTS + STALL_SOFT_KTS:
             x = min(1.0, max(0.0, (STALL_FLOOR_ABS_KTS + STALL_SOFT_KTS - V_kts)
                              / STALL_SOFT_KTS))   # 0 at +10 kt, 1 at/below floor
             pitch_deg = min(pitch_deg, (1.0 - x) * 5.0)   # nose-up cap: +5 -> 0

@@ -333,10 +333,11 @@ class TestGlideslopeAttitudeLaw(unittest.TestCase):
         self.assertGreaterEqual(theta, -5.0)
         self.assertLessEqual(theta, 1.5)
 
-    def test_flare_region_never_points_down(self):
-        # Below 80 ft AGL, even 400 ft high: the flare hold keeps the nose up.
-        thr, theta = self._law(actual_alt=2400.0, target_alt=2000.0, agl_ft=60.0)
+    def test_flare_region_idle_and_nose_up(self):
+        # Below 10 ft AGL: committed to land — IDLE power and the nose stays up.
+        thr, theta = self._law(actual_alt=1005.0, target_alt=1000.0, agl_ft=5.0)
         self.assertGreaterEqual(theta, 0.0, "near the ground the nose stays up")
+        self.assertAlmostEqual(thr, 0.0, places=3, msg="idle to land")
 
 
 if __name__ == "__main__":
