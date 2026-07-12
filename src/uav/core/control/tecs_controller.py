@@ -1,16 +1,30 @@
 """
-TECSController — the rebuilt soldier.
+TECSController — one energy law for the whole flight envelope.
 
-Longitudinal control is TECS (energy) + a pitch attitude inner loop. Lateral
-(heading→bank→aileron) and yaw are the proven cascades kept verbatim from the
-old controller — those were never the problem. Three phases are NOT pure TECS
-and stay as explicit overrides: ground/takeoff (throttle commanded, nose eases
-up to rotate), and flare (idle + sink-rate arrest). Everything between —
-climb, cruise, descent, approach, decelerate — is one TECS law fed a
-(altitude, speed) demand by the ribbon.
+Longitudinal control is a single Total-Energy law (throttle → total energy,
+elevator → energy balance) applied to EVERY energy phase: climb, cruise,
+descent, approach, decelerate. It chases two RESULTS handed over by the ribbon,
+target altitude and target airspeed, and drives the two inputs (throttle,
+elevator) freely to null the energy errors. There is no per-phase control
+policy, no step-and-check, no throttle slew, no elevator trim-hold, no pitch
+policy cap. Inputs are bounded only by physics (0..1 throttle, ±1 surface) and
+by three RESULT-based envelope floors that bite only at the edges: stall,
+terrain sink, and overspeed. (Idriss doctrine, 2026-07-12: "result controlled,
+not input controlled — we chase results and adjust inputs.")
 
-Drop-in for SimpleFixedWingController: same compute(telemetry, targets, dt)
--> Actuators signature.
+Three phases are genuinely NOT energy tracking and stay explicit: ground/
+takeoff (throttle commanded, nose eases up to rotate), flare (idle + gentle
+nose-up), and rollout (derotate). Those are entered by the ribbon handing an
+explicit throttle; every throttle-None phase is the one energy law. Lateral
+(heading→bank→aileron) and yaw ground-steering are the proven cascades, kept
+verbatim.
+
+ALTITUDE PRIORITY via an asymmetric band: never below target, up to +BAND_UP
+above is fine. The plane rides at-or-above the (possibly descending) target and
+never dives through it. The band tapers to zero near the ground so the flare
+lands on the numbers.
+
+Drop-in for SimpleFixedWingController: compute(telemetry, targets, dt).
 """
 from __future__ import annotations
 
@@ -20,7 +34,6 @@ from uav.core.control.base import Controller
 from uav.core.control.pid import PID
 from uav.core.control.simple_fixedwing import ControlGains, _wrap_deg, _clamp
 from uav.core.control.tecs import TECS, TECSParams
-from uav.core.control.attitude import default_pitch_axis
 from uav.sim.types import Telemetry, Actuators, Targets
 
 FT_TO_M = 0.3048
@@ -28,10 +41,36 @@ MS_TO_KT = 1.94384
 FPM_TO_MS = 0.00508   # ft/min → m/s
 
 # Flare = hold ONE gentle nose-up attitude and let her settle, idle power.
-# NOT a sink-rate chase — that PIO'd on the real plane's noisy VS (ballooned
-# 6→46 ft, bled to the stall, dropped in). A fixed held degree is stable.
-# Tune this one number if the flare is too firm (lower) or floats (higher).
 FLARE_PITCH_DEG = 5.0
+
+# Altitude band (altitude priority). Never below target; tolerate up to this
+# far above. The band is what removes the dive-through-the-line overshoot: the
+# plane only has to reach "within BAND_UP above", never an exact line, so there
+# is no aggressive dive to overshoot.
+ALT_BAND_UP_FT = 200.0
+BAND_TAPER_FROM_FT = 30.0   # band shrinks to 0 by this AGL (land on the numbers)
+BAND_TAPER_SLOPE = 0.5      # ft of band per ft of AGL above the taper floor
+
+# Energy-balance weighting for the pitch loop (TECS spdweight). 1.0 = balanced;
+# altitude priority is carried by the band + floors, not by starving speed.
+SPDWEIGHT = 1.0
+
+# Envelope floors (result-based safety, highest priority is stall).
+STALL_GUARD_FACTOR = 1.1     # fire the stall floor below factor × stall_floor_kts
+TERRAIN_SINK_PER_FT = 8.0    # max allowed sink (fpm) per ft AGL (tight near ground)
+TERRAIN_SINK_MIN_FPM = 100.0 # never tighter than this
+GLOBAL_SINK_MAX_FPM = 1500.0 # absolute sink ceiling at any height — the floor
+                             # engages early (not only near the ground) so a bad
+                             # target can't build an unarrestable dive up high
+
+# Pitch attitude inner loop (the proven X-Plane-tuned soft spring + rate damper,
+# now with a slow trim INTEGRAL that auto-trims to hold the demanded attitude —
+# this replaces the ad-hoc "never let go" trim-hold with a standard PI+D loop
+# that self-trims and has anti-windup).
+PITCH_KP = 0.05
+PITCH_KI = 0.02
+PITCH_KD = 0.055
+PITCH_I_LIMIT = 0.5
 
 
 class TECSController(Controller):
@@ -50,37 +89,16 @@ class TECSController(Controller):
         params = tecs_params or TECSParams()
         params.thr_cruise = cruise_throttle
         self.tecs = TECS(params)
-        # Pitch attitude inner loop: the PROVEN X-Plane-tuned one from the old
-        # controller (soft 0.05/deg spring + 0.055 rate damper with filtering),
-        # NOT the sim-tuned attitude.py — that railed at rotation on the real
-        # plane (flight after f3594a7) because X-Plane's elevator bites harder
-        # than my sim modelled. This loop flew every takeoff today.
+        # Pitch attitude inner loop state.
         self._prev_pitch_deg: float | None = None
         self._pitch_rate_filt = 0.0
-        # Elevator trim-hold ("never let go") — a persistent held elevator
-        # deflection used ONLY on the glideslope, so the surface parks at the
-        # value that maintains the demanded attitude instead of relaxing to
-        # neutral when the error hits zero. Seeded/reset on glideslope exit.
-        self._elev_trim = 0.0
-        # glideslope-split state (pitch=slope, throttle=speed); re-seeded on entry
-        self._gs_theta_ref: float | None = None
-        self._gs_vs_filt = 0.0
-        self._gs_thr: float | None = None
-        # step-and-check timer for the glideslope throttle loop (below)
-        self._gs_thr_wait = 0.0
-        # step-and-check state for the glideslope PITCH loop — a held nose-up
-        # bias (deg) that rejoins the line: below the slope it steps the nose
-        # UP, above it steps DOWN, checked on the SAME 1 s cadence and the SAME
-        # altitude error as the throttle loop, so power-up is paired with
-        # pull-up. Re-seeded on glideslope exit.
-        self._gs_pitch_bias = 0.0
-        self._gs_pitch_wait = 0.0
-        # step-and-check state for yaw (below)
-        self._yaw_cmd_held = 0.0
-        self._yaw_wait = 0.0
+        self._pitch_integ = 0.0
         # lateral state
         self._prev_bank_deg = 0.0
         self._prev_hdg_deg: float | None = None
+        # yaw ground-steering step-and-check state
+        self._yaw_cmd_held = 0.0
+        self._yaw_wait = 0.0
         # longitudinal state
         self._prev_V_ms: float | None = None
         self._prev_throttle = 0.0
@@ -91,6 +109,66 @@ class TECSController(Controller):
         if math.isnan(v):
             v = 0.0
         return max(v, 0.0) / MS_TO_KT
+
+    def _alt_band_hdmd_ft(self, target_ft: float, h_ft: float,
+                          agl_ft: float) -> float:
+        """Asymmetric altitude band → the height demand fed to TECS.
+
+        Below target → demand target (climb back, firm: never below).
+        Inside [target, target+band] → demand h (no push; chase speed only).
+        Above the band → demand the top of the band (ease down, gentle).
+        The band tapers to zero near the ground so the flare lands on target.
+        """
+        if math.isnan(agl_ft):
+            band = ALT_BAND_UP_FT
+        else:
+            band = max(0.0, min(ALT_BAND_UP_FT,
+                                (agl_ft - BAND_TAPER_FROM_FT) * BAND_TAPER_SLOPE))
+        if h_ft < target_ft:
+            return target_ft
+        if h_ft <= target_ft + band:
+            return h_ft
+        return target_ft + band
+
+    def _envelope_floors(self, thr: float, pitch_deg: float, V_kts: float,
+                         vs_fpm: float, agl_ft: float,
+                         stall_kts: float | None,
+                         vmax_kts: float | None) -> tuple[float, float]:
+        """Result-based safety, applied in priority order (stall wins, so it is
+        applied LAST). These only ever act at the edges of the envelope."""
+        if math.isnan(V_kts):
+            return thr, pitch_deg
+        sink = -vs_fpm if not math.isnan(vs_fpm) else 0.0   # +ve = descending
+
+        # Overspeed (lowest priority): near the never-exceed / flap limit, do
+        # not push the nose down further and cut power. Trades speed for height.
+        if vmax_kts is not None and V_kts > vmax_kts:
+            pitch_deg = max(pitch_deg, 1.0)
+            thr = 0.0
+
+        # Terrain / dive floor ("regard for the ground"): sink is capped by the
+        # tighter of an AGL-proportional limit (tight near ground) and a global
+        # ceiling (engages early at any height). When exceeded, command nose-up
+        # proportional to the overshoot. The inner loop already slams full
+        # nose-up elevator on a big demand, so the cap is really about engaging
+        # EARLY enough to arrest before the ground, not about the number.
+        agl_cap = (max(TERRAIN_SINK_MIN_FPM, agl_ft * TERRAIN_SINK_PER_FT)
+                   if not math.isnan(agl_ft) else GLOBAL_SINK_MAX_FPM)
+        max_sink = min(agl_cap, GLOBAL_SINK_MAX_FPM)
+        # Soft engagement: start easing the nose up at 75% of the cap so the
+        # arrest anticipates the limit instead of overshooting it (reacting to
+        # actual sink lags; a hard trip point rings past the ceiling).
+        soft = 0.75 * max_sink
+        if sink > soft:
+            pitch_deg = max(pitch_deg, min(14.0, (sink - soft) * 0.03))
+
+        # Stall floor (HIGHEST priority — last so it overrides the terrain nose-up
+        # above): near stall, stop pulling up and go to full power. Alpha-floor.
+        if stall_kts is not None and V_kts < stall_kts * STALL_GUARD_FACTOR:
+            pitch_deg = min(pitch_deg, 0.0)
+            thr = 1.0
+
+        return max(0.0, min(1.0, thr)), pitch_deg
 
     def compute(self, telemetry: Telemetry, targets: Targets, dt: float) -> Actuators:
         g = self.gains
@@ -121,320 +199,82 @@ class TECSController(Controller):
         vdot = (V - self._prev_V_ms) / dt if dt > 0 else 0.0
         self._prev_V_ms = V
 
+        agl_ft = (telemetry.agl_m * 3.28084
+                  if not math.isnan(telemetry.agl_m) else float('nan'))
+
         pitch_dmd_deg = 0.0
-        throttle_self_limited = False  # True = the branch below already rate-limited itself
-        pitch_trim_hold = False        # True = use the held-elevator PI (climb/cruise/descent)
-        # Clear the glideslope-SPECIFIC state whenever we're not on the slope
-        # so it re-seeds cleanly next approach. NOTE: _elev_trim is deliberately
-        # NOT reset here (Idriss, 2026-07-11: "no reset, especially on cruise
-        # and descent"). The elevator NEVER lets go — its held trim persists
-        # through climb/cruise/descent and across phase boundaries; only a
-        # fresh controller (new flight) starts it at 0. Resetting it every tick
-        # would also make the cruise hold impossible (cruise is off-glideslope,
-        # so this block runs every cruise tick).
-        if not getattr(targets, "on_glideslope", False):
-            self._gs_theta_ref = None
-            self._gs_thr = None
-            self._gs_thr_wait = 0.0
-            self._gs_pitch_bias = 0.0
-            self._gs_pitch_wait = 0.0
+        energy_phase = False
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
-            # FLARE: idle power (explicit), and hold ONE steady nose-up flare
-            # attitude — the proven inner loop eases the nose up to it and
-            # keeps it there. She decelerates and settles onto the mains
-            # instead of hunting. (Replaced the sink-rate chase that PIO'd on
-            # the real plane's noisy VS and ballooned into a stall-drop.)
+            # FLARE / ROLLOUT: explicit idle, hold ONE steady flare attitude
+            # (the inner loop eases the nose to it). She decelerates and settles
+            # onto the mains instead of hunting.
             throttle_cmd = targets.throttle
             pitch_dmd_deg = FLARE_PITCH_DEG
             self.tecs.reset()
 
         elif targets.throttle is not None:
-            # GROUND / TAKEOFF / any explicit-throttle phase without a sink
-            # target. Honour the throttle; ease the nose toward a gentle climb
-            # attitude scaled by how far below target we are (0 on the ground
-            # where h≈h_dmd is false but speed is ~0, so the surface just holds
-            # back-pressure and she rotates at Vr). Bounded so it can't yank.
+            # GROUND / TAKEOFF: honour the throttle; ease the nose toward a
+            # gentle climb attitude scaled by how far below target we are, so
+            # she rotates at Vr. Bounded so it can't yank.
             throttle_cmd = targets.throttle
             if targets.altitude_ft is not None:
                 below = (targets.altitude_ft - telemetry.altitude_ft)
                 pitch_dmd_deg = max(0.0, min(8.0, below * 0.004))
             self.tecs.reset()
 
-        elif getattr(targets, "on_glideslope", False) and targets.airspeed_kts is not None:
-            # ── GLIDESLOPE: ALTITUDE ONLY. SPEED PLAYS NO ROLE, EVER. ────
-            # (Idriss, 2026-07-11.) Throttle serves TARGET ALTITUDE and
-            # NOTHING ELSE — no speed target, no stall guard. Speed is a
-            # RESULT of pitch + configuration, never a goal, never a reason
-            # to add or remove power.
-            #
-            # SYMMETRIC on purpose (fixed after it landed short, flight
-            # c677d781): a one-sided version that could only CUT power
-            # (never restore it below the line) meant that any dip under
-            # the glideslope was permanent — nothing pulled it back onto
-            # the path, and it sank into the ground before the runway.
-            # "Accurate as fuck on altitude — that's what guarantees a
-            # landing" (Idriss). Above the line → power eases off. Below
-            # the line → power eases back in. Both directions are pure
-            # altitude error; neither looks at speed.
-            #
-            # STEP-AND-CHECK, not a continuous formula (Idriss, 2026-07-11:
-            # "the alt needs to be increased by 0.05, check alt again, if
-            # still below increase again, if not don't, if up decrease").
-            # This replaces the continuous proportional walk entirely. Every
-            # THROTTLE_CHECK_S seconds: look at the altitude error, take ONE
-            # fixed +-THROTTLE_STEP nudge in the direction that helps, then
-            # go quiet and let the airplane's own inertia show the result
-            # BEFORE judging again. This is also why the earlier windup
-            # incident (theta_ref accumulating during a 36 s deficit, then
-            # ballooning +217 ft on the way back — see the Notion audit)
-            # can't happen to the throttle side any more: there is no
-            # accumulator to wind up, just a bounded step taken periodically
-            # off the CURRENT observed error. A small deadband (the 5 ft
-            # noise floor set below) means it holds once close instead of
-            # chattering every cycle. Checking THROTTLE_CHECK_S (1 s) apart,
-            # not every tick, gives the engine + aerodynamic response time to
-            # actually show up before the next decision — a tick-by-tick
-            # check would just be re-judging a change that hasn't landed
-            # yet, the same "loop faster than the airplane" mistake that
-            # phugoided cruise earlier today.
-            # TIERED step size (Idriss, 2026-07-11, final correction): the
-            # step now scales with how far off the line we are — fine near
-            # the target, urgent far from it. A flat 0.01 step would take
-            # 1000+ seconds to correct a genuine 1000 ft deficit (too slow
-            # for a ~1-3 min descent); a flat 0.05 was too hot once close
-            # (part of what caused the windup/balloon incident). Checked
-            # every THROTTLE_CHECK_S (1 s), same as before — enough time for
-            # the engine + aerodynamic response to actually show up before
-            # judging again. The decision is ALWAYS re-based on the CURRENT
-            # observed altitude error at each check, never a blind
-            # continuation — "not empty increasing" — which is also what
-            # keeps this immune to the theta_ref-style windup that caused
-            # the earlier +217 ft balloon: there is no accumulator, just a
-            # bounded step taken periodically off what's true right now.
-            # Tier bands widened (Idriss, 2026-07-11): within 500 ft -> 0.01,
-            # within 1000 ft -> 0.05, within 2000 ft (and beyond) -> 0.2.
-            # (0.05 for the 1000 ft band, NOT 0.5 as first written — 0.5 would
-            # move half the throttle in one second, the slam that has crashed
-            # us; monotonic so a bigger miss gets a bigger nudge.) The throttle
-            # is a HOLD: even ON target it MAINTAINS its parked value and never
-            # returns to a default — see the deadband branch below, which holds
-            # rather than resetting.
-            THROTTLE_CHECK_S = 1.0
-            THROTTLE_DEADBAND_FT = 5.0   # noise floor only, not a "close enough" zone
-            alt_err_ft = targets.altitude_ft - telemetry.altitude_ft  # + = below target
-            abs_err = abs(alt_err_ft)
-            if abs_err <= 500.0:
-                THROTTLE_STEP = 0.01
-            elif abs_err <= 1000.0:
-                THROTTLE_STEP = 0.05
-            else:   # 2000 ft band and beyond — hold at the outermost step
-                THROTTLE_STEP = 0.2
-            if self._gs_thr is None:
-                self._gs_thr = self._prev_throttle
-                self._gs_thr_wait = 0.0
-            self._gs_thr_wait += dt
-            if self._gs_thr_wait >= THROTTLE_CHECK_S:
-                self._gs_thr_wait = 0.0
-                if alt_err_ft > THROTTLE_DEADBAND_FT:
-                    self._gs_thr = min(1.0, self._gs_thr + THROTTLE_STEP)
-                elif alt_err_ft < -THROTTLE_DEADBAND_FT:
-                    self._gs_thr = max(0.0, self._gs_thr - THROTTLE_STEP)
-                # else: within the noise-floor deadband — hold, no step.
-            throttle_cmd = self._gs_thr
-            throttle_self_limited = True   # the step-and-check IS the rate limit;
-            # the generic 0.05/s outer slew below would otherwise silently
-            # cap the 0.05/0.2 tiers down to its own rate, defeating the
-            # whole point of having bigger steps for bigger errors (found
-            # on the bench: tier2/tier3/beyond ALL measured +0.025 instead
-            # of +0.05/+0.2/+0.2 — the outer slew was the true bottleneck).
-
-            # PITCH: unchanged — the damped attitude-trim that killed the
-            # 987d1262 PIO (filtered VS, slow trim, rate-damped inner loop).
-            # Flies the commanded sink rate down; nothing here reacts to
-            # speed either.
-            vs_now = telemetry.vs_fpm if not math.isnan(telemetry.vs_fpm) else 0.0
-            pnow = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
-            if self._gs_theta_ref is None:   # seed on entry
-                self._gs_theta_ref = pnow
-                self._gs_vs_filt = vs_now
-            self._gs_vs_filt += min(1.0, dt / 0.6) * (vs_now - self._gs_vs_filt)
-            vs_ref = (targets.vs_target_fpm
-                      if targets.vs_target_fpm is not None else -500.0)
-            # ── AGL SINK FLOOR — "regard for the ground" (Idriss, 2026-07-11:
-            # "it just plummeted down and crashed, no regard to the ground").
-            # Independent of the glideslope geometry and of any wound-up
-            # demand: the lower we are, the less sink we allow. Cap =
-            # -(AGL_ft * 8) fpm, never tighter than 100 fpm. A normal ~750 fpm
-            # approach is unaffected above ~95 ft; below that the cap arrests
-            # the sink into the flare. Deliberately steeper than the height
-            # itself demands so it bounds ACTUAL sink (the airframe lags the
-            # demand), so a bad target altitude or a runaway pitch demand can
-            # NEVER dive the aircraft into the terrain — something always
-            # watches true height. NaN AGL -> fail open to geometry.
-            agl_ft = (telemetry.agl_m * 3.28084
-                      if not math.isnan(telemetry.agl_m) else float('nan'))
-            if not math.isnan(agl_ft):
-                vs_floor_fpm = -max(100.0, agl_ft * 8.0)
-                vs_ref = max(vs_ref, vs_floor_fpm)   # vs is negative going down
-            vs_err = vs_ref - self._gs_vs_filt
-            # Trim gain halved (0.0018 -> 0.0008) alongside the flight_engine
-            # conv_gain cut — the trim was winding up past what the
-            # pitch_limit=0.25 nose-up cap can actually deliver, and
-            # unwinding slowly enough to overshoot on the way back. Gentler
-            # trim + a gentler upstream demand together, not either alone.
-            self._gs_theta_ref += vs_err * 0.0008 * dt
-            self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
-
-            # ── PITCH STEP-AND-CHECK — rejoin the line (Idriss, 2026-07-12).
-            # The vs-tracking above only flies the slope-PARALLEL baseline
-            # sink; it does nothing to CLOSE an altitude gap. That closure is
-            # this loop: on the SAME 1 s cadence and the SAME altitude error
-            # the throttle loop uses, nudge a held nose-up bias one fixed step
-            # in the helping direction, then go quiet and let the airplane
-            # show the result before judging again. Below the line the
-            # throttle steps power UP (above) and this steps the nose UP
-            # together — power increase PAIRED with pulling up, so the added
-            # energy becomes climb, not the straight-down acceleration a
-            # continuous conv_gain produced. Above the line it steps the nose
-            # DOWN to shed the excess. A small deadband holds once on the line
-            # instead of chattering. There is no accumulator wound faster than
-            # the airplane responds, so this can't balloon: every step is
-            # re-based on the CURRENT observed error one second apart. Bias is
-            # bounded well inside the pitch-demand clamp so it can't run away.
-            PITCH_CHECK_S = 1.0
-            PITCH_DEADBAND_FT = 5.0   # noise floor, same as the throttle loop
-            PITCH_STEP_DEG = 0.2      # one gentle nudge per check
-            PITCH_BIAS_LIMIT = 6.0
-            self._gs_pitch_wait += dt
-            if self._gs_pitch_wait >= PITCH_CHECK_S:
-                self._gs_pitch_wait = 0.0
-                if alt_err_ft > PITCH_DEADBAND_FT:        # below → pull up
-                    self._gs_pitch_bias += PITCH_STEP_DEG
-                elif alt_err_ft < -PITCH_DEADBAND_FT:     # above → nose down
-                    self._gs_pitch_bias -= PITCH_STEP_DEG
-                # else: on the line within the deadband — hold, no step.
-                self._gs_pitch_bias = max(-PITCH_BIAS_LIMIT,
-                                          min(PITCH_BIAS_LIMIT,
-                                              self._gs_pitch_bias))
-
-            pitch_dmd_deg = max(-10.0, min(8.0,
-                                self._gs_theta_ref + vs_err * 0.00035
-                                + self._gs_pitch_bias))
-            pitch_trim_hold = True   # elevator HOLDS its trim on the slope
-            self.tecs.reset()
-
-        elif targets.airspeed_kts is not None and targets.altitude_ft is not None:
-            # TECS — climb / cruise / decelerate (level-ish energy phases).
-            h_dmd = targets.altitude_ft * FT_TO_M
+        elif targets.altitude_ft is not None and targets.airspeed_kts is not None:
+            # ── THE ONE ENERGY LAW (climb / cruise / descent / approach / decel)
+            # Chase two results — the altitude BAND and the target speed — with
+            # throttle (total energy) and elevator (balance). No per-phase policy;
+            # descent is just cruise with a lower, moving altitude demand.
+            energy_phase = True
+            target_ft = targets.altitude_ft
+            h_dmd_ft = self._alt_band_hdmd_ft(target_ft, telemetry.altitude_ft
+                                              if not math.isnan(telemetry.altitude_ft)
+                                              else target_ft, agl_ft)
             V_dmd = targets.airspeed_kts / MS_TO_KT
-            sw = 1.7 if getattr(targets, "pitch_for_speed", False) else 1.0
             throttle_cmd, pitch_dmd_deg = self.tecs.update(
-                h, V, hdot, vdot, h_dmd, V_dmd, dt, spdweight=sw)
-            pitch_trim_hold = True   # elevator HOLDS its trim in cruise/climb too
-            # (Idriss, 2026-07-11: "on for cruise"). TECS sets the demanded
-            # attitude; the held trim parks the elevator at the deflection that
-            # maintains it, instead of relaxing to neutral each time the plane
-            # reaches the demand. The trim is a SLOW inner-loop hold (gain 0.02,
-            # bounded, anti-windup), so it trims around TECS's demand rather
-            # than fighting TECS's own pitch integral.
+                h, V, hdot, vdot, h_dmd_ft * FT_TO_M, V_dmd, dt, spdweight=SPDWEIGHT)
+
         else:
-            # No speed target (shouldn't happen with the TECS ribbon) — hold
-            # the last throttle and a level attitude rather than do anything
-            # surprising.
+            # No demands (shouldn't happen) — hold last throttle, level attitude.
             throttle_cmd = self._prev_throttle
             pitch_dmd_deg = 2.0
 
+        # ── ENVELOPE FLOORS (result-based safety; energy phases only) ────
+        if energy_phase:
+            throttle_cmd, pitch_dmd_deg = self._envelope_floors(
+                throttle_cmd, pitch_dmd_deg, telemetry.airspeed_kts,
+                telemetry.vs_fpm, agl_ft, targets.stall_floor_kts,
+                getattr(targets, "v_max_kts", None))
+
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
-        # THE ENGINE IS NOT A SWITCH. Cap tightened 0.5/s -> 0.05/s (Idriss,
-        # 2026-07-11, after the crash audit): a stalled control tick has an
-        # uncapped dt, and the slew step is proportional to dt, so a 2 s
-        # stall legally permitted a 100% throttle jump under the old 0.5/s
-        # cap — confirmed in the crash log (row 941: 0.42->1.00 in 0.098 s,
-        # a 12x violation). A 10x tighter rate shrinks ANY stall's max jump
-        # by the same 10x, protecting against this cause and any other
-        # source of a large dt, not just the ones already found. Explicit
-        # orders (takeoff full, flare idle) are exempt — those are meant to
-        # be immediate. Full 0-100% now takes >=20 s in closed-loop phases
-        # (cruise only now — glideslope is exempt, see throttle_self_limited
-        # above: its own tiered step-and-check already rate-limits it, and
-        # a second flat 0.05/s cap on top of that was silently defeating
-        # the whole point of the bigger tiers for bigger errors).
-        if targets.throttle is None and dt > 0 and not throttle_self_limited:
-            step = 0.05 * dt
-            throttle_cmd = max(self._prev_throttle - step,
-                               min(self._prev_throttle + step, throttle_cmd))
         self._prev_throttle = throttle_cmd
 
-        # Pitch attitude inner loop — hold the TECS-demanded degree. Soft
-        # spring + timely rate damper (the old controller's X-Plane-proven
-        # gains). This is deliberately GENTLE so it can't rail on the real
-        # elevator the way the sim-tuned loop did.
+        # ── PITCH ATTITUDE INNER LOOP (PI+D, self-trimming, anti-windup) ──
+        # Soft spring + rate damper (X-Plane-proven) plus a slow trim integral
+        # that holds the demanded attitude without the ad-hoc "never let go"
+        # hack. Anti-windup: stop integrating while the surface is saturated.
         pdeg = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
         if self._prev_pitch_deg is not None and dt > 0:
             raw = (pdeg - self._prev_pitch_deg) / dt
             self._pitch_rate_filt = 0.5 * raw + 0.5 * self._pitch_rate_filt
         self._prev_pitch_deg = pdeg
-        p_d = 0.05 * (pitch_dmd_deg - pdeg) - 0.055 * self._pitch_rate_filt
-        if pitch_trim_hold:
-            # NEVER LET GO (Idriss, 2026-07-11): on the glideslope the elevator
-            # HOLDS a trim instead of relaxing to neutral when the attitude
-            # error reaches zero. The trim integral parks the surface at the
-            # deflection that MAINTAINS the demanded attitude; the P+D terms
-            # just correct around it. Slow gain + a bound + anti-windup (stop
-            # integrating while the command is already pinned at a limit) so
-            # the hold can't wind past the surface authority and balloon —
-            # the exact failure that a naive hold would reintroduce.
-            ELEV_TRIM_GAIN = 0.02
-            ELEV_TRIM_LIMIT = 0.25
-            err = pitch_dmd_deg - pdeg
-            provisional = self._elev_trim + p_d
-            up_cap = targets.pitch_limit is not None and provisional >= abs(targets.pitch_limit)
-            dn_cap = (targets.pitch_down_limit is not None
-                      and provisional <= -abs(targets.pitch_down_limit))
-            if not ((err > 0 and up_cap) or (err < 0 and dn_cap)):
-                self._elev_trim += ELEV_TRIM_GAIN * err * dt
-                self._elev_trim = max(-ELEV_TRIM_LIMIT,
-                                      min(ELEV_TRIM_LIMIT, self._elev_trim))
-            pitch_cmd = self._elev_trim + p_d
-        else:
-            pitch_cmd = p_d
-        # Commander surface clamps (hardware orders).
-        if targets.pitch_limit is not None:
-            pitch_cmd = min(pitch_cmd, abs(targets.pitch_limit))
-        if targets.pitch_down_limit is not None:
-            pitch_cmd = max(pitch_cmd, -abs(targets.pitch_down_limit))
+        err = pitch_dmd_deg - pdeg
+        self._pitch_integ += PITCH_KI * err * dt
+        self._pitch_integ = max(-PITCH_I_LIMIT, min(PITCH_I_LIMIT, self._pitch_integ))
+        pitch_cmd = PITCH_KP * err + self._pitch_integ - PITCH_KD * self._pitch_rate_filt
+        if pitch_cmd > 1.0 or pitch_cmd < -1.0:
+            self._pitch_integ -= PITCH_KI * err * dt   # unwind while saturated
         pitch_cmd = _clamp(pitch_cmd, 1.0)
 
-        # ── YAW (ribbon-driven yaw-hold): STEP-AND-CHECK, SPEED-SCALED ───
-        # (Idriss, 2026-07-11.) Same philosophy as the throttle loop above —
-        # a fixed nudge, then wait and observe, rather than a continuous
-        # formula reacting every tick — but with YAW's own, much faster
-        # physics: the nose starts responding to rudder within about a
-        # second, nothing like altitude's multi-second lag, so this checks
-        # far more often than the throttle loop (YAW_CHECK_S vs
-        # THROTTLE_CHECK_S) — same structure, different timing, because the
-        # two controls are not the same speed of animal.
-        #
-        # Still speed-scaled: the rudder is an aerodynamic surface — the
-        # SAME deflection produces LESS actual turning force as airspeed
-        # drops (dynamic pressure falls with V^2), and the old law used one
-        # fixed step across the WHOLE yaw_hold speed range (TAKEOFF_ROLL
-        # 0->~105kt; ROLLOUT touchdown ~85-108kt down to a stop) with no
-        # awareness of that. X-Plane holds whatever we send (a persistent
-        # DataRef write, not a pulse) — the bottleneck was never "can we
-        # hold it," it was that we never asked for MORE as authority
-        # weakened. The step itself (not a continuous gain now) is scaled
-        # by (V/Vref)^2, same pattern as attitude.py's pitch/roll axes:
-        # floored/capped so it can't blow up near a stop or get suppressed
-        # to nothing at speed.
-        YAW_REF_KTS = 60.0      # mid-range of the takeoff-roll/rollout envelope
-        # Revised finer (Idriss, 2026-07-11): step 0.05->0.01, check
-        # 0.75s->1.0s (now uniform with the throttle loop's cadence). The
-        # step is still speed-scaled below (/q_ratio), so the EFFECTIVE
-        # step at low speed (0-60kt, where authority is weakest) is closer
-        # to ~0.029 — full rudder range in ~21s at the low-authority end,
-        # far slower (and less needed) at high speed.
+        # ── YAW (ribbon-driven ground-steering): STEP-AND-CHECK, SPEED-SCALED
+        # Kept verbatim — this is takeoff-roll / rollout nosewheel steering, a
+        # different animal from the longitudinal law. The rudder is aerodynamic,
+        # so the SAME deflection turns less as speed drops; the step is scaled
+        # by (V/Vref)^2, floored/capped so it can't blow up near a stop.
+        YAW_REF_KTS = 60.0
         YAW_STEP = 0.01
         YAW_CHECK_S = 1.0
         YAW_DEADBAND_DEG = 2.0
@@ -450,12 +290,11 @@ class TECSController(Controller):
             self._yaw_wait += dt
             if self._yaw_wait >= YAW_CHECK_S:
                 self._yaw_wait = 0.0
-                step = YAW_STEP / q_ratio   # bigger nudge at low speed, smaller at high
+                step = YAW_STEP / q_ratio
                 if hdg_error > YAW_DEADBAND_DEG:
                     self._yaw_cmd_held = min(yaw_limit, self._yaw_cmd_held + step)
                 elif hdg_error < -YAW_DEADBAND_DEG:
                     self._yaw_cmd_held = max(-yaw_limit, self._yaw_cmd_held - step)
-                # else: within the deadband — hold, no step.
             yaw_cmd = _clamp(self._yaw_cmd_held, yaw_limit)
         else:
             self._prev_hdg_deg = telemetry.heading_deg

@@ -100,6 +100,10 @@ class Targets:
     # plane was above the slope and the alt law refused power. None on
     # phases where slow is by design (flare/rollout).
     stall_floor_kts: float | None = None
+    # Overspeed ceiling (kts). Above this the controller stops commanding
+    # nose-down and cuts throttle (trade speed for height). The ribbon sets
+    # it per phase: flap-limit speed when flaps are out, never-exceed clean.
+    v_max_kts: float | None = None
     # True on the descent/approach glideslope (not flare). Tells the
     # controller to fly the slope with the proven pitch=sink-rate /
     # throttle=speed split instead of TECS energy control — TECS's

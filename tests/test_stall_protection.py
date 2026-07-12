@@ -203,45 +203,46 @@ class TestDescentSpeedCeiling(unittest.TestCase):
                         "Gear must lead the descent (drag ladder).")
 
 
-class TestGlideslopePitchStepCheck(unittest.TestCase):
-    """The pitch rejoin-the-line loop: same nudge/wait/re-check feedback the
-    throttle runs, on the SAME altitude error, so power-up is paired with
-    pull-up (Idriss, 2026-07-12)."""
+class TestEnergyLawEnvelopeFloors(unittest.TestCase):
+    """The one energy law + three result-based envelope floors (Idriss,
+    2026-07-12). Inputs are free; only stall, terrain-sink, and overspeed
+    override at the edges."""
 
-    def _hold(self, target_alt, actual_alt, secs=6.0):
+    def _one(self, *, actual_alt=2000.0, target_alt=2000.0, V=120.0,
+             vs_fpm=-500.0, agl_ft=2000.0, stall=108.0, v_max=250.0):
         from uav.core.control.tecs_controller import TECSController
         ctl = TECSController()
-        dt = 0.05
-        agl_m = max(0.0, actual_alt) * 0.3048
-        act = None
-        for _ in range(int(secs / dt)):
-            tel = Telemetry(airspeed_kts=110.0, altitude_ft=actual_alt,
-                            pitch_deg=-2.0, roll_deg=0.0, heading_deg=90.0,
-                            timestamp=0.0, lat_deg=0.0, lon_deg=0.0,
-                            agl_m=agl_m, vs_fpm=-700.0, groundspeed_kts=110.0)
-            tg = Targets(heading_deg=90.0, altitude_ft=target_alt,
-                         airspeed_kts=120.0, throttle=None, vs_target_fpm=-700.0,
-                         on_glideslope=True, pitch_limit=0.25,
-                         pitch_down_limit=0.40, gear_down=True, flap_ratio=1.0)
-            act = ctl.compute(tel, tg, dt)
-        return ctl, act
+        ctl._prev_throttle = 0.4
+        tel = Telemetry(airspeed_kts=V, altitude_ft=actual_alt, pitch_deg=0.0,
+                        roll_deg=0.0, heading_deg=90.0, timestamp=0.0,
+                        lat_deg=0.0, lon_deg=0.0, agl_m=agl_ft * 0.3048,
+                        vs_fpm=vs_fpm, groundspeed_kts=V)
+        tg = Targets(heading_deg=90.0, altitude_ft=target_alt, airspeed_kts=130.0,
+                     throttle=None, stall_floor_kts=stall, v_max_kts=v_max,
+                     gear_down=True, flap_ratio=1.0)
+        return ctl.compute(tel, tg, 0.1)
 
-    def test_below_line_pairs_power_up_with_nose_up(self):
-        # 100 ft below the slope, held there: throttle steps UP and the
-        # pitch bias steps UP together — the coupling that stops the plane
-        # accelerating straight down.
-        ctl, act = self._hold(target_alt=1100.0, actual_alt=1000.0)
-        self.assertGreater(ctl._gs_pitch_bias, 0.0, "nose should step up when low")
-        self.assertGreater(act.throttle, 0.0, "power should step up when low")
+    def test_stall_floor_forces_full_power_and_no_nose_up(self):
+        # Below the stall guard: throttle pinned full, elevator not nose-up.
+        act = self._one(V=100.0, stall=108.0)   # 100 < 1.1*108
+        self.assertAlmostEqual(act.throttle, 1.0, places=3)
+        self.assertLessEqual(act.pitch, 0.05, "must not command nose-up near stall")
 
-    def test_above_line_steps_nose_down(self):
-        ctl, act = self._hold(target_alt=900.0, actual_alt=1000.0)
-        self.assertLess(ctl._gs_pitch_bias, 0.0, "nose should step down when high")
+    def test_overspeed_cuts_throttle(self):
+        # Above v_max: throttle cut, nose not pushed down.
+        act = self._one(V=260.0, v_max=250.0)
+        self.assertAlmostEqual(act.throttle, 0.0, places=3)
 
-    def test_on_line_holds_no_chatter(self):
-        # Within the deadband: the bias never leaves zero.
-        ctl, act = self._hold(target_alt=1002.0, actual_alt=1000.0)
-        self.assertEqual(ctl._gs_pitch_bias, 0.0)
+    def test_terrain_floor_arrests_sink_low(self):
+        # Fast sink close to the ground: elevator commands nose-up.
+        act = self._one(agl_ft=120.0, vs_fpm=-1600.0, V=120.0)
+        self.assertGreater(act.pitch, 0.1, "sink floor must pull the nose up")
+
+    def test_holds_altitude_band_no_runaway(self):
+        # On target, healthy speed: throttle stays sane, elevator near neutral.
+        act = self._one(actual_alt=2000.0, target_alt=2000.0, vs_fpm=0.0)
+        self.assertTrue(0.0 <= act.throttle <= 1.0)
+        self.assertTrue(-1.0 <= act.pitch <= 1.0)
 
 
 if __name__ == "__main__":

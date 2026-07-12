@@ -806,6 +806,11 @@ class FlightEngine:
             else:
                 self._cmd_spd_smooth = None
 
+        # Overspeed ceiling for the energy law's protection floor: the
+        # flap-safe speed when flaps are out, a conservative clean Vne proxy
+        # otherwise (no explicit Vne in the seed envelope).
+        v_max = g.flap_safe_kts if flap > 0.0 else 2.3 * g.v_stall
+
         return Targets(
             heading_deg=hdg,
             altitude_ft=alt,
@@ -839,6 +844,7 @@ class FlightEngine:
             throttle_max=None,  # full 0–100% range in every phase
             vs_target_fpm=vs_target,
             stall_floor_kts=stall_floor,
+            v_max_kts=v_max,
             on_glideslope=glide_decouple,
         )
 
