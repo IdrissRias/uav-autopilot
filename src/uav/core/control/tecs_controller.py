@@ -85,12 +85,14 @@ GLOBAL_SINK_MAX_FPM = 1500.0 # absolute sink ceiling at any height — the floor
 # stalled tick can't sneak a big jump through.
 THROTTLE_SLEW_PER_S = 0.25
 
-# Pitch attitude inner loop (the proven X-Plane-tuned soft spring + rate damper,
-# now with a slow trim INTEGRAL that auto-trims to hold the demanded attitude —
-# this replaces the ad-hoc "never let go" trim-hold with a standard PI+D loop
-# that self-trims and has anti-windup).
-PITCH_KP = 0.05
-PITCH_KI = 0.02
+# Pitch attitude inner loop (soft spring + rate damper + slow self-trim integral
+# with anti-windup). Detuned for X-Plane (2026-07-12): spring cut (KP 0.05->0.03)
+# so the elevator eases toward the demanded attitude instead of slamming to full
+# on a big error; damper (KD) kept, which raises the damping ratio and calms the
+# PIO. The pitch-rate signal is filtered harder below so KD stops chattering on
+# X-Plane's noisy 25 Hz rate.
+PITCH_KP = 0.03
+PITCH_KI = 0.01
 PITCH_KD = 0.055
 PITCH_I_LIMIT = 0.5
 
@@ -289,7 +291,9 @@ class TECSController(Controller):
         pdeg = telemetry.pitch_deg if not math.isnan(telemetry.pitch_deg) else 0.0
         if self._prev_pitch_deg is not None and dt > 0:
             raw = (pdeg - self._prev_pitch_deg) / dt
-            self._pitch_rate_filt = 0.5 * raw + 0.5 * self._pitch_rate_filt
+            # Heavier filter (0.3/0.7) so the KD damper doesn't chatter on
+            # X-Plane's noisy 25 Hz pitch-rate.
+            self._pitch_rate_filt = 0.3 * raw + 0.7 * self._pitch_rate_filt
         self._prev_pitch_deg = pdeg
         err = pitch_dmd_deg - pdeg
         self._pitch_integ += PITCH_KI * err * dt

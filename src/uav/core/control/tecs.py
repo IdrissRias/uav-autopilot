@@ -53,9 +53,15 @@ class TECSParams:
     thr_integ_limit: float = 0.45
 
     # PITCH loop (energy balance). Output is a pitch-ANGLE demand.
-    kp_pitch: float = 0.55      # on balance-energy error
-    kd_pitch: float = 0.28      # on balance-energy-rate error (damping)
-    ki_pitch: float = 0.030     # integral on balance error
+    # Conservative detune for X-Plane (2026-07-12): the old kp_pitch=0.55 let an
+    # ~80 ft altitude error saturate the pitch demand to ~15° (its limit), which
+    # the inner loop then slammed the elevator for → a ~2 Hz PIO that looked
+    # smooth in the point-mass sim but rang hard on the real short-period. Cut
+    # the spring ~3x and keep proportionally more damping so the demand responds
+    # gently (an 80 ft error now asks for ~5°, not 15°).
+    kp_pitch: float = 0.18      # on balance-energy error (was 0.55)
+    kd_pitch: float = 0.14      # on balance-energy-rate error (damping)
+    ki_pitch: float = 0.010     # integral on balance error (was 0.030)
     pitch_integ_limit: float = 0.20   # rad
     pitch_max_deg: float = 15.0
     pitch_min_deg: float = -12.0
