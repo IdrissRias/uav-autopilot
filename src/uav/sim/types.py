@@ -18,6 +18,9 @@ class Telemetry:
     agl_m: float = math.nan
     vs_fpm: float = math.nan       # vertical speed (ft/min) — positive = climbing
     groundspeed_kts: float = math.nan
+    alpha_deg: float = math.nan    # angle of attack (deg) — the real envelope
+                                   # variable (stall is an AoA event). Measured
+                                   # from X-Plane, or computed pitch - flightpath.
 
     def is_valid(self) -> bool:
         # Valid attitude/airspeed/alt/heading telemetry (position optional).

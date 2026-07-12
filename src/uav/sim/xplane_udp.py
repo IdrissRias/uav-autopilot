@@ -26,6 +26,9 @@ class XPlaneUDP(SimAdapter):
         7: "sim/flightmodel/position/y_agl",  # metres above ground
         8: "sim/flightmodel/position/vh_ind_fpm",  # vertical speed (ft/min)
         9: "sim/flightmodel/position/groundspeed",  # m/s
+        10: "sim/flightmodel/position/alpha",  # angle of attack (deg) — the
+                                               # real envelope variable (stall is
+                                               # an AoA event, not a speed event)
     }
 
     def __init__(
@@ -113,6 +116,16 @@ class XPlaneUDP(SimAdapter):
         vs_fpm = self._last_values.get(8, math.nan)
         gs_ms = self._last_values.get(9, math.nan)
         gs_kts = gs_ms * 1.94384 if not math.isnan(gs_ms) else math.nan  # m/s → kts
+        alpha_deg = self._last_values.get(10, math.nan)   # measured AoA
+        # Fallback: if X-Plane's alpha isn't flowing, compute it from geometry.
+        # AoA = pitch - flight-path-angle, flight-path = asin(vertical / TAS).
+        if math.isnan(alpha_deg) and not (math.isnan(pitch) or math.isnan(vs_fpm)
+                                          or math.isnan(airspeed)):
+            v_fps = airspeed * 1.68781
+            if v_fps > 1.0:
+                gamma = math.degrees(math.asin(
+                    max(-1.0, min(1.0, (vs_fpm / 60.0) / v_fps))))
+                alpha_deg = pitch - gamma
         return Telemetry(
             airspeed_kts=airspeed,
             altitude_ft=alt,
@@ -125,6 +138,7 @@ class XPlaneUDP(SimAdapter):
             agl_m=agl_m,
             vs_fpm=vs_fpm,
             groundspeed_kts=gs_kts,
+            alpha_deg=alpha_deg,
         )
 
     def write_actuators(self, act: Actuators) -> None:

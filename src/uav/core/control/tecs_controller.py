@@ -51,6 +51,29 @@ ALT_BAND_UP_FT = 200.0
 BAND_TAPER_FROM_FT = 30.0   # band shrinks to 0 by this AGL (land on the numbers)
 BAND_TAPER_SLOPE = 0.5      # ft of band per ft of AGL above the taper floor
 
+# ── DESCENT / APPROACH: attitude-hold + power-for-altitude (Idriss doctrine,
+# 2026-07-12). The nose does NOT dive to chase the glideslope. A plane on a 3°
+# path sits nose-UP (flight path = pitch - AoA), so we HOLD a gentle scheduled
+# nose-up attitude, make THROTTLE the altitude servo (pull power / idle to sink,
+# add to hold), let FLAPS be the drag brake, and let speed be emergent. The nose
+# eases toward level only as a last resort (already at idle and still above the
+# band). This kills the dive-and-PIO by construction: pitch barely moves.
+# First-pass numbers, to be tuned from flight logs.
+GS_THETA_UP_HI = 1.5      # held nose-up attitude (deg), high/fast on descent
+GS_THETA_UP_LO = 4.5      # held nose-up attitude near the flare (slower, more AoA)
+GS_THETA_MIN_HI = -2.5    # lowest the nose may ease to, high up (last-resort sink)
+GS_THETA_MIN_LO = 0.0     # near the ground the nose may never point down
+GS_SCHED_HI_AGL = 800.0   # schedule endpoints (ft AGL): full nose-up-schedule
+GS_SCHED_LO_AGL = 80.0    #   blends between these
+GS_THR_TRIM = 0.22        # nominal power that holds the path inside the band
+GS_THR_KP = 0.004         # throttle per ft of altitude error (power = altitude)
+GS_PITCH_ASSIST = 0.006   # deg nose-down per ft ABOVE the band (last resort)
+
+# AoA envelope — defend ANGLE OF ATTACK at all times (the real stall variable;
+# stall is an AoA event, not a speed event). Above this, unload (nose down toward
+# the limit) and add power. Replaces the crude speed-based stall floor.
+ALPHA_MAX_DEG = 12.0      # margin below the ~15-16° critical AoA
+
 # Energy-balance weighting for the pitch loop (TECS spdweight). The pitch loop
 # splits into two weights that sum to 2: speed weight = SPDWEIGHT, altitude
 # weight = 2 - SPDWEIGHT. Lower SPDWEIGHT = the ELEVATOR defends ALTITUDE harder
@@ -134,29 +157,67 @@ class TECSController(Controller):
             v = 0.0
         return max(v, 0.0) / MS_TO_KT
 
+    def _band_up_ft(self, agl_ft: float) -> float:
+        """The +altitude band width, tapering to 0 near the ground so the flare
+        lands on target."""
+        if math.isnan(agl_ft):
+            return ALT_BAND_UP_FT
+        return max(0.0, min(ALT_BAND_UP_FT,
+                            (agl_ft - BAND_TAPER_FROM_FT) * BAND_TAPER_SLOPE))
+
     def _alt_band_hdmd_ft(self, target_ft: float, h_ft: float,
                           agl_ft: float) -> float:
-        """Asymmetric altitude band → the height demand fed to TECS.
-
-        Below target → demand target (climb back, firm: never below).
-        Inside [target, target+band] → demand h (no push; chase speed only).
-        Above the band → demand the top of the band (ease down, gentle).
-        The band tapers to zero near the ground so the flare lands on target.
-        """
-        if math.isnan(agl_ft):
-            band = ALT_BAND_UP_FT
-        else:
-            band = max(0.0, min(ALT_BAND_UP_FT,
-                                (agl_ft - BAND_TAPER_FROM_FT) * BAND_TAPER_SLOPE))
+        """Asymmetric altitude band → the height demand fed to TECS (cruise/climb).
+        Below target → demand target (never below); inside the band → demand h
+        (no push); above the band → demand the top of the band (ease down)."""
+        band = self._band_up_ft(agl_ft)
         if h_ft < target_ft:
             return target_ft
         if h_ft <= target_ft + band:
             return h_ft
         return target_ft + band
 
+    def _sched_frac(self, agl_ft: float) -> float:
+        """0 high up → 1 near the ground: blends the descent attitude schedule."""
+        if math.isnan(agl_ft) or agl_ft >= GS_SCHED_HI_AGL:
+            return 0.0
+        if agl_ft <= GS_SCHED_LO_AGL:
+            return 1.0
+        return (GS_SCHED_HI_AGL - agl_ft) / (GS_SCHED_HI_AGL - GS_SCHED_LO_AGL)
+
+    def _glideslope_law(self, tel: Telemetry, targets: Targets,
+                        agl_ft: float) -> tuple[float, float]:
+        """DESCENT / APPROACH: hold a gentle nose-up attitude, power for altitude,
+        flaps for drag, speed emergent. Returns (throttle_target, pitch_deg).
+        The throttle target is walked by the outer spool-rate limiter."""
+        alt = (tel.altitude_ft if not math.isnan(tel.altitude_ft)
+               else targets.altitude_ft)
+        target = targets.altitude_ft
+        band = self._band_up_ft(agl_ft)
+        # altitude error against the band: + below target (add power / climb back),
+        # 0 inside the band, - above the band (idle / sink).
+        if alt < target:
+            e = target - alt
+        elif alt <= target + band:
+            e = 0.0
+        else:
+            e = (target + band) - alt   # negative
+        # THROTTLE is the altitude servo. Power = altitude.
+        thr = GS_THR_TRIM + GS_THR_KP * e
+        # PITCH holds a scheduled gentle nose-up attitude; it eases toward the
+        # (bounded) floor ONLY when above the band, and never dives.
+        frac = self._sched_frac(agl_ft)
+        theta_up = GS_THETA_UP_HI + (GS_THETA_UP_LO - GS_THETA_UP_HI) * frac
+        theta_min = GS_THETA_MIN_HI + (GS_THETA_MIN_LO - GS_THETA_MIN_HI) * frac
+        theta = theta_up
+        if e < 0.0:
+            theta = max(theta_min, theta_up + e * GS_PITCH_ASSIST)
+        return max(0.0, min(1.0, thr)), theta
+
     def _envelope_floors(self, thr: float, pitch_deg: float, V_kts: float,
-                         vs_fpm: float, agl_ft: float,
-                         vmax_kts: float | None) -> tuple[float, float]:
+                         vs_fpm: float, agl_ft: float, vmax_kts: float | None,
+                         alpha_deg: float, pitch_now_deg: float
+                         ) -> tuple[float, float]:
         """Result-based safety, applied in priority order (stall wins, so it is
         applied LAST). These only ever act at the edges of the envelope."""
         if math.isnan(V_kts):
@@ -185,11 +246,17 @@ class TECSController(Controller):
         if sink > soft:
             pitch_deg = max(pitch_deg, min(14.0, (sink - soft) * 0.03))
 
-        # Stall floor (catastrophic backstop only — see note at STALL_FLOOR_ABS_KTS):
-        # the loop holds a safe target speed, so this fires only in a genuine
-        # fall-out-of-the-sky slow-down, never in normal flight. Highest priority
-        # (applied last) so it overrides the terrain nose-up above.
-        if V_kts < STALL_FLOOR_ABS_KTS:
+        # STALL = ANGLE OF ATTACK, not speed (highest priority, applied last).
+        # Defend critical AoA at all times: above the limit, unload by commanding
+        # the nose down just enough to bring AoA back to the limit, and add full
+        # power. Works in any maneuver, not just 1g. A very-low speed backstop
+        # remains only for when AoA is unavailable (NaN).
+        if not math.isnan(alpha_deg):
+            if alpha_deg > ALPHA_MAX_DEG:
+                pitch_deg = min(pitch_deg,
+                                pitch_now_deg - (alpha_deg - ALPHA_MAX_DEG))
+                thr = 1.0
+        elif V_kts < STALL_FLOOR_ABS_KTS:
             pitch_deg = min(pitch_deg, 0.0)
             thr = 1.0
 
@@ -248,11 +315,21 @@ class TECSController(Controller):
                 pitch_dmd_deg = max(0.0, min(8.0, below * 0.004))
             self.tecs.reset()
 
+        elif targets.altitude_ft is not None and getattr(targets, "on_glideslope", False):
+            # ── DESCENT / APPROACH: attitude-hold + power-for-altitude.
+            # Hold a gentle nose-up attitude, throttle is the altitude servo,
+            # flaps are the drag brake, speed is emergent. The nose does not dive.
+            energy_phase = True
+            throttle_cmd, pitch_dmd_deg = self._glideslope_law(
+                telemetry, targets, agl_ft)
+            self.tecs.reset()   # keep TECS integrators fresh for the next cruise
+
         elif targets.altitude_ft is not None and targets.airspeed_kts is not None:
-            # ── THE ONE ENERGY LAW (climb / cruise / descent / approach / decel)
-            # Chase two results — the altitude BAND and the target speed — with
-            # throttle (total energy) and elevator (balance). No per-phase policy;
-            # descent is just cruise with a lower, moving altitude demand.
+            # ── TECS ENERGY LAW (climb / cruise / decelerate).
+            # Chase the altitude BAND and the target speed with throttle (total
+            # energy) and elevator (balance). Descent/approach are handled above
+            # by the attitude-hold law instead, since TECS's energy-balance pitch
+            # dives to catch the slope and PIO'd on the real short-period.
             energy_phase = True
             target_ft = targets.altitude_ft
             h_dmd_ft = self._alt_band_hdmd_ft(target_ft, telemetry.altitude_ft
@@ -269,9 +346,12 @@ class TECSController(Controller):
 
         # ── ENVELOPE FLOORS (result-based safety; energy phases only) ────
         if energy_phase:
+            pitch_now = (telemetry.pitch_deg
+                         if not math.isnan(telemetry.pitch_deg) else 0.0)
             throttle_cmd, pitch_dmd_deg = self._envelope_floors(
                 throttle_cmd, pitch_dmd_deg, telemetry.airspeed_kts,
-                telemetry.vs_fpm, agl_ft, getattr(targets, "v_max_kts", None))
+                telemetry.vs_fpm, agl_ft, getattr(targets, "v_max_kts", None),
+                telemetry.alpha_deg, pitch_now)
 
         throttle_cmd = max(0.0, min(1.0, throttle_cmd))
         # Spool-rate walk (energy phases only; ground/takeoff/flare are explicit

@@ -257,6 +257,55 @@ class TestEnergyLawEnvelopeFloors(unittest.TestCase):
         self.assertTrue(0.0 <= act.throttle <= 1.0)
         self.assertTrue(-1.0 <= act.pitch <= 1.0)
 
+    def test_aoa_backstop_unloads_and_powers(self):
+        # Above critical AoA (14° > 12° limit): the floor commands nose DOWN
+        # (relative to current pitch) and full power — defending AoA, not speed.
+        from uav.core.control.tecs_controller import TECSController
+        ctl = TECSController()
+        thr, pitch = ctl._envelope_floors(0.4, 5.0, V_kts=110.0, vs_fpm=-300.0,
+                                          agl_ft=1500.0, vmax_kts=250.0,
+                                          alpha_deg=14.0, pitch_now_deg=6.0)
+        self.assertAlmostEqual(thr, 1.0, places=3)
+        self.assertLess(pitch, 6.0, "must unload (nose down toward the AoA limit)")
+
+
+class TestGlideslopeAttitudeLaw(unittest.TestCase):
+    """DESCENT / APPROACH: hold a gentle nose-up attitude, throttle for altitude,
+    never dive (Idriss, 2026-07-12)."""
+
+    def _law(self, *, actual_alt, target_alt, agl_ft):
+        from uav.core.control.tecs_controller import TECSController
+        ctl = TECSController()
+        tel = Telemetry(airspeed_kts=120.0, altitude_ft=actual_alt, pitch_deg=2.0,
+                        roll_deg=0.0, heading_deg=270.0, timestamp=0.0,
+                        agl_m=agl_ft * 0.3048, vs_fpm=-600.0, groundspeed_kts=120.0)
+        tg = Targets(heading_deg=270.0, altitude_ft=target_alt, airspeed_kts=120.0,
+                     throttle=None, on_glideslope=True, gear_down=True, flap_ratio=1.0)
+        return ctl._glideslope_law(tel, tg, agl_ft)
+
+    def test_on_band_holds_gentle_noseup(self):
+        # Tracking the slope: nose is gently UP (never down), power near trim.
+        thr, theta = self._law(actual_alt=2000.0, target_alt=2000.0, agl_ft=1000.0)
+        self.assertGreater(theta, 0.0, "nose must be up while descending on-path")
+        self.assertLessEqual(theta, 5.0)
+
+    def test_above_band_pulls_power_not_dive(self):
+        # 400 ft high: throttle drops toward idle; nose eases but does NOT dive.
+        thr, theta = self._law(actual_alt=2400.0, target_alt=2000.0, agl_ft=1000.0)
+        self.assertLess(thr, 0.22, "above the band must reduce power (idle to sink)")
+        self.assertGreaterEqual(theta, -3.0, "must not dive; gentle at most")
+
+    def test_below_target_adds_power(self):
+        # Below target: throttle up, nose held up (climb back on power).
+        thr, theta = self._law(actual_alt=1900.0, target_alt=2000.0, agl_ft=1000.0)
+        self.assertGreater(thr, 0.22, "below target must add power")
+        self.assertGreater(theta, 0.0)
+
+    def test_near_ground_never_points_down(self):
+        # Low AGL and above band: the nose floor is 0, it may not point down.
+        thr, theta = self._law(actual_alt=2400.0, target_alt=2000.0, agl_ft=60.0)
+        self.assertGreaterEqual(theta, 0.0, "near the ground the nose stays up")
+
 
 if __name__ == "__main__":
     unittest.main()
