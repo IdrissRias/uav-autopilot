@@ -33,6 +33,18 @@ from uav.nav.geo import bearing_deg, haversine_m
 from uav.sim.types import Telemetry, Targets
 from uav.core.guidance.track_follower import TrackFollower, TrackState
 
+# ── Centerline-correction integral (both takeoff `dep_runway` and landing
+# `dest_runway`). METER-scale and deterministic: it winds only when the plane is
+# beyond CL_MARGIN_M of the line, so it's soft near center and only works hard
+# when it matters — then it keeps pushing until the offset is gone, killing the
+# steady drift a P-only law leaves behind. (Idriss, 2026-07-12: "soft but more
+# deterministic, with a margin of error.")
+CL_INT_GAIN = 0.012    # deg per (metre · second)
+CL_INT_CAP = 5.0       # deg — max integral heading offset (crosswind crab)
+CL_MARGIN_M = 10.0     # dead-band (m): hold the integral within this of the line.
+                       # NOTE: runway-width-scale; shrink for a small drone (a
+                       # later aircraft-derived value; fixed for now).
+
 # Flap deployment is speed-staged and EARLY (see flap logic in
 # _resolve): all drag comes out at the top of the descent, the
 # VS-tracking pitch counters the lift spike, and nothing deploys low.
@@ -67,7 +79,8 @@ class FlightEngine:
         # STEADY lateral offset (crosswind, geometry bias) — the plane
         # lands parallel to the runway, beside it. Slow integral trims
         # the residual to zero. Degrees; clamped ±5.
-        self._cl_int_deg = 0.0
+        self._cl_int_deg = 0.0   # landing (dest_runway) centerline integral
+        self._cl_int_dep = 0.0   # takeoff (dep_runway) centerline integral
         self._cl_cross_prev = None
         self._cl_cross_rate = 0.0
         self._cruise_thr_trim = 0.0
@@ -102,7 +115,8 @@ class FlightEngine:
         self._cmd_alt_smooth = None
         self._cmd_spd_smooth = None
         self._ramp_ts = None
-        self._cl_int_deg = 0.0
+        self._cl_int_deg = 0.0   # landing (dest_runway) centerline integral
+        self._cl_int_dep = 0.0   # takeoff (dep_runway) centerline integral
         self._cl_cross_prev = None
         self._cl_cross_rate = 0.0
         self._cruise_thr_trim = 0.0
@@ -301,13 +315,16 @@ class FlightEngine:
                                       t.lat_deg, t.lon_deg)
                     diff = ((brg - g.dep_heading + 180.0) % 360.0) - 180.0
                     cross_m = d_nm * 1852.0 * math.sin(math.radians(diff))
-                    # METER-scale gain. The old 60°/nm gave <1° for a
-                    # 10 m drift — a whisper; the plane left the pavement
-                    # with the loop nominally "working". On a 45 m-wide
-                    # runway, meters are the unit that matters:
-                    # 0.8°/m → 8° at 10 m off, capped 15°.
-                    hdg = (g.dep_heading
-                           - max(-15.0, min(15.0, cross_m * 0.8))) % 360.0
+                    # METER-scale P (0.8°/m → 8° at 10 m off, capped 15°) PLUS a
+                    # meter-scale integral (same as landing) — the P alone left a
+                    # steady crosswind/bias drift it could never null. Integral
+                    # winds only beyond the margin, capped, so it's soft on-line.
+                    p_term = max(-15.0, min(15.0, cross_m * 0.8))
+                    if abs(cross_m) > CL_MARGIN_M:
+                        self._cl_int_dep += cross_m * CL_INT_GAIN * ramp_dt
+                        self._cl_int_dep = max(-CL_INT_CAP,
+                                               min(CL_INT_CAP, self._cl_int_dep))
+                    hdg = (g.dep_heading - (p_term + self._cl_int_dep)) % 360.0
         elif kf.heading_mode == "dest_runway":
             # Runway heading + a small centerline correction. A pure
             # heading hold let any residual cross-track at flare entry
@@ -325,12 +342,17 @@ class FlightEngine:
                 # diff > 0 → plane displaced left of the approach course
                 # (facing the runway) → steer right (positive correction).
                 cross_nm = d_nm * math.sin(math.radians(diff))
-                # The INTEGRAL term kills what P never can: a STEADY
-                # offset (crosswind / geometry bias) that had the plane
-                # landing parallel to the runway, beside it.
-                self._cl_int_deg += cross_nm * 10.0 * ramp_dt
-                self._cl_int_deg = max(-5.0, min(5.0, self._cl_int_deg))
+                # The INTEGRAL kills what P never can: a STEADY offset
+                # (crosswind / geometry bias) that had the plane landing
+                # parallel to the runway, beside it. METER-scale now and gated
+                # by the margin — winds only when beyond CL_MARGIN_M, so it's
+                # soft near the line and deterministic when it matters (was a
+                # whisper in nm-units: 10/nm ≈ 0.005°/m).
                 cross_m = cross_nm * 1852.0
+                if abs(cross_m) > CL_MARGIN_M:
+                    self._cl_int_deg += cross_m * CL_INT_GAIN * ramp_dt
+                    self._cl_int_deg = max(-CL_INT_CAP,
+                                           min(CL_INT_CAP, self._cl_int_deg))
                 on_ground = (not math.isnan(t.agl_m)) and t.agl_m < 5.0
                 if on_ground:
                     # Rollout: meter-scale, assertive (0.8°/m, cap 15°) —
