@@ -9,8 +9,9 @@
     bit by bit — never a step, never a fixed setpoint.
   - Explicit idle (FLARE/ROLLOUT) is absolute; nothing adds power back.
 
-Plus: pitch never dives for speed while at/below target altitude, and
-above the slope the commanded sink rate steepens (VS convergence).
+Plus: pitch never dives for speed while at/below target altitude. Rejoining
+the glideslope (pull up when low / nose down when high) is the controller's
+pitch step-and-check, not a vs_target convergence term (Idriss, 2026-07-12).
 """
 from __future__ import annotations
 
@@ -169,14 +170,22 @@ class TestDescentSpeedCeiling(unittest.TestCase):
                       vs_fpm=-800.0, agl_m=(alt_ft - 1380.0) / 3.28084)
         return self.engine._resolve(self.kf, t, self.ribbon)
 
-    def test_vs_target_steepens_when_above_slope(self):
-        # Altitude has authority: above the slope the commanded sink
-        # rate deepens (convergence term), pitch-down as needed.
+    def test_vs_target_is_slope_baseline_not_convergence(self):
+        # ARCHITECTURE (Idriss, 2026-07-12): vs_target is now the slope
+        # BASELINE sink only — the sink that flies PARALLEL to the line —
+        # and no longer carries an altitude-convergence term. Rejoining the
+        # line (steepen when high / pull up when low) moved into the
+        # controller's glideslope PITCH step-and-check, verified below in
+        # TestGlideslopePitchStepCheck. So the commanded sink is the SAME
+        # whether we are on the slope or 300 ft above it — the convergence
+        # is no longer baked into this number.
         on_slope = self._resolve(3000.0).altitude_ft
         vs_on = self._resolve(on_slope).vs_target_fpm
         vs_high = self._resolve(on_slope + 300.0).vs_target_fpm
-        self.assertLess(vs_high, vs_on,
-                        "300 ft high → steeper commanded sink.")
+        self.assertAlmostEqual(
+            vs_high, vs_on, delta=1.0,
+            msg="vs_target is the slope baseline; convergence is the "
+                "controller's pitch step-and-check now, not this term.")
 
     def test_stall_floor_set_in_flight_phases(self):
         on_slope = self._resolve(3000.0).altitude_ft
@@ -192,6 +201,47 @@ class TestDescentSpeedCeiling(unittest.TestCase):
         out = self._resolve(on_slope + 300.0)  # above slope, 120 kts
         self.assertTrue(out.gear_down,
                         "Gear must lead the descent (drag ladder).")
+
+
+class TestGlideslopePitchStepCheck(unittest.TestCase):
+    """The pitch rejoin-the-line loop: same nudge/wait/re-check feedback the
+    throttle runs, on the SAME altitude error, so power-up is paired with
+    pull-up (Idriss, 2026-07-12)."""
+
+    def _hold(self, target_alt, actual_alt, secs=6.0):
+        from uav.core.control.tecs_controller import TECSController
+        ctl = TECSController()
+        dt = 0.05
+        agl_m = max(0.0, actual_alt) * 0.3048
+        act = None
+        for _ in range(int(secs / dt)):
+            tel = Telemetry(airspeed_kts=110.0, altitude_ft=actual_alt,
+                            pitch_deg=-2.0, roll_deg=0.0, heading_deg=90.0,
+                            timestamp=0.0, lat_deg=0.0, lon_deg=0.0,
+                            agl_m=agl_m, vs_fpm=-700.0, groundspeed_kts=110.0)
+            tg = Targets(heading_deg=90.0, altitude_ft=target_alt,
+                         airspeed_kts=120.0, throttle=None, vs_target_fpm=-700.0,
+                         on_glideslope=True, pitch_limit=0.25,
+                         pitch_down_limit=0.40, gear_down=True, flap_ratio=1.0)
+            act = ctl.compute(tel, tg, dt)
+        return ctl, act
+
+    def test_below_line_pairs_power_up_with_nose_up(self):
+        # 100 ft below the slope, held there: throttle steps UP and the
+        # pitch bias steps UP together — the coupling that stops the plane
+        # accelerating straight down.
+        ctl, act = self._hold(target_alt=1100.0, actual_alt=1000.0)
+        self.assertGreater(ctl._gs_pitch_bias, 0.0, "nose should step up when low")
+        self.assertGreater(act.throttle, 0.0, "power should step up when low")
+
+    def test_above_line_steps_nose_down(self):
+        ctl, act = self._hold(target_alt=900.0, actual_alt=1000.0)
+        self.assertLess(ctl._gs_pitch_bias, 0.0, "nose should step down when high")
+
+    def test_on_line_holds_no_chatter(self):
+        # Within the deadband: the bias never leaves zero.
+        ctl, act = self._hold(target_alt=1002.0, actual_alt=1000.0)
+        self.assertEqual(ctl._gs_pitch_bias, 0.0)
 
 
 if __name__ == "__main__":

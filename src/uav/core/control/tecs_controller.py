@@ -68,6 +68,13 @@ class TECSController(Controller):
         self._gs_thr: float | None = None
         # step-and-check timer for the glideslope throttle loop (below)
         self._gs_thr_wait = 0.0
+        # step-and-check state for the glideslope PITCH loop — a held nose-up
+        # bias (deg) that rejoins the line: below the slope it steps the nose
+        # UP, above it steps DOWN, checked on the SAME 1 s cadence and the SAME
+        # altitude error as the throttle loop, so power-up is paired with
+        # pull-up. Re-seeded on glideslope exit.
+        self._gs_pitch_bias = 0.0
+        self._gs_pitch_wait = 0.0
         # step-and-check state for yaw (below)
         self._yaw_cmd_held = 0.0
         self._yaw_wait = 0.0
@@ -129,6 +136,8 @@ class TECSController(Controller):
             self._gs_theta_ref = None
             self._gs_thr = None
             self._gs_thr_wait = 0.0
+            self._gs_pitch_bias = 0.0
+            self._gs_pitch_wait = 0.0
 
         if targets.throttle is not None and targets.vs_target_fpm is not None:
             # FLARE: idle power (explicit), and hold ONE steady nose-up flare
@@ -276,8 +285,42 @@ class TECSController(Controller):
             # trim + a gentler upstream demand together, not either alone.
             self._gs_theta_ref += vs_err * 0.0008 * dt
             self._gs_theta_ref = max(-8.0, min(6.0, self._gs_theta_ref))
+
+            # ── PITCH STEP-AND-CHECK — rejoin the line (Idriss, 2026-07-12).
+            # The vs-tracking above only flies the slope-PARALLEL baseline
+            # sink; it does nothing to CLOSE an altitude gap. That closure is
+            # this loop: on the SAME 1 s cadence and the SAME altitude error
+            # the throttle loop uses, nudge a held nose-up bias one fixed step
+            # in the helping direction, then go quiet and let the airplane
+            # show the result before judging again. Below the line the
+            # throttle steps power UP (above) and this steps the nose UP
+            # together — power increase PAIRED with pulling up, so the added
+            # energy becomes climb, not the straight-down acceleration a
+            # continuous conv_gain produced. Above the line it steps the nose
+            # DOWN to shed the excess. A small deadband holds once on the line
+            # instead of chattering. There is no accumulator wound faster than
+            # the airplane responds, so this can't balloon: every step is
+            # re-based on the CURRENT observed error one second apart. Bias is
+            # bounded well inside the pitch-demand clamp so it can't run away.
+            PITCH_CHECK_S = 1.0
+            PITCH_DEADBAND_FT = 5.0   # noise floor, same as the throttle loop
+            PITCH_STEP_DEG = 0.2      # one gentle nudge per check
+            PITCH_BIAS_LIMIT = 6.0
+            self._gs_pitch_wait += dt
+            if self._gs_pitch_wait >= PITCH_CHECK_S:
+                self._gs_pitch_wait = 0.0
+                if alt_err_ft > PITCH_DEADBAND_FT:        # below → pull up
+                    self._gs_pitch_bias += PITCH_STEP_DEG
+                elif alt_err_ft < -PITCH_DEADBAND_FT:     # above → nose down
+                    self._gs_pitch_bias -= PITCH_STEP_DEG
+                # else: on the line within the deadband — hold, no step.
+                self._gs_pitch_bias = max(-PITCH_BIAS_LIMIT,
+                                          min(PITCH_BIAS_LIMIT,
+                                              self._gs_pitch_bias))
+
             pitch_dmd_deg = max(-10.0, min(8.0,
-                                self._gs_theta_ref + vs_err * 0.00035))
+                                self._gs_theta_ref + vs_err * 0.00035
+                                + self._gs_pitch_bias))
             pitch_trim_hold = True   # elevator HOLDS its trim on the slope
             self.tecs.reset()
 

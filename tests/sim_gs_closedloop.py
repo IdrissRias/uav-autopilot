@@ -41,7 +41,6 @@ def run(label, snap_to_ground_at=None, T=300.0, dt=0.1, disturb_ft=200.0):
 
     ctl = TECSController(cruise_throttle=0.45)
     ctl._prev_throttle = 0.3
-    off_rate_filt, off_prev = 0.0, None
     kicks, kicked = {40.0, 90.0}, set()
 
     off_trace, sink_after_snap, off_after_snap = [], [], []
@@ -61,12 +60,12 @@ def run(label, snap_to_ground_at=None, T=300.0, dt=0.1, disturb_ft=200.0):
                                 and t >= snap_to_ground_at) else ideal_alt_ft
 
         off_slope_ft = actual_alt_ft - ideal_alt_ft
-        if off_prev is not None:
-            off_rate_filt = 0.3 * ((off_slope_ft - off_prev) / dt) + 0.7 * off_rate_filt
-        off_prev = off_slope_ft
-        conv = 0.15 if off_slope_ft >= 0 else 0.20
-        vs_target = max(-1500.0, min(250.0,
-                        required_fpm - off_slope_ft * conv - off_rate_filt * 45.0))
+        # vs_target is the slope BASELINE only (matches production as of
+        # 2026-07-12). Convergence back onto the line is no longer baked into
+        # this number — it's the controller's pitch step-and-check, driven by
+        # the altitude error (target_alt_ft vs actual), which this loop
+        # exercises for real via ctl.compute below.
+        vs_target = max(-1500.0, min(250.0, required_fpm))
 
         vs_fpm = ac.V * math.sin(ac.gamma) * 196.85
         tel = Telemetry(

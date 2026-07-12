@@ -72,9 +72,6 @@ class FlightEngine:
         self._cl_cross_rate = 0.0
         self._cruise_thr_trim = 0.0
         self._td_ticks = 0
-        # Tangential-capture state (see glideslope vs block).
-        self._off_slope_prev: Optional[float] = None
-        self._off_rate_filt = 0.0
 
     # ── Public interface ─────────────────────────────────────────────
 
@@ -110,8 +107,6 @@ class FlightEngine:
         self._cl_cross_rate = 0.0
         self._cruise_thr_trim = 0.0
         self._td_ticks = 0
-        self._off_slope_prev = None
-        self._off_rate_filt = 0.0
         self.ctx.pop("mode_state", None)
         self.ctx.pop("destination", None)
         self.ctx.pop("_aim_passed_kf", None)
@@ -569,64 +564,31 @@ class FlightEngine:
                       else t.airspeed_kts)
             gs_nm_min = max(0.0, gs_kts) / 60.0
             required_fpm = -(local_slope * gs_nm_min)
-            # Convergence back to the line, ASYMMETRIC (Idriss doctrine,
-            # 2026-07-11):
-            #   ABOVE the line → dive harder to catch the slope (gain 1.5,
-            #     no lower clamp — the line is religion, dive as the line
-            #     demands). Excess altitude is traded down.
-            #   BELOW the line → you do NOT just add power and hope it
-            #     accelerates back up. You PULL UP a little to convert
-            #     that power into climb and regain the altitude you lost
-            #     (gain 2.5, and the -200 "never command up" floor is
-            #     GONE so the nose can actually climb). The power walk
-            #     supplies the energy; the pitch points it at the line.
-            #     Capped to a gentle +250 fpm so it rounds back onto the
-            #     slope instead of zooming through it.
+            # vs_target is now the BASELINE slope sink rate ONLY — the sink
+            # that flies PARALLEL to the glideslope at the current ground
+            # speed. It carries NO altitude-convergence term any more.
             #
-            # TANGENTIAL CAPTURE (PD): the P-only demand held the full
-            # dive until the line then released all at once — the dive's
-            # stored speed converted to lift and the plane floated back
-            # up (dive → release → balloon limit cycle, landing far
-            # beyond the runway). The closure-rate term eases the demand
-            # EARLY, in proportion to how fast the gap is closing, so
-            # the plane rounds off into the slope with nothing left to
-            # release. Rate is low-passed against altimeter noise.
-            off_slope_ft = t.altitude_ft - alt   # + above the line, - below
-            # ramp_dt > 0.01 (not just > 0): two ticks a fraction of a
-            # millisecond apart (rapid successive calls, e.g. in a test)
-            # divide by a near-zero dt and the derivative blows up to a
-            # huge spurious value, which then swamps vs_raw and clamps it
-            # at the +250 ceiling regardless of the real off-slope state
-            # (surfaced as test_vs_target_steepens_when_above_slope going
-            # red after the slope constant shrank and stopped masking it).
-            # Real flight ticks at ~20 Hz (~50 ms) are always well above
-            # this floor, so production behavior is unaffected.
-            if self._off_slope_prev is not None and ramp_dt > 0.01:
-                raw_rate = (off_slope_ft - self._off_slope_prev) / ramp_dt
-                self._off_rate_filt = (0.3 * raw_rate
-                                       + 0.7 * self._off_rate_filt)
-            self._off_slope_prev = off_slope_ft
-            # GENTLED (Idriss, after flight 162820: 8 sign-crossings, +-150 to
-            # 194 ft swings, the ENTIRE descent — not a converging approach,
-            # a sustained oscillation that happened to touch down near a
-            # zero-crossing, which is what made it LOOK clean in a sparse
-            # sample). Root issue: pitch was independently correcting the
-            # SAME off-slope error that throttle ALSO corrects (per the
-            # 'altitude only' doctrine) — two controls fighting one axis,
-            # the exact disease this project fought all day in other forms.
-            # Pitch now mostly just flies the baseline required sink rate;
-            # THROTTLE (already gentled to 0.0008) owns the position
-            # correction. conv_gain cut ~10x (1.5/2.5 -> 0.15/0.20);
-            # CLOSURE_DAMP raised (30 -> 45) for more genuine rate damping.
-            CLOSURE_DAMP = 45.0   # fpm of easing per ft/s of closure
-            conv_gain = 0.15 if off_slope_ft >= 0.0 else 0.20
-            vs_raw = (required_fpm
-                      - off_slope_ft * conv_gain
-                      - self._off_rate_filt * CLOSURE_DAMP)
-            # Floor: never over-dive. Ceiling: a gentle climb to regain
-            # the line when we've dropped below it (was hard-clamped to
-            # a descent only).
-            vs_target = max(-1500.0, min(250.0, vs_raw))
+            # Convergence back onto the line (pull up when low / nose down
+            # when high) moved into the controller's glideslope PITCH loop
+            # as a STEP-AND-CHECK — the same "nudge, wait 1 s, re-check the
+            # altitude, nudge again" feedback loop the throttle and yaw
+            # already run, checking the SAME altitude error the throttle
+            # checks (Idriss, 2026-07-12: "pulling checking alt, pulling
+            # checking alt, we did that every 1 s in the params").
+            #
+            # Why here, not a continuous conv_gain: the old convergence was
+            # a per-tick proportional formula (conv_gain * off_slope), which
+            # is exactly the continuous law that let power be added below the
+            # line while the nose kept commanding the full descent — energy
+            # into speed, not climb, so it "accelerated straight down." A
+            # step-and-check that OBSERVES the altitude before nudging again
+            # can't do that: below the line, throttle steps power up AND
+            # pitch steps the nose up, both re-based on the current error
+            # each second, so power increase is PAIRED with pulling up. It
+            # also inherently avoids the dive→release balloon the old
+            # tangential-capture PD was patching, because it never winds up a
+            # demand it hasn't seen the result of yet.
+            vs_target = max(-1500.0, min(250.0, required_fpm))
         elif cruise_hold:
             # POWER FOR ALTITUDE, PITCH FOR ATTITUDE (user doctrine). The
             # yoke holds a STEADY, near-level attitude — it does NOT chase
