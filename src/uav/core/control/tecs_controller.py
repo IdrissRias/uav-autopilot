@@ -51,9 +51,15 @@ ALT_BAND_UP_FT = 200.0
 BAND_TAPER_FROM_FT = 30.0   # band shrinks to 0 by this AGL (land on the numbers)
 BAND_TAPER_SLOPE = 0.5      # ft of band per ft of AGL above the taper floor
 
-# Energy-balance weighting for the pitch loop (TECS spdweight). 1.0 = balanced;
-# altitude priority is carried by the band + floors, not by starving speed.
-SPDWEIGHT = 1.0
+# Energy-balance weighting for the pitch loop (TECS spdweight). The pitch loop
+# splits into two weights that sum to 2: speed weight = SPDWEIGHT, altitude
+# weight = 2 - SPDWEIGHT. Lower SPDWEIGHT = the ELEVATOR defends ALTITUDE harder
+# (throttle then carries speed). Idriss doctrine is altitude-first ("never below
+# target"), so weight it hard toward altitude:
+#   0.25 -> altitude weight 1.75, speed weight 0.25  (7:1 toward altitude)
+# The stall floor still protects the low-speed edge, so starving the pitch loop
+# of speed authority is safe.
+SPDWEIGHT = 0.25
 
 # Envelope floors (result-based safety, highest priority is stall).
 STALL_GUARD_FACTOR = 1.1     # fire the stall floor below factor × stall_floor_kts
